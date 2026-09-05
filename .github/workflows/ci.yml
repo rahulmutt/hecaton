@@ -4,13 +4,17 @@ on:
   pull_request:
   schedule:
     - cron: "17 3 * * *"   # nightly tier
+permissions:
+  contents: read
 jobs:
+  # Installs only what the job needs; the full [tools] table builds two cargo: tools from source.
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
-        with: { install: true, cache: true }
+        with: { install: false, cache: true }
+      - run: mise install rust cargo:cargo-nextest cargo-insta
       - run: mise run check
   audit:
     if: github.event_name == 'schedule'
@@ -18,5 +22,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
-        with: { install: true, cache: true }
+        with: { install: false, cache: true }
+      - run: mise install rust cargo:cargo-audit aqua:EmbarkStudios/cargo-deny
       - run: mise run audit
