@@ -19,12 +19,16 @@ pub const RESERVED_ENV_PREFIXES: &[&str] = &[
 ];
 
 /// Rejects mise's fuzzy forms: keywords, `prefix:`/`ref:`/`path:`/`sub-`
-/// specs, wildcards, and bare `major` / `major.minor` numbers.
+/// specs, wildcards, bare `major` / `major.minor` numbers, and digit-free
+/// channel names ("nightly", "stable", "beta", "canary").
 pub fn is_exact_version(v: &str) -> bool {
     if v.is_empty() || matches!(v, "latest" | "lts" | "system") {
         return false;
     }
     if v.ends_with(".x") || v.contains('*') || v.contains(':') {
+        return false;
+    }
+    if !v.bytes().any(|b| b.is_ascii_digit()) {
         return false;
     }
     let numeric_parts = v
@@ -129,6 +133,9 @@ mod tests {
             "ref:main",
             "sub-1:latest",
             "path:/x",
+            "nightly",
+            "stable",
+            "beta",
             "",
         ] {
             assert!(!is_exact_version(v), "{v:?} should be fuzzy");
