@@ -6,7 +6,14 @@
 /// The `apiVersion` every fleet file and request declares.
 pub const API_VERSION: &str = "hecaton/v1";
 
+pub mod credentials;
+pub mod fleet;
+pub mod request;
 pub mod settings;
+
+pub use credentials::CredentialBundle;
+pub use fleet::{CrewSpec, FleetSpec, GitAuth, GitSettings};
+pub use request::FleetRequest;
 pub use settings::{AgentSettings, ClaudeSettings, RunnerSettings};
 
 #[cfg(test)]
