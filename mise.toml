@@ -1,7 +1,7 @@
 # Every entry is an exact version (developer-environment: an unpinned entry is a reproducibility bug).
 # git is a system prerequisite (not in the mise registry); the devcontainer ships 2.47.3.
 [tools]
-rust = "1.98.1"
+rust = { version = "1.98.1", components = ["rustfmt", "clippy"] }
 "cargo:cargo-nextest" = "0.9.143"
 cargo-insta = "1.48.0"
 "cargo:cargo-audit" = "0.22.2"

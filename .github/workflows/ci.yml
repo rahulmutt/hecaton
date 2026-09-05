@@ -6,8 +6,11 @@ on:
     - cron: "17 3 * * *"   # nightly tier
 permissions:
   contents: read
+env:
+  # `mise run` would otherwise install every missing tool in the [tools] table
+  # (two cargo: tools build from source); each job installs only what it needs.
+  MISE_AUTO_INSTALL: "false"
 jobs:
-  # Installs only what the job needs; the full [tools] table builds two cargo: tools from source.
   check:
     runs-on: ubuntu-latest
     steps:
