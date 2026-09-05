@@ -1,0 +1,30 @@
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+  schedule:
+    - cron: "17 3 * * *"   # nightly tier
+permissions:
+  contents: read
+env:
+  # `mise run` would otherwise install every missing tool in the [tools] table
+  # (two cargo: tools build from source); each job installs only what it needs.
+  MISE_AUTO_INSTALL: "false"
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with: { install: false, cache: true }
+      - run: mise install rust cargo:cargo-nextest cargo-insta
+      - run: mise run check
+  audit:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with: { install: false, cache: true }
+      - run: mise install rust cargo:cargo-audit aqua:EmbarkStudios/cargo-deny
+      - run: mise run audit
