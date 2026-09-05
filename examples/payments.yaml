@@ -1,0 +1,24 @@
+apiVersion: hecaton/v1
+kind: Fleet
+name: payments
+defaults:
+  claude:
+    settings: { model: sonnet, permissions: { allow: ["Bash(git *)"] } }
+    args: ["--verbose"]
+    resume: true
+  sandbox:
+    network: { mode: allow }
+  tools: { node: "22.11.0" }
+  env: { RUST_LOG: info }
+  runner: { type: tmux }
+  flow: {}
+crews:
+  backend:
+    repo: acme/payments-api
+    ref: main
+    git: { push: true, auth: gh }
+    defaults:
+      tools: { python: "3.12.8" }
+    agents:
+      alice: {}
+      bob: { claude: { settings: { model: opus } } }
