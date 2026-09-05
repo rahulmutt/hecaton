@@ -1,0 +1,28 @@
+[package]
+name = "hecaton"
+description = "Control plane and orchestrator for fleets of coding agents"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "hecaton"
+path = "src/main.rs"
+
+[dependencies]
+hecaton-api = { workspace = true }
+hecaton-config = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+serde_norway = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
