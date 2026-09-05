@@ -9,7 +9,7 @@ a repository.
 1. `mise trust && mise install` — pinned toolchain (Rust and every tool hecaton shells out to).
 2. `git config core.hooksPath .githooks` — enables the pre-commit tier.
 3. `mise run check` — lint + tests; the same gate CI runs.
-4. `mise x -- cargo run -q -p hecaton -- config resolve examples/payments.yaml`
+4. `mise x -- cargo run -q -p hecaton -- config resolve examples/payments.yaml --no-host-defaults`
    — resolves the example fleet and prints every agent's merged settings.
 
 ## Where to look
