@@ -10,9 +10,9 @@ credentials, hook input, or sandbox rules.
 - `lint`, `test`, `fmt`, `precommit`, `audit` — defined in `mise.toml`.
 
 ## Conventions
-- Ports (`AgentRunner`, `FleetStore`, `EventHandler`) live in `hecaton-core`;
-  adapter crates implement them and never depend on each other. Only the
-  `hecaton` binary wires adapters to ports.
+- Ports (`AgentRunner`, `FleetStore`, `EventHandler`) will live in (Phase 2)
+  `hecaton-core`; adapter crates implement them and never depend on each
+  other. Only the `hecaton` binary wires adapters to ports.
 - Library crates return `thiserror` errors whose messages start with the config
   path (`crews.backend.agents.bob.tools.node: …`); only the binary uses `anyhow`.
 - Every tool version — `mise.toml` and fleet `tools:` — is exact.

@@ -326,7 +326,7 @@ Derived from the devkit skills (`developer-environment`, `writing-clean-code`, `
 ### Developer environment
 
 - Repo `mise.toml` pins **exact** versions of: `rust`, `cargo-nextest`, `cargo-insta`, `cargo-audit`, `cargo-deny`, `cargo-mutants`, `gitleaks`, `tmux`, `gh`, `nono`, `claude`. `git` is not in the mise registry and is a system prerequisite (the devcontainer image provides it). `Cargo.lock` is committed. Native `cargo`; no Bazel trigger applies.
-- Intended crate set, so additions are visible decisions: `tokio`, `axum`, `rustls`/`axum-server`, `serde`, `serde_json`, `serde_yaml`, `thiserror`, `anyhow`, `clap`, `chacha20poly1305`, `prometheus`, `tracing`, `reqwest` (client), `insta`, `proptest`, `proptest-state-machine`.
+- Intended crate set, so additions are visible decisions: `tokio`, `axum`, `rustls`/`axum-server`, `serde`, `serde_json`, `serde_norway`, `thiserror`, `anyhow`, `clap`, `chacha20poly1305`, `prometheus`, `tracing`, `reqwest` (client), `insta`, `proptest`, `proptest-state-machine`.
 - Renovate keeps dependencies current on a cadence.
 
 ### Clean code (Rust)

@@ -22,6 +22,7 @@ pub enum RepoRef {
 impl RepoRef {
     /// Accepts `owner/name`, `https://github.com/owner/name[.git]`,
     /// `git@github.com:owner/name[.git]`, or any other `scheme://` / `user@host:` URL.
+    /// A single trailing `.git` is stripped from any of these forms (never more than one).
     pub fn parse(s: &str) -> Result<Self, RepoError> {
         let err = |reason| RepoError {
             value: s.to_string(),
@@ -31,16 +32,17 @@ impl RepoRef {
             return Err(err("empty"));
         }
         if let Some(rest) = s.strip_prefix("https://github.com/") {
-            return parse_slug(rest.trim_end_matches(".git"))
-                .ok_or_else(|| err("expected owner/name or a clone URL"));
+            let rest = rest.strip_suffix(".git").unwrap_or(rest);
+            return parse_slug(rest).ok_or_else(|| err("expected owner/name or a clone URL"));
         }
         if let Some(rest) = s.strip_prefix("git@github.com:") {
-            return parse_slug(rest.trim_end_matches(".git"))
-                .ok_or_else(|| err("expected owner/name or a clone URL"));
+            let rest = rest.strip_suffix(".git").unwrap_or(rest);
+            return parse_slug(rest).ok_or_else(|| err("expected owner/name or a clone URL"));
         }
         if s.contains("://") || (s.contains('@') && s.contains(':')) {
             return Ok(Self::Url(s.to_string()));
         }
+        let s = s.strip_suffix(".git").unwrap_or(s);
         parse_slug(s).ok_or_else(|| err("expected owner/name or a clone URL"))
     }
 
@@ -71,6 +73,8 @@ fn parse_slug(s: &str) -> Option<RepoRef> {
     let (owner, name) = s.split_once('/')?;
     let ok = |part: &str| {
         !part.is_empty()
+            && part != "."
+            && part != ".."
             && part
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
@@ -99,6 +103,23 @@ mod tests {
         ] {
             assert_eq!(RepoRef::parse(s).unwrap(), expected, "for {s}");
         }
+        assert_eq!(
+            RepoRef::parse("acme/payments-api.git").unwrap(),
+            expected,
+            "shorthand also strips a trailing .git"
+        );
+    }
+
+    #[test]
+    fn double_git_suffix_is_stripped_only_once() {
+        let r = RepoRef::parse("https://github.com/acme/x.git.git").unwrap();
+        assert_eq!(
+            r,
+            RepoRef::GitHub {
+                owner: "acme".into(),
+                name: "x.git".into(),
+            }
+        );
     }
 
     #[test]
@@ -125,6 +146,8 @@ mod tests {
             ("/name", "expected owner/name or a clone URL"),
             ("a/b/c", "expected owner/name or a clone URL"),
             ("acme/pay ments", "expected owner/name or a clone URL"),
+            ("a/..", "expected owner/name or a clone URL"),
+            ("./b", "expected owner/name or a clone URL"),
         ] {
             let err = RepoRef::parse(bad).unwrap_err();
             assert_eq!(err.value, bad);
