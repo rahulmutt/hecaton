@@ -4,7 +4,9 @@
 pub mod error;
 pub mod file;
 pub mod merge;
+pub mod validate;
 
 pub use error::ConfigError;
 pub use file::{CrewFile, FleetFile, parse, read};
 pub use merge::{merge, merge_layers, strip_nulls};
+pub use validate::{RESERVED_ENV_PREFIXES, is_exact_version, validate_agent};
