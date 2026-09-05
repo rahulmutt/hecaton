@@ -97,6 +97,36 @@ fn host_defaults_are_layered_beneath_the_file() {
 }
 
 #[test]
+fn credentials_never_reach_output() {
+    let home = tempfile::tempdir().unwrap();
+    write(
+        home.path(),
+        ".claude/.credentials.json",
+        r#"{"claudeAiOauth":{"accessToken":"sk-ant-FAKE-cred"}}"#,
+    );
+    write(
+        home.path(),
+        ".claude.json",
+        r#"{"oauthAccount":{"emailAddress":"nobody@example.invalid"}}"#,
+    );
+    write(
+        home.path(),
+        ".config/gh/hosts.yml",
+        "github.com:\n    oauth_token: gho_FAKE_token\n",
+    );
+    hecaton(home.path())
+        .args(["config", "resolve", PAYMENTS])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("sk-ant-FAKE-cred").not())
+        .stdout(predicate::str::contains("gho_FAKE_token").not())
+        .stdout(predicate::str::contains("nobody@example.invalid").not())
+        .stderr(predicate::str::contains("sk-ant-FAKE-cred").not())
+        .stderr(predicate::str::contains("gho_FAKE_token").not())
+        .stderr(predicate::str::contains("nobody@example.invalid").not());
+}
+
+#[test]
 fn invalid_config_exits_1_with_the_path_on_stderr() {
     let home = tempfile::tempdir().unwrap();
     let file = write(

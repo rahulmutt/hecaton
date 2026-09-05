@@ -17,7 +17,9 @@ credentials, hook input, or sandbox rules.
   path (`crews.backend.agents.bob.tools.node: …`); only the binary uses `anyhow`.
 - Every tool version — `mise.toml` and fleet `tools:` — is exact.
 - Types holding secrets hand-implement `Debug` and print `<redacted>`. Secrets
-  never go in argv, env, logs, or `config resolve` output.
+  never go in argv, env, or logs; `config resolve` withholds the credential
+  bundle but prints the host `settings.json` verbatim unless
+  `--no-host-defaults` is given.
 - New Cargo dependencies are a deliberate decision: add to
   `[workspace.dependencies]` with an exact version and say why in the commit.
 

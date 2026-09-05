@@ -45,7 +45,7 @@ phases; the rest exist in code today.
 | Threat | Control | Where |
 |---|---|---|
 | Secrets in debug output / logs | `CredentialBundle` hand-implements `Debug` → `<redacted>`; hook payloads logged at `debug` only | `crates/hecaton-api/src/credentials.rs`; *(planned §8)* |
-| Secrets printed by `config resolve` | host credentials are loaded and discarded; only the spec is rendered | `crates/hecaton/src/commands/config.rs` |
+| Secrets printed by `config resolve` | the credential bundle is loaded and discarded; the host settings.json is rendered verbatim as part of the resolved spec, so treat config resolve output as sensitive (use --no-host-defaults for shareable output) | `crates/hecaton/src/commands/config.rs` |
 | Repo/user config overriding hook wiring | `claude.settings.hooks` rejected at validation; daemon re-owns the key when writing `settings.json` | `crates/hecaton-config/src/validate.rs`; *(planned §6)* |
 | User `env` clobbering isolation variables | reserved `HOME`, `XDG_*`, `CLAUDE_CONFIG_DIR`, `GH_CONFIG_DIR`, `MISE_*`, `HECATON_*`, `PATH` rejected | `crates/hecaton-config/src/validate.rs` |
 | Malformed names reaching tmux/branch/paths | DNS-label validation on fleet/crew/agent names before anything is created | `crates/hecaton-core/src/name.rs` |
