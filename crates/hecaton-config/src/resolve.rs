@@ -18,6 +18,9 @@ pub struct ResolveOptions {
     /// `--name` on the CLI; wins over the file's `name`.
     pub name_override: Option<String>,
     /// The host's `~/.claude/settings.json`, layered beneath `defaults`.
+    ///
+    /// A `hooks` key in this value is dropped before layering, since hecaton
+    /// owns that key downstream (see `validate::validate_agent`).
     pub host_claude_settings: Option<Value>,
 }
 
@@ -31,10 +34,13 @@ pub fn resolve(file: &FleetFile, opts: &ResolveOptions) -> Result<FleetSpec, Con
             path: "name".to_string(),
             message: "required; set `name` in the file or pass --name".to_string(),
         })?;
-    let host_layer = opts
-        .host_claude_settings
-        .as_ref()
-        .map(|s| json!({ "claude": { "settings": s } }));
+    let host_layer = opts.host_claude_settings.as_ref().map(|s| {
+        let mut s = s.clone();
+        if let Some(obj) = s.as_object_mut() {
+            obj.remove("hooks");
+        }
+        json!({ "claude": { "settings": s } })
+    });
     expect_mapping("defaults", &file.defaults)?;
 
     let mut crews = BTreeMap::new();
@@ -169,6 +175,31 @@ crews:
         assert_eq!(
             spec.crews["c"].agents["a"].claude.settings,
             json!({"model": "sonnet", "theme": "dark"})
+        );
+    }
+
+    #[test]
+    fn host_hooks_are_ignored_not_rejected() {
+        let yaml = "apiVersion: hecaton/v1\nkind: Fleet\nname: f\ncrews:\n  c:\n    repo: o/r\n    agents:\n      a: {}\n";
+        let host = json!({"hooks": {"PreToolUse": []}, "model": "haiku"});
+        let spec = resolve(
+            &file(yaml),
+            &ResolveOptions {
+                host_claude_settings: Some(host),
+                ..opts()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            spec.crews["c"].agents["a"].claude.settings,
+            json!({"model": "haiku"})
+        );
+
+        let fleet_hooks_yaml = "apiVersion: hecaton/v1\nkind: Fleet\nname: f\ndefaults:\n  claude: { settings: { hooks: {} } }\ncrews:\n  c:\n    repo: o/r\n    agents:\n      a: {}\n";
+        let err = resolve(&file(fleet_hooks_yaml), &opts()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "crews.c.agents.a.claude.settings.hooks: hecaton owns this key; configure hook behaviour via `flow` instead"
         );
     }
 
