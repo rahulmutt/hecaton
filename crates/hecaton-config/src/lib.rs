@@ -2,7 +2,9 @@
 //! (spec §5). Pure apart from reading the file and host defaults.
 
 pub mod error;
+pub mod file;
 pub mod merge;
 
 pub use error::ConfigError;
+pub use file::{CrewFile, FleetFile, parse, read};
 pub use merge::{merge, merge_layers, strip_nulls};
