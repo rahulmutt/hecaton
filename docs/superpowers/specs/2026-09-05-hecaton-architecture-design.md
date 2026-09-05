@@ -1,7 +1,7 @@
 # Hecaton — Architecture Design
 
 **Date:** 2026-09-05
-**Status:** Draft for review; supersedes `docs/bootstrap.md` (the origin brief)
+**Status:** Approved 2026-09-05; supersedes `docs/bootstrap.md` (the origin brief)
 **Scope:** Whole-system architecture. Implementation is split into two follow-up
 specs (see §11): *Spec A — vertical slice* and *Spec B — state machine*.
 
