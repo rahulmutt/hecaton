@@ -325,7 +325,7 @@ Derived from the devkit skills (`developer-environment`, `writing-clean-code`, `
 
 ### Developer environment
 
-- Repo `mise.toml` pins **exact** versions of: `rust`, `cargo-nextest`, `cargo-insta`, `cargo-audit`, `cargo-deny`, `cargo-mutants`, `gitleaks`, `tmux`, `git`, `gh`, `nono`, `claude`. `Cargo.lock` is committed. Native `cargo`; no Bazel trigger applies.
+- Repo `mise.toml` pins **exact** versions of: `rust`, `cargo-nextest`, `cargo-insta`, `cargo-audit`, `cargo-deny`, `cargo-mutants`, `gitleaks`, `tmux`, `gh`, `nono`, `claude`. `git` is not in the mise registry and is a system prerequisite (the devcontainer image provides it). `Cargo.lock` is committed. Native `cargo`; no Bazel trigger applies.
 - Intended crate set, so additions are visible decisions: `tokio`, `axum`, `rustls`/`axum-server`, `serde`, `serde_json`, `serde_yaml`, `thiserror`, `anyhow`, `clap`, `chacha20poly1305`, `prometheus`, `tracing`, `reqwest` (client), `insta`, `proptest`, `proptest-state-machine`.
 - Renovate keeps dependencies current on a cadence.
 
@@ -346,7 +346,7 @@ Cheapest layer that catches the bug class, climbing only when needed.
 | static | `cargo fmt --check`, `clippy -D warnings` | — |
 | unit | reconciler decisions, merge rules, validators | specified |
 | golden (`insta`) | resolved spec; generated `settings.json`, `mise.toml`, `nono-profile.json`, `launch.sh` | recorded (narrow snapshots, reviewed, deterministic) |
-| property (`proptest`) | merge is associative and idempotent; `FleetSpec` serde round-trips | invariant |
+| property (`proptest`) | merge never emits `null`, is idempotent (`merge(a,a) = strip_nulls(a)`), and re-applying an overlay is a no-op; `FleetSpec` serde round-trips. (Merge is deliberately a left fold and *not* associative — `null` deletes relative to the layers beneath it.) | invariant |
 | model-based (`proptest-state-machine`) | reconciler vs. a reference model over random `up / update / down / agent-dies` sequences, through `FakeRunner` + `InMemoryStore` | derived |
 | integration | runtime adapters against real `tmux`, `git`, `mise`, `nono` in a temp XDG root and a local bare repo | specified |
 | fuzz (`cargo-fuzz`) | YAML config parser; hook-event JSON (untrusted input from agents) | crash |
