@@ -3,13 +3,16 @@
 //! HTTP API, hook ingress and metrics. Depends on `hecaton-core` and
 //! `hecaton-api` only; the binary wires the runtime adapters in.
 
+pub mod actor;
 pub mod auth;
 pub mod fsutil;
 pub mod hooks;
 pub mod metrics;
 pub mod store;
+pub mod testing;
 pub mod vault;
 
+pub use actor::{FleetHandle, Msg, Ports, READY_EVENT, SecretIndex, Shared};
 pub use auth::{RateLimiter, bearer, constant_time_eq};
 pub use hooks::{ParsedEvent, parse_event};
 pub use metrics::Metrics;

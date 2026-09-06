@@ -1,0 +1,627 @@
+//! One task per fleet (Phase 3 spec §3.2, P3-4): the single writer of that
+//! fleet's record, secrets and status. Passes run in `spawn_blocking`;
+//! snapshots go out on a `watch` channel; the inbox queues while a pass
+//! runs, so a Ready arriving mid-pass lands when the pass ends.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use hecaton_api::{CredentialBundle, FleetSpec, Timestamp};
+use hecaton_core::reconcile::{ReconcileContext, agent_ready, reconcile_pass, set_desired};
+use hecaton_core::{
+    AgentId, AgentRunner, Clock, Desired, Fleet, FleetName, FleetRecord, FleetSecrets, FleetStore,
+    HookTarget, Keep, Materializer, ReconcilePolicy, ResolvedAgent,
+};
+use tokio::sync::{RwLock, mpsc, oneshot, watch};
+
+use crate::metrics::Metrics;
+use crate::vault::random_hex;
+
+/// The hook event that means "Claude is up and accepting input".
+pub const READY_EVENT: &str = "SessionStart";
+
+pub enum Msg {
+    Apply {
+        spec: FleetSpec,
+        credentials: CredentialBundle,
+        reply: oneshot::Sender<FleetRecord>,
+    },
+    Down {
+        keep: Keep,
+        purge: bool,
+        reply: oneshot::Sender<FleetRecord>,
+    },
+    Event {
+        agent: AgentId,
+        name: String,
+        at: Timestamp,
+    },
+}
+
+#[derive(Clone)]
+pub struct FleetHandle {
+    pub tx: mpsc::Sender<Msg>,
+    pub status: watch::Receiver<FleetRecord>,
+}
+
+/// Everything every actor shares read-only.
+pub struct Ports {
+    pub materializer: Arc<dyn Materializer>,
+    pub runner: Arc<dyn AgentRunner>,
+    pub clock: Arc<dyn Clock>,
+    pub store: Arc<dyn FleetStore>,
+    pub policy: ReconcilePolicy,
+    /// `http://127.0.0.1:<port>`; every agent's hooks post here.
+    pub hook_url: String,
+    pub resync: Duration,
+}
+
+/// Agent id → the bearer secret its hooks present. Ingress authenticates
+/// against this; actors keep it current.
+pub type SecretIndex = Arc<RwLock<HashMap<AgentId, String>>>;
+
+#[derive(Clone)]
+pub struct Shared {
+    pub hook_secrets: SecretIndex,
+    pub metrics: Metrics,
+    /// An actor announces its own name here after a purge; the registry
+    /// drops the handle.
+    pub purged: mpsc::Sender<FleetName>,
+}
+
+pub fn shared(metrics: Metrics) -> (Shared, mpsc::Receiver<FleetName>) {
+    let (purged, rx) = mpsc::channel(16);
+    (
+        Shared {
+            hook_secrets: Arc::default(),
+            metrics,
+            purged,
+        },
+        rx,
+    )
+}
+
+/// Starts the actor. `initial_pass` is true for records loaded at startup
+/// (reconcile what tmux still has) and false for a fresh `POST`, whose
+/// `Apply` triggers the first pass.
+pub fn spawn(
+    name: FleetName,
+    record: FleetRecord,
+    secrets: FleetSecrets,
+    ports: Arc<Ports>,
+    shared: Shared,
+    initial_pass: bool,
+) -> FleetHandle {
+    let (tx, rx) = mpsc::channel(1024);
+    let (publish, status) = watch::channel(record.clone());
+    let actor = Actor {
+        name,
+        record,
+        secrets,
+        ports,
+        shared,
+        publish,
+        rx,
+        last_pass_clean: true,
+    };
+    tokio::spawn(actor.run(initial_pass));
+    FleetHandle { tx, status }
+}
+
+struct Actor {
+    name: FleetName,
+    record: FleetRecord,
+    secrets: FleetSecrets,
+    ports: Arc<Ports>,
+    shared: Shared,
+    publish: watch::Sender<FleetRecord>,
+    rx: mpsc::Receiver<Msg>,
+    /// A pass with a failed step retries at the resync cadence, not at
+    /// `next_restart_at`: a failing clone must not spin.
+    last_pass_clean: bool,
+}
+
+impl Actor {
+    async fn run(mut self, initial_pass: bool) {
+        self.seed_index().await;
+        if initial_pass && !self.record.is_down() {
+            self.pass().await;
+        }
+        loop {
+            let deadline = self.deadline();
+            let msg = tokio::select! {
+                m = self.rx.recv() => match m {
+                    Some(m) => Some(m),
+                    None => return,
+                },
+                () = tokio::time::sleep_until(deadline) => None,
+            };
+            match msg {
+                Some(Msg::Apply {
+                    spec,
+                    credentials,
+                    reply,
+                }) => {
+                    self.apply(spec, credentials).await;
+                    let _ = reply.send(self.record.clone());
+                    self.pass().await;
+                }
+                Some(Msg::Down { keep, purge, reply }) => {
+                    self.record.desired = Desired::Down { keep, purge };
+                    self.publish();
+                    let _ = reply.send(self.record.clone());
+                    self.pass().await;
+                }
+                Some(Msg::Event { agent, name, at }) => self.event(agent, name, at).await,
+                None => self.pass().await,
+            }
+            if matches!(self.record.desired, Desired::Down { purge: true, .. })
+                && self.record.is_down()
+            {
+                self.purge().await;
+                return;
+            }
+        }
+    }
+
+    fn deadline(&self) -> tokio::time::Instant {
+        let now = tokio::time::Instant::now();
+        let resync = now + self.ports.resync;
+        if !self.last_pass_clean {
+            return resync;
+        }
+        let now_ts = self.ports.clock.now();
+        match self
+            .record
+            .status
+            .agents
+            .values()
+            .filter_map(|a| a.next_restart_at)
+            .min()
+        {
+            Some(due) => (now + Duration::from_secs(due.0.saturating_sub(now_ts.0))).min(resync),
+            None => resync,
+        }
+    }
+
+    /// Ids of the agents the current spec wants, or none if the spec does
+    /// not convert (the API validated it; a stored record may not).
+    fn wanted_agents(&self) -> Vec<AgentId> {
+        Fleet::try_from(self.record.spec.clone())
+            .map(|f| {
+                ResolvedAgent::from_fleet(&f)
+                    .into_iter()
+                    .map(|a| a.id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    async fn seed_index(&self) {
+        let mut idx = self.shared.hook_secrets.write().await;
+        for (id, secret) in &self.secrets.hook_secrets {
+            if let Ok(id) = id.parse::<AgentId>() {
+                idx.insert(id, secret.clone());
+            }
+        }
+    }
+
+    async fn apply(&mut self, spec: FleetSpec, credentials: CredentialBundle) {
+        self.record.generation += 1;
+        self.record.spec = spec;
+        self.record.desired = Desired::Up;
+        set_desired(&mut self.record.status, self.record.generation);
+        self.secrets.credentials = credentials;
+        let wanted = self.wanted_agents();
+        let mut next = BTreeMap::new();
+        for id in &wanted {
+            let key = id.to_string();
+            let secret = self
+                .secrets
+                .hook_secrets
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| random_hex(32));
+            next.insert(key, secret);
+        }
+        self.secrets.hook_secrets = next;
+        {
+            let mut idx = self.shared.hook_secrets.write().await;
+            idx.retain(|id, _| id.fleet != self.name);
+            for id in &wanted {
+                if let Some(s) = self.secrets.hook_secrets.get(&id.to_string()) {
+                    idx.insert(id.clone(), s.clone());
+                }
+            }
+        }
+        self.publish();
+    }
+
+    async fn event(&mut self, agent: AgentId, name: String, at: Timestamp) {
+        if name == READY_EVENT {
+            agent_ready(&mut self.record.status, &agent, at);
+            self.persist().await;
+        } else if let Some(a) = self.record.status.agents.get_mut(&agent.to_string()) {
+            a.last_event_at = Some(at);
+        }
+        self.publish();
+    }
+
+    async fn pass(&mut self) {
+        let ports = self.ports.clone();
+        let name = self.name.clone();
+        let desired = match self.record.desired {
+            Desired::Up => Some(Fleet::try_from(self.record.spec.clone())),
+            Desired::Down { .. } => None,
+        };
+        let keep = match self.record.desired {
+            Desired::Down { keep, .. } => keep,
+            Desired::Up => Keep::default(),
+        };
+        let before = self.record.status.clone();
+        let mut status = before.clone();
+        let creds = self.secrets.credentials.clone();
+        let hook_secrets = self.secrets.hook_secrets.clone();
+        let started = Instant::now();
+        let joined = tokio::task::spawn_blocking(move || {
+            let fleet = match desired {
+                Some(Ok(f)) => Some(f),
+                Some(Err(e)) => return (status, Err(format!("{name}: invalid stored spec: {e}"))),
+                None => None,
+            };
+            let hooks = |id: &AgentId| HookTarget {
+                url: ports.hook_url.clone(),
+                secret: hook_secrets
+                    .get(&id.to_string())
+                    .cloned()
+                    .unwrap_or_default(),
+            };
+            let ctx = ReconcileContext {
+                fleet: &name,
+                desired: fleet.as_ref(),
+                keep,
+                materializer: ports.materializer.as_ref(),
+                runner: ports.runner.as_ref(),
+                creds: &creds,
+                hooks: &hooks,
+                policy: &ports.policy,
+                clock: ports.clock.as_ref(),
+            };
+            let outcome = reconcile_pass(&mut status, &ctx).map_err(|e| e.to_string());
+            (status, outcome)
+        })
+        .await;
+        let secs = started.elapsed().as_secs_f64();
+        let clean = match joined {
+            Ok((status, Ok((plan, report)))) => {
+                self.record.status = status;
+                for (step, err) in &report.failures {
+                    tracing::warn!(fleet = %self.name, step = %step, "step failed: {err}");
+                }
+                tracing::info!(
+                    fleet = %self.name,
+                    steps = plan.len(),
+                    failed = report.failures.len(),
+                    skipped = report.skipped.len(),
+                    phase = ?self.record.status.phase,
+                    "reconciled"
+                );
+                report.all_ok()
+            }
+            Ok((status, Err(e))) => {
+                self.record.status = status;
+                tracing::error!(fleet = %self.name, "pass failed: {e}");
+                false
+            }
+            Err(e) => {
+                tracing::error!(fleet = %self.name, "reconcile task panicked: {e}");
+                false
+            }
+        };
+        self.last_pass_clean = clean;
+        self.shared
+            .metrics
+            .reconcile(self.name.as_str(), secs, clean);
+        for (id, a) in &self.record.status.agents {
+            let prev = before.agents.get(id).map_or(0, |p| p.restarts);
+            if a.restarts > prev
+                && let Ok(aid) = id.parse::<AgentId>()
+            {
+                self.shared.metrics.restart(&aid);
+            }
+        }
+        self.persist().await;
+        self.publish();
+    }
+
+    async fn persist(&self) {
+        let store = self.ports.store.clone();
+        let record = self.record.clone();
+        let secrets = self.secrets.clone();
+        match tokio::task::spawn_blocking(move || store.put(&record, &secrets)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!(fleet = %self.name, "persist failed: {e}"),
+            Err(e) => tracing::error!(fleet = %self.name, "persist task panicked: {e}"),
+        }
+    }
+
+    fn publish(&self) {
+        let _ = self.publish.send(self.record.clone());
+    }
+
+    async fn purge(&mut self) {
+        let store = self.ports.store.clone();
+        let name = self.name.clone();
+        match tokio::task::spawn_blocking(move || store.purge(&name)).await {
+            Ok(Ok(())) => tracing::info!(fleet = %self.name, "purged"),
+            Ok(Err(e)) => tracing::error!(fleet = %self.name, "purge failed: {e}"),
+            Err(e) => tracing::error!(fleet = %self.name, "purge task panicked: {e}"),
+        }
+        self.shared
+            .hook_secrets
+            .write()
+            .await
+            .retain(|id, _| id.fleet != self.name);
+        let _ = self.shared.purged.send(self.name.clone()).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::Harness;
+    use hecaton_api::{AgentPhase, AgentSettings, CrewSpec, FleetPhase, GitSettings};
+    use hecaton_core::ProcessState;
+    use std::collections::BTreeMap;
+
+    fn spec(agents: &[&str]) -> FleetSpec {
+        FleetSpec {
+            name: "f".into(),
+            crews: BTreeMap::from([(
+                "c".to_string(),
+                CrewSpec {
+                    repo: "acme/x".into(),
+                    git_ref: "main".into(),
+                    git: GitSettings::default(),
+                    agents: agents
+                        .iter()
+                        .map(|a| (a.to_string(), AgentSettings::default()))
+                        .collect(),
+                },
+            )]),
+        }
+    }
+
+    fn id(s: &str) -> AgentId {
+        s.parse().unwrap()
+    }
+
+    async fn wait(
+        rx: &mut watch::Receiver<FleetRecord>,
+        pred: impl Fn(&FleetRecord) -> bool,
+    ) -> FleetRecord {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if pred(&rx.borrow()) {
+                    return rx.borrow().clone();
+                }
+                rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("condition not reached; last: {:#?}", rx.borrow().status))
+    }
+
+    async fn apply(h: &FleetHandle, spec: FleetSpec) -> FleetRecord {
+        let (tx, rx) = oneshot::channel();
+        h.tx.send(Msg::Apply {
+            spec,
+            credentials: CredentialBundle::default(),
+            reply: tx,
+        })
+        .await
+        .unwrap();
+        rx.await.unwrap()
+    }
+
+    async fn down(h: &FleetHandle, purge: bool) -> FleetRecord {
+        let (tx, rx) = oneshot::channel();
+        h.tx.send(Msg::Down {
+            keep: Keep::default(),
+            purge,
+            reply: tx,
+        })
+        .await
+        .unwrap();
+        rx.await.unwrap()
+    }
+
+    fn start(h: &Harness) -> (FleetHandle, Shared, mpsc::Receiver<FleetName>) {
+        let (shared, purged) = shared(Metrics::new().unwrap());
+        let handle = spawn(
+            "f".parse().unwrap(),
+            FleetRecord::new(spec(&[])),
+            FleetSecrets::default(),
+            h.ports.clone(),
+            shared.clone(),
+            false,
+        );
+        (handle, shared, purged)
+    }
+
+    #[tokio::test]
+    async fn apply_reconciles_mints_secrets_and_persists() {
+        let h = Harness::new(Duration::from_secs(3600));
+        let (handle, shared, _purged) = start(&h);
+        let reply = apply(&handle, spec(&["a", "b"])).await;
+        assert_eq!(reply.generation, 1);
+        assert_eq!(reply.desired, Desired::Up);
+        let mut rx = handle.status.clone();
+        let rec = wait(&mut rx, |r| r.status.observed_generation == 1).await;
+        assert_eq!(rec.status.agents["f/c/a"].phase, AgentPhase::Starting);
+        assert_eq!(rec.status.phase, FleetPhase::Reconciling);
+        assert!(h.runner.calls().contains(&"ensure_agent f/c/b".to_string()));
+        let idx = shared.hook_secrets.read().await;
+        assert_eq!(idx.len(), 2);
+        assert_eq!(idx[&id("f/c/a")].len(), 64, "32 random bytes as hex");
+        let (stored, secrets) = h.store.get("f").unwrap();
+        assert_eq!(stored.generation, 1);
+        assert_eq!(secrets.hook_secrets.len(), 2);
+        assert_eq!(secrets.hook_secrets["f/c/a"], idx[&id("f/c/a")]);
+    }
+
+    #[tokio::test]
+    async fn session_start_readies_an_agent_and_a_new_apply_keeps_its_secret() {
+        let h = Harness::new(Duration::from_secs(3600));
+        let (handle, shared, _purged) = start(&h);
+        apply(&handle, spec(&["a", "b"])).await;
+        let mut rx = handle.status.clone();
+        wait(&mut rx, |r| r.status.observed_generation == 1).await;
+
+        handle
+            .tx
+            .send(Msg::Event {
+                agent: id("f/c/a"),
+                name: READY_EVENT.into(),
+                at: Timestamp(5),
+            })
+            .await
+            .unwrap();
+        let rec = wait(&mut rx, |r| {
+            r.status.agents["f/c/a"].phase == AgentPhase::Ready
+        })
+        .await;
+        assert_eq!(rec.status.agents["f/c/a"].last_event_at, Some(Timestamp(5)));
+        assert_eq!(
+            h.store.get("f").unwrap().0.status.agents["f/c/a"].phase,
+            AgentPhase::Ready,
+            "a phase change is persisted"
+        );
+
+        handle
+            .tx
+            .send(Msg::Event {
+                agent: id("f/c/b"),
+                name: "PreToolUse".into(),
+                at: Timestamp(9),
+            })
+            .await
+            .unwrap();
+        let rec = wait(&mut rx, |r| {
+            r.status.agents["f/c/b"].last_event_at == Some(Timestamp(9))
+        })
+        .await;
+        assert_eq!(
+            rec.status.agents["f/c/b"].phase,
+            AgentPhase::Starting,
+            "only SessionStart readies"
+        );
+
+        let before = shared.hook_secrets.read().await[&id("f/c/a")].clone();
+        let reply = apply(&handle, spec(&["a"])).await;
+        assert_eq!(reply.generation, 2);
+        wait(&mut rx, |r| r.status.observed_generation == 2).await;
+        let idx = shared.hook_secrets.read().await;
+        assert_eq!(idx.len(), 1);
+        assert_eq!(
+            idx[&id("f/c/a")],
+            before,
+            "a surviving agent keeps its secret"
+        );
+        assert!(h.runner.calls().contains(&"stop_agent f/c/b".to_string()));
+        assert_eq!(h.store.get("f").unwrap().1.hook_secrets.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn down_settles_then_purge_removes_everything_and_ends_the_task() {
+        let h = Harness::new(Duration::from_secs(3600));
+        let (handle, shared, mut purged) = start(&h);
+        apply(&handle, spec(&["a"])).await;
+        let mut rx = handle.status.clone();
+        wait(&mut rx, |r| r.status.observed_generation == 1).await;
+
+        let reply = down(&handle, false).await;
+        assert!(matches!(reply.desired, Desired::Down { purge: false, .. }));
+        let rec = wait(&mut rx, |r| r.status.phase == FleetPhase::Down).await;
+        assert!(rec.is_down());
+        assert!(h.runner.observed().crews.is_empty());
+        assert_eq!(h.store.names(), vec!["f"], "record kept until purge");
+
+        down(&handle, true).await;
+        let name = tokio::time::timeout(Duration::from_secs(5), purged.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(name.as_str(), "f");
+        assert!(h.store.names().is_empty());
+        assert!(shared.hook_secrets.read().await.is_empty());
+        tokio::time::timeout(Duration::from_secs(5), handle.tx.closed())
+            .await
+            .expect("actor task ends after purge");
+    }
+
+    #[tokio::test]
+    async fn an_exit_is_noted_then_restarted_on_the_timer() {
+        let policy = ReconcilePolicy {
+            max_restarts: 5,
+            backoff_base_secs: 0,
+            backoff_cap_secs: 0,
+        };
+        let h = Harness::with_policy(Duration::from_millis(50), policy);
+        let (handle, shared, _purged) = start(&h);
+        apply(&handle, spec(&["a"])).await;
+        let mut rx = handle.status.clone();
+        wait(&mut rx, |r| r.status.observed_generation == 1).await;
+
+        h.runner
+            .set_state(&id("f/c/a"), ProcessState::Exited { code: Some(1) });
+        let rec = wait(&mut rx, |r| r.status.agents["f/c/a"].restarts == 1).await;
+        assert!(
+            rec.status.agents["f/c/a"]
+                .message
+                .starts_with("exited with status 1")
+        );
+        wait(&mut rx, |r| {
+            r.status.agents["f/c/a"].next_restart_at.is_none()
+                && h.runner
+                    .calls()
+                    .iter()
+                    .filter(|c| *c == "ensure_agent f/c/a")
+                    .count()
+                    == 2
+        })
+        .await;
+        assert!(
+            shared
+                .metrics
+                .encode()
+                .contains("hecaton_agent_restarts_total{agent=\"a\",crew=\"c\",fleet=\"f\"} 1")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_loaded_record_seeds_the_secret_index_and_reconciles_once() {
+        let h = Harness::new(Duration::from_secs(3600));
+        let (shared, _purged) = shared(Metrics::new().unwrap());
+        let mut record = FleetRecord::new(spec(&["a"]));
+        record.generation = 3;
+        record.status.generation = 3;
+        let secrets = FleetSecrets {
+            hook_secrets: BTreeMap::from([("f/c/a".to_string(), "kept".to_string())]),
+            ..FleetSecrets::default()
+        };
+        let handle = spawn(
+            "f".parse().unwrap(),
+            record,
+            secrets,
+            h.ports.clone(),
+            shared.clone(),
+            true,
+        );
+        let mut rx = handle.status.clone();
+        let rec = wait(&mut rx, |r| r.status.observed_generation == 3).await;
+        assert_eq!(rec.status.agents["f/c/a"].phase, AgentPhase::Starting);
+        assert_eq!(shared.hook_secrets.read().await[&id("f/c/a")], "kept");
+    }
+}
