@@ -25,6 +25,16 @@ pub fn agent_env(
         ("CLAUDE_CONFIG_DIR".to_string(), s(&paths.claude_dir())),
         ("GH_CONFIG_DIR".to_string(), s(&paths.gh_dir())),
         ("MISE_GLOBAL_CONFIG_FILE".to_string(), s(&paths.mise_toml)),
+        // The in-sandbox counterpart of the `cwd=/` the daemon's `mise
+        // install` uses: mise otherwise walks up from the workspace and
+        // applies every `mise.toml` it finds. The repository's own file is
+        // applied even though `mise trust` never covered it (mise 2026.9.1
+        // honours `[tools]` from an untrusted config), which pulls in tools
+        // the daemon never installed and the sandbox cannot download; an
+        // ancestor file that the profile does not grant is worse still —
+        // mise exits on the read error. A ceiling at the workspace stops the
+        // walk before either, leaving only the generated global file.
+        ("MISE_CEILING_PATHS".to_string(), s(&paths.workspace)),
         ("MISE_DATA_DIR".to_string(), s(&layout.mise_data_dir())),
         ("MISE_CONFIG_DIR".to_string(), s(&paths.mise_config_dir())),
         ("MISE_STATE_DIR".to_string(), s(&paths.mise_state_dir())),
@@ -76,7 +86,11 @@ mod tests {
         assert_eq!(env["HECATON_AGENT_ID"], "payments/backend/alice");
         assert_eq!(env["MISE_DATA_DIR"], "/h/.local/share/hecaton/mise");
         assert_eq!(env["HECATON_HOOK_SECRET"], "hook-s3");
+        assert_eq!(
+            env["MISE_CEILING_PATHS"],
+            "/h/.local/state/hecaton/fleets/payments/crews/backend/agents/alice/workspace"
+        );
         assert!(!env.contains_key("PATH"), "PATH is nono's");
-        assert_eq!(env.len(), 19);
+        assert_eq!(env.len(), 20);
     }
 }

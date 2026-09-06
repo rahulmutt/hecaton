@@ -162,6 +162,7 @@ python = "3.12.8"
       "HECATON_HOOK_SECRET": "secret-alice",
       "HOME": "<root>/state/fleets/payments/crews/backend/agents/alice/home",
       "MISE_CACHE_DIR": "<root>/state/fleets/payments/crews/backend/agents/alice/home/.cache/mise",
+      "MISE_CEILING_PATHS": "<root>/state/fleets/payments/crews/backend/agents/alice/workspace",
       "MISE_CONFIG_DIR": "<root>/state/fleets/payments/crews/backend/agents/alice/home/.config/mise",
       "MISE_DATA_DIR": "<root>/data/mise",
       "MISE_GLOBAL_CONFIG_FILE": "<root>/state/fleets/payments/crews/backend/agents/alice/mise.toml",
@@ -186,6 +187,7 @@ python = "3.12.8"
       "/bin",
       "/etc",
       "<root>/data/mise",
+      "<root>/state/fleets/payments/crews/backend/agents/alice/mise.toml",
       "/tools/hecaton"
     ]
   },
@@ -369,6 +371,7 @@ python = "3.12.8"
       "HECATON_HOOK_SECRET": "secret-bob",
       "HOME": "<root>/state/fleets/payments/crews/backend/agents/bob/home",
       "MISE_CACHE_DIR": "<root>/state/fleets/payments/crews/backend/agents/bob/home/.cache/mise",
+      "MISE_CEILING_PATHS": "<root>/state/fleets/payments/crews/backend/agents/bob/workspace",
       "MISE_CONFIG_DIR": "<root>/state/fleets/payments/crews/backend/agents/bob/home/.config/mise",
       "MISE_DATA_DIR": "<root>/data/mise",
       "MISE_GLOBAL_CONFIG_FILE": "<root>/state/fleets/payments/crews/backend/agents/bob/mise.toml",
@@ -393,6 +396,7 @@ python = "3.12.8"
       "/bin",
       "/etc",
       "<root>/data/mise",
+      "<root>/state/fleets/payments/crews/backend/agents/bob/mise.toml",
       "/tools/hecaton"
     ]
   },

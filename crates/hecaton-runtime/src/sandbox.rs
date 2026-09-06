@@ -28,6 +28,11 @@ pub fn hecaton_grants(
 ) -> Grants {
     let mut read: Vec<PathBuf> = SYSTEM_READ.iter().map(PathBuf::from).collect();
     read.push(layout.mise_data_dir());
+    // `MISE_GLOBAL_CONFIG_FILE` points at the agent's generated `mise.toml`,
+    // which sits in the agent root — outside every `allow` below. Without
+    // this single-file grant the sandboxed `mise exec` cannot read its own
+    // config and dies with "Permission denied (os error 13)".
+    read.push(paths.mise_toml.clone());
     // The `SessionStart` relay hook runs this binary inside the sandbox
     // (nono 0.75.0 validates and enforces a single-file `read` entry, and
     // `nono run` inside such a profile executes the granted binary).
@@ -255,7 +260,11 @@ mod tests {
         assert_eq!(p["meta"]["name"], "hecaton-f-c-a");
         assert_eq!(p["filesystem"]["read"][0], "/usr");
         assert_eq!(p["filesystem"]["read"][5], "/h/.local/share/hecaton/mise");
-        assert_eq!(p["filesystem"]["read"][6], "/opt/hecaton");
+        assert_eq!(
+            p["filesystem"]["read"][6],
+            "/h/.local/state/hecaton/fleets/f/crews/c/agents/a/mise.toml"
+        );
+        assert_eq!(p["filesystem"]["read"][7], "/opt/hecaton");
         assert_eq!(
             p["filesystem"]["allow"][2],
             "/h/.local/state/hecaton/fleets/f/crews/c/repo/.git"
