@@ -13,7 +13,7 @@ phases; the rest exist in code today.
 - **Host integrity** — agents run arbitrary code; the sandbox is what stands between them and the host.
 
 ## Trust boundaries
-- **CLI ↔ daemon** — resolved specs and credential bundles cross it; the user controls both ends today, but transport is treated as untrusted (future remote control plane).
+- **CLI ↔ daemon** — resolved specs and credential bundles cross it over plain HTTP on `127.0.0.1`, authenticated by a 0600 bearer token; the user controls both ends today.
 - **Agent ↔ daemon (hook ingress)** — event JSON produced by a process running LLM-driven code. **Untrusted input.**
 - **Daemon ↔ disk** — credentials at rest, fleet records.
 - **Agent ↔ host** — filesystem and network from inside the sandbox.
@@ -41,18 +41,21 @@ phases; the rest exist in code today.
 - **A user who runs `hecaton` with real credentials on a host they do not trust** — same trust as running `claude` itself.
 - **Multi-tenant use** — one user per daemon in this iteration.
 - **The per-agent hook secret is readable by its own agent** — it sits in the agent's settings.json; it authenticates only that agent's events.
+- **No TLS on loopback** — an unprivileged local process cannot read loopback traffic; TLS arrives with the remote control plane (Phase 3 spec P3-1).
+- **The hecaton binary is readable inside the sandbox** (it is the `SessionStart` relay); the admin token and the state root are not granted, so an agent cannot drive the fleet API. `hook-relay` lets an agent post events as itself, which it could already do over HTTP.
 
 ## Mitigations
 | Threat | Control | Where |
 |---|---|---|
-| Secrets in debug output / logs | `CredentialBundle` hand-implements `Debug` → `<redacted>`; hook payloads logged at `debug` only | `crates/hecaton-api/src/credentials.rs`; *(planned §8)* |
+| Secrets in debug output / logs | `CredentialBundle` hand-implements `Debug` → `<redacted>`; hook payloads logged at `debug` only | `crates/hecaton-api/src/credentials.rs`; hook payloads logged at debug only (`daemon.rs`); the e2e asserts no hook secret or token appears in `server.log` or any `launch.sh` |
 | Secrets printed by `config resolve` | the credential bundle is loaded and discarded; the host settings.json is rendered verbatim as part of the resolved spec, so treat config resolve output as sensitive (use --no-host-defaults for shareable output) | `crates/hecaton/src/commands/config.rs` |
 | Repo/user config overriding hook wiring | `claude.settings.hooks` rejected at validation; daemon re-owns the key when writing `settings.json` | `crates/hecaton-config/src/validate.rs`; *(planned §6)* |
 | User `env` clobbering isolation variables | reserved `HOME`, `XDG_*`, `CLAUDE_CONFIG_DIR`, `GH_CONFIG_DIR`, `MISE_*`, `HECATON_*`, `PATH` rejected; the agent environment is set through the nono profile's set_vars (deny_vars ["*"]), so nothing but PATH crosses from the outer process | `crates/hecaton-config/src/validate.rs`; `crates/hecaton-runtime/src/env.rs`, `sandbox.rs` |
 | Malformed names reaching tmux/branch/paths | DNS-label validation on fleet/crew/agent names before anything is created | `crates/hecaton-core/src/name.rs` |
-| Credentials at rest | vault key 0600, XChaCha20-Poly1305, plaintext only while writing an agent's `.credentials.json` | *(planned §7)* |
-| Forged hook events | per-agent secret, body size limit, timeout, per-agent rate limit, validation at the edge | *(planned §7–§8)* |
-| Local process reaching the API | loopback bind, TLS, bearer token 0600 | *(planned §7)* |
+| Credentials at rest | vault key 0600 created at first serve; secrets.enc holds XChaCha20-Poly1305 ciphertext with the fleet name as AAD; plaintext only while writing an agent's files | `crates/hecaton-server/src/vault.rs`, `store.rs` |
+| Forged hook events | per-agent 32-byte secret compared in constant time (unknown agent and bad secret answer alike), checked before the per-agent rate limiter and before body validation; 20/s burst 50 per agent, 1 MiB body, JSON-object-with-string-name validation at the edge, 2 s handler timeout | `crates/hecaton-server/src/hooks.rs`, `auth.rs`, `daemon.rs` |
+| Local process reaching the API | loopback bind, 0600 admin token compared in constant time on every /v1/fleets route | `crates/hecaton-server/src/api.rs`, `lifecycle.rs` |
 | Sandbox mis-grants | generated nono profile with explicit read-only system paths and read-write `home/`+`workspace/`; `nono profile validate` before launch; user grants that conflict are rejected, not overridden | `crates/hecaton-runtime/src/sandbox.rs` (conflicts rejected with a path; `nono profile validate` before launch) |
 | Secrets in argv / env / `launch.sh` | gh token only in `hosts.yml` 0600; Claude creds only in `.credentials.json`; `settings.json` holds the per-agent hook secret and is 0600 inside a 0700 `home/`; argv arrays, shell-quoted `launch.sh` | `crates/hecaton-runtime/src/launch.rs` (no credential is an input), `home.rs`, `workspace.rs` (gh token only in two 0600 `hosts.yml` files) |
+| Hook secret at rest on the agent side | `settings.json` (HTTP header) and `nono-profile.json` (`HECATON_HOOK_SECRET`) are 0600 inside a 0700 agent dir; the secret authenticates only that agent; `nono-profile.json` also carries `MISE_CEILING_PATHS`/`MISE_GLOBAL_CONFIG_FILE` (not secrets, just noting the file is the sandbox boundary) | `crates/hecaton-runtime/src/home.rs`, `sandbox.rs` |
 | Supply chain | exact-pinned `mise.toml`; committed `Cargo.lock`; `cargo audit` + `cargo deny` (`mise run audit`); `gitleaks` in `mise run precommit` | `mise.toml`, `deny.toml` |

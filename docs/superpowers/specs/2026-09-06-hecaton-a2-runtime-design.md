@@ -484,7 +484,9 @@ for §4 environment, §6 worktree and pipeline changes, and §3 ports.
 
 - In-sandbox `git push` needs a credential helper: `home/.gitconfig` with
   `[credential "https://github.com"] helper = !gh auth git-credential` (or
-  `gh auth setup-git` at materialize time). Phase 3.
+  `gh auth setup-git` at materialize time). Phase 3. — Resolved in Phase 3
+  (§6.3 of its spec): `home/.gitconfig` carries the gh credential helper for
+  crews that may push.
 
 ## 10. Done when
 

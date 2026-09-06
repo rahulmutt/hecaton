@@ -11,13 +11,16 @@ credentials, hook input, or sandbox rules.
   git/mise/nono/tmux, with `HECATON_REQUIRE_TOOLS=1` so a missing tool fails
   instead of skipping.
 - `mutants` — nightly tier: mutation-tests `hecaton-core` (the reconciler).
+- `e2e` — the Phase 3 journey against a real daemon; needs the same tools as `test-it`.
+- `serve` — a foreground daemon under `target/tmp/serve` for poking by hand
+  (`HOME` is overridden, so it never touches your real state).
 - `lint`, `test`, `fmt`, `precommit`, `audit` — defined in `mise.toml`.
 
 ## Conventions
-- Ports (`Materializer`, `AgentRunner`, `Clock`; later `FleetStore`,
-  `EventHandler`) live in `hecaton-core`; adapter crates implement them and
-  never depend on each other. Only the `hecaton` binary wires adapters to
-  ports.
+- Ports (`Materializer`, `AgentRunner`, `Clock`, `FleetStore`, `EventHandler`)
+  live in `hecaton-core`; adapter crates implement them and never depend on
+  each other. Only the `hecaton` binary wires adapters to ports;
+  `hecaton-server` receives `Ports` and never imports `hecaton-runtime`.
 - Library crates return `thiserror` errors whose messages start with the config
   path (`crews.backend.agents.bob.tools.node: …`); only the binary uses `anyhow`.
 - Every tool version — `mise.toml` and fleet `tools:` — is exact.
@@ -50,3 +53,19 @@ credentials, hook input, or sandbox rules.
   fixtures do the same — the pre-commit hook exports them, and a git
   subprocess that inherits them operates on this repository instead of the
   test's.
+- The e2e overrides the system tool table with an empty `[tools]` in its scratch
+  `$XDG_CONFIG_HOME/hecaton/mise.toml` so nothing downloads; the real embedded
+  table pins `claude`, and a fresh `up` on a real host installs it.
+- `hecaton dev fake-claude` is what the e2e runs as `claude.binary`; it reads
+  `$CLAUDE_CONFIG_DIR/settings.json` and fires the hooks itself. Change the hooks
+  block in `home.rs` and the fake together.
+- `serve` writes `server/endpoint` after binding; clients resolve `--api-url`,
+  then `HECATON_API_URL`, then that file. Tests bind port 0 and read it.
+- `DELETE …?keep_repos=true`: axum's `Query` rejects bare flags, so every flag is
+  `key=true|false` (`DownQuery::to_query_string`).
+- Hook secrets live in `secrets.enc` (vault), the agent's `settings.json` (HTTP
+  header) and `nono-profile.json` (`HECATON_HOOK_SECRET` for the relay), all 0600.
+- `hecaton-server` and `hecaton` integration tests (`api_it`, `cli_serve`,
+  `cli_fleet`, `e2e`) bind port 0 and use private tmux sockets; if a run is
+  interrupted, kill leftovers via `server/hecaton.pid` under the test's temp
+  HOME and `tmux -L hecaton-e2e-<pid> kill-server`.
