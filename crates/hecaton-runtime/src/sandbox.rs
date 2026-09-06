@@ -131,15 +131,21 @@ pub fn check_conflicts(
     if u.contains_key("meta") {
         return Err(conflict("meta".into(), "hecaton-owned".into()));
     }
-    let Some(Value::Object(fs)) = u.get("filesystem") else {
+    let Some(fs_value) = u.get("filesystem") else {
         return Ok(());
+    };
+    let Value::Object(fs) = fs_value else {
+        return Err(conflict("filesystem".into(), "expected an object".into()));
     };
     for (key, entries) in fs {
         let Some(user_level) = level(key) else {
             continue;
         };
         let Value::Array(items) = entries else {
-            continue;
+            return Err(conflict(
+                format!("filesystem.{key}"),
+                "expected an array".into(),
+            ));
         };
         for (i, item) in items.iter().enumerate() {
             let Some(p) = entry_path(item) else {
@@ -310,6 +316,29 @@ mod tests {
                 &json!({ "filesystem": { "read": ["/usr/share"] } })
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn malformed_filesystem_shapes_are_rejected() {
+        let (id, grants, env) = fixture();
+        let e =
+            render_profile(&id, &grants, 1, &env, &json!({ "filesystem": "nope" })).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "f/c/a: sandbox.filesystem: expected an object"
+        );
+        let e = render_profile(
+            &id,
+            &grants,
+            1,
+            &env,
+            &json!({ "filesystem": { "read": "/opt/data" } }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "f/c/a: sandbox.filesystem.read: expected an array"
         );
     }
 

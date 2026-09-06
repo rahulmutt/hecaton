@@ -58,7 +58,7 @@ pub fn landlock_works(tools: &ToolPaths, root: &Path) -> bool {
         root.file_name().unwrap_or_default().to_string_lossy()
     ));
     std::fs::create_dir_all(&home).unwrap();
-    std::process::Command::new(&tools.nono)
+    let result = std::process::Command::new(&tools.nono)
         .args(["-s", "run", "--allow-cwd", "--", "/bin/true"])
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
@@ -66,5 +66,7 @@ pub fn landlock_works(tools: &ToolPaths, root: &Path) -> bool {
         .current_dir(root)
         .status()
         .map(|s| s.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    let _ = std::fs::remove_dir_all(&home);
+    result
 }
