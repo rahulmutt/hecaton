@@ -92,16 +92,10 @@ impl Runtime {
         )?;
         let profile_changed = write_profile(id, &paths, &profile)?;
 
-        let resume = wants_continue(&agent.settings.claude, &paths);
-        let (script, plan) = render_launch(
-            &paths,
-            &self.tools,
-            &agent.settings.claude.binary,
-            &agent.settings.claude.args,
-            resume,
-        );
-        write_launch(id, &paths, &script)?;
-
+        // Removed as soon as either rendered file has changed (Phase 3 spec
+        // §6.2), before any later fallible step (e.g. `write_launch`) can
+        // return early and strand a marker whose files no longer match what
+        // was last installed and validated.
         let toolchain_changed = tools_changed || profile_changed;
         if toolchain_changed
             && let Err(e) = std::fs::remove_file(paths.installed_marker())
@@ -113,6 +107,17 @@ impl Runtime {
                 message: e.to_string(),
             });
         }
+
+        let resume = wants_continue(&agent.settings.claude, &paths);
+        let (script, plan) = render_launch(
+            &paths,
+            &self.tools,
+            &agent.settings.claude.binary,
+            &agent.settings.claude.args,
+            resume,
+        );
+        write_launch(id, &paths, &script)?;
+
         Ok(RenderOutcome {
             plan,
             toolchain_changed,
@@ -356,5 +361,36 @@ mod tests {
         assert!(rt.install_and_validate(&a).is_err());
         std::fs::write(paths.installed_marker(), "").unwrap();
         rt.install_and_validate(&a).unwrap();
+    }
+
+    #[test]
+    fn a_later_failure_does_not_strand_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime(dir.path());
+        let creds = CredentialBundle::default();
+        let a = agent(&[("node", "22.11.0")]);
+        let paths = rt.layout.agent(&a.id);
+        rt.render_agent(&a, &creds, &hooks(), &RenderOptions::default())
+            .unwrap();
+        std::fs::write(paths.installed_marker(), "").unwrap();
+        assert!(paths.installed_marker().exists());
+
+        // A changed toolchain (so render_agent must invalidate the marker),
+        // but `launch.sh`'s path is now a directory: `write_launch` (which
+        // runs after the marker check) fails, and render_agent must return
+        // that error early. The marker must still be gone — it is removed
+        // as soon as `tools_changed`/`profile_changed` is known, not after
+        // this later, unrelated fallible step.
+        let b = agent(&[("node", "22.12.0")]);
+        std::fs::remove_file(&paths.launch).unwrap();
+        std::fs::create_dir(&paths.launch).unwrap();
+        let err = rt
+            .render_agent(&b, &creds, &hooks(), &RenderOptions::default())
+            .unwrap_err();
+        assert!(matches!(err, MaterializeError::Io { .. }), "{err:?}");
+        assert!(
+            !paths.installed_marker().exists(),
+            "marker must be removed even though a later step failed"
+        );
     }
 }
