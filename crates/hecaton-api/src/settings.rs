@@ -24,9 +24,10 @@ pub struct AgentSettings {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub runner: RunnerSettings,
-    /// Reserved for the state-machine spec; passthrough map.
-    #[serde(default = "empty_object")]
-    pub flow: Value,
+    /// Plugin name → that plugin's per-agent config (plugins spec §2.2);
+    /// passthrough objects, merged like every other map.
+    #[serde(default)]
+    pub plugins: BTreeMap<String, Value>,
 }
 
 impl Default for AgentSettings {
@@ -37,7 +38,7 @@ impl Default for AgentSettings {
             tools: BTreeMap::new(),
             env: BTreeMap::new(),
             runner: RunnerSettings::default(),
-            flow: empty_object(),
+            plugins: BTreeMap::new(),
         }
     }
 }
@@ -101,7 +102,7 @@ mod tests {
         assert!(s.claude.args.is_empty());
         assert_eq!(s.claude.settings, json!({}));
         assert_eq!(s.sandbox, json!({}));
-        assert_eq!(s.flow, json!({}));
+        assert!(s.plugins.is_empty());
         assert!(s.tools.is_empty());
         assert!(s.env.is_empty());
     }
@@ -114,7 +115,7 @@ mod tests {
             "tools": { "node": "22.11.0" },
             "env": { "RUST_LOG": "info" },
             "runner": { "type": "tmux" },
-            "flow": {}
+            "plugins": { "web": { "enabled": true } }
         });
         let s: AgentSettings = serde_json::from_value(v).unwrap();
         assert_eq!(s.claude.settings, json!({ "model": "opus" }));
@@ -124,6 +125,18 @@ mod tests {
         assert_eq!(s.tools["node"], "22.11.0");
         assert_eq!(s.env["RUST_LOG"], "info");
         assert_eq!(s.runner, RunnerSettings::Tmux);
+        assert_eq!(s.plugins["web"]["enabled"], true);
+    }
+
+    #[test]
+    fn plugins_is_a_map_of_passthrough_objects() {
+        let s: AgentSettings = serde_json::from_value(
+            json!({ "plugins": { "flow": { "initial": "working" }, "web": {} } }),
+        )
+        .unwrap();
+        assert_eq!(s.plugins.len(), 2);
+        assert_eq!(s.plugins["flow"]["initial"], "working");
+        assert!(serde_json::from_value::<AgentSettings>(json!({ "flow": {} })).is_err());
     }
 
     #[test]

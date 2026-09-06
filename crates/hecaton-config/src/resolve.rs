@@ -199,7 +199,7 @@ crews:
         let err = resolve(&file(fleet_hooks_yaml), &opts()).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "crews.c.agents.a.claude.settings.hooks: hecaton owns this key; configure hook behaviour via `flow` instead"
+            "crews.c.agents.a.claude.settings.hooks: hecaton owns this key; configure hook behaviour via `plugins` instead"
         );
     }
 

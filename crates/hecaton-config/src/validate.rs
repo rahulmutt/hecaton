@@ -68,14 +68,25 @@ pub fn validate_agent(path: &str, settings: &AgentSettings) -> Result<(), Config
     if claude_settings.contains_key("hooks") {
         return Err(invalid(
             "claude.settings.hooks",
-            "hecaton owns this key; configure hook behaviour via `flow` instead".to_string(),
+            "hecaton owns this key; configure hook behaviour via `plugins` instead".to_string(),
         ));
     }
     if !settings.sandbox.is_object() {
         return Err(invalid("sandbox", "expected a mapping".to_string()));
     }
-    if !settings.flow.is_object() {
-        return Err(invalid("flow", "expected a mapping".to_string()));
+    for (name, cfg) in &settings.plugins {
+        if let Err(reason) = hecaton_core::name::validate_name(name) {
+            return Err(invalid(
+                &format!("plugins.{name}"),
+                format!("invalid plugin name: {reason}"),
+            ));
+        }
+        if !cfg.is_object() {
+            return Err(invalid(
+                &format!("plugins.{name}"),
+                "expected a mapping".to_string(),
+            ));
+        }
     }
 
     for key in settings.env.keys() {
@@ -191,7 +202,7 @@ mod tests {
         let err = validate_agent("crews.c.agents.a", &s).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "crews.c.agents.a.claude.settings.hooks: hecaton owns this key; configure hook behaviour via `flow` instead"
+            "crews.c.agents.a.claude.settings.hooks: hecaton owns this key; configure hook behaviour via `plugins` instead"
         );
     }
 
@@ -206,12 +217,20 @@ mod tests {
             "p.sandbox: expected a mapping"
         );
         let s = AgentSettings {
-            flow: json!("x"),
+            plugins: BTreeMap::from([("web".to_string(), json!("x"))]),
             ..AgentSettings::default()
         };
         assert_eq!(
             validate_agent("p", &s).unwrap_err().to_string(),
-            "p.flow: expected a mapping"
+            "p.plugins.web: expected a mapping"
+        );
+        let s = AgentSettings {
+            plugins: BTreeMap::from([("Web".to_string(), json!({}))]),
+            ..AgentSettings::default()
+        };
+        assert_eq!(
+            validate_agent("p", &s).unwrap_err().to_string(),
+            "p.plugins.Web: invalid plugin name: contains characters other than a-z, 0-9 and '-'"
         );
         let s = AgentSettings {
             claude: ClaudeSettings {

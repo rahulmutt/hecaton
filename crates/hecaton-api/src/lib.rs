@@ -9,13 +9,18 @@ pub const API_VERSION: &str = "hecaton/v1";
 pub mod credentials;
 pub mod fleet;
 pub mod hook;
+pub mod plugin;
 pub mod request;
 pub mod settings;
 pub mod status;
 
 pub use credentials::CredentialBundle;
 pub use fleet::{CrewSpec, FleetSpec, GitAuth, GitIdentity, GitSettings};
-pub use hook::HookEvent;
+pub use hook::{HOOK_EVENTS, HookEvent};
+pub use plugin::{
+    Capability, HelloRequest, HelloResponse, HookSubscriptions, PLUGIN_KIND, PLUGIN_PROTOCOL,
+    PluginEntry, PluginManifest, PluginStatus, PluginsFile, SyncReport,
+};
 pub use request::{DownQuery, ErrorBody, FleetRequest};
 pub use settings::{AgentSettings, ClaudeSettings, RunnerSettings};
 pub use status::{

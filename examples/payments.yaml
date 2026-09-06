@@ -11,7 +11,7 @@ defaults:
   tools: { node: "22.11.0" }
   env: { RUST_LOG: info }
   runner: { type: tmux }
-  flow: {}
+  plugins: {}
 crews:
   backend:
     repo: acme/payments-api
