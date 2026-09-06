@@ -19,12 +19,16 @@ prometheus = { workspace = true }
 chacha20poly1305 = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
+serde_norway = { workspace = true }
+sha2 = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
+ureq = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 proptest = { workspace = true }
-ureq = { workspace = true }
 
 [lints]
 workspace = true

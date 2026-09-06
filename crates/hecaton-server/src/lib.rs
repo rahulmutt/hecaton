@@ -11,6 +11,7 @@ pub mod fsutil;
 pub mod hooks;
 pub mod lifecycle;
 pub mod metrics;
+pub mod plugins;
 pub mod store;
 pub mod testing;
 pub mod vault;
@@ -25,5 +26,6 @@ pub use lifecycle::{
     write_endpoint, write_pid,
 };
 pub use metrics::Metrics;
+pub use plugins::PluginError;
 pub use store::FileFleetStore;
 pub use vault::{Vault, VaultError, random_hex};
