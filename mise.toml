@@ -71,3 +71,7 @@ run = [
   "mkdir -p target/tmp/serve/home",
   "cargo run -q -p hecaton -- serve --tmux-socket hecaton-dev",
 ]
+
+[tasks.verify-claude]
+description = "By-hand spec §8.1 check: a real claude under a scratch daemon (XDG roots under target/tmp/verify-claude, your HOME kept for credentials); pauses for you to attach and type one prompt, then prints a report to paste back"
+run = "scripts/verify-claude.sh"

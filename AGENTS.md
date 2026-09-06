@@ -14,6 +14,9 @@ credentials, hook input, or sandbox rules.
 - `e2e` — the Phase 3 journey against a real daemon; needs the same tools as `test-it`.
 - `serve` — a foreground daemon under `target/tmp/serve` for poking by hand
   (`HOME` is overridden, so it never touches your real state).
+- `verify-claude` — the interactive spec §8.1 check with a real `claude`
+  (`scripts/verify-claude.sh`); `HECATON_VERIFY_FAKE=1` self-tests it with
+  `dev fake-claude`.
 - `lint`, `test`, `fmt`, `precommit`, `audit` — defined in `mise.toml`.
 
 ## Conventions
