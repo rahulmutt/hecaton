@@ -89,10 +89,25 @@ pub fn render_hosts_yml(token: &str) -> String {
 }
 
 /// Seed that suppresses first-run prompts, overlaid with the account fields
-/// the bundle carried (`oauthAccount`, `hasCompletedOnboarding`).
-pub fn render_claude_json(account: Option<&Value>) -> Value {
+/// the bundle carried (`oauthAccount`, `hasCompletedOnboarding`). `trusted`
+/// are the directories whose "do you trust this folder?" dialog is
+/// pre-accepted: the agent's workspace and the crew's `repo/` — claude
+/// 2.1.263 keys the decision on the worktree's common git dir, not on the
+/// cwd it asked about (verified by hand, Phase 3 spec §8.1). Without it a
+/// fresh agent parks on that dialog and never sends `SessionStart`.
+pub fn render_claude_json(account: Option<&Value>, trusted: &[&Path]) -> Value {
     let mut m = Map::new();
     m.insert("hasCompletedOnboarding".to_string(), json!(true));
+    let projects: Map<String, Value> = trusted
+        .iter()
+        .map(|p| {
+            (
+                p.display().to_string(),
+                json!({ "hasTrustDialogAccepted": true }),
+            )
+        })
+        .collect();
+    m.insert("projects".to_string(), Value::Object(projects));
     if let Some(Value::Object(a)) = account {
         for (k, v) in a {
             m.insert(k.clone(), v.clone());
@@ -107,6 +122,8 @@ pub struct HomeInputs<'a> {
     pub hooks: &'a HookTarget,
     pub git: &'a GitSettings,
     pub relay: &'a Path,
+    /// Directories whose trust dialog is pre-accepted in `.claude.json`.
+    pub trusted: &'a [&'a Path],
     pub with_gh: bool,
     pub redact_credentials: bool,
 }
@@ -170,17 +187,20 @@ pub fn write_home(
     }
     .map_err(|e| io_err(id, &creds_path, e))?;
 
-    // Written twice: Claude Code reads `$HOME/.claude.json` by default but
-    // `$CLAUDE_CONFIG_DIR/.claude.json` when that variable is set, and the
-    // sandbox profile sets it. Phase 3's e2e says which copy is live and
-    // the unused one goes then.
-    let claude_json_body = pretty(&render_claude_json(inputs.creds.claude_account.as_ref()));
-    for p in [
-        paths.home.join(".claude.json"),
-        paths.claude_dir().join(".claude.json"),
-    ] {
-        write_atomic(&p, &claude_json_body, 0o600).map_err(|e| io_err(id, &p, e))?;
-    }
+    // Claude Code reads `$CLAUDE_CONFIG_DIR/.claude.json` when that variable
+    // is set, and the sandbox profile sets it; verified by hand with claude
+    // 2.1.263 (only this copy was ever rewritten), so the `$HOME` copy that
+    // Phase 2 also wrote is gone.
+    let claude_json = paths.claude_dir().join(".claude.json");
+    write_atomic(
+        &claude_json,
+        &pretty(&render_claude_json(
+            inputs.creds.claude_account.as_ref(),
+            inputs.trusted,
+        )),
+        0o600,
+    )
+    .map_err(|e| io_err(id, &claude_json, e))?;
 
     if inputs.with_gh
         && let Some(token) = &inputs.creds.gh_token
@@ -294,14 +314,26 @@ mod tests {
             render_hosts_yml("gho_x"),
             "github.com:\n    oauth_token: gho_x\n    git_protocol: https\n"
         );
-        let v = render_claude_json(Some(
-            &json!({ "oauthAccount": { "emailAddress": "a@b.c" }, "hasCompletedOnboarding": true }),
-        ));
+        let trusted = [Path::new("/w/workspace"), Path::new("/w/repo")];
+        let v = render_claude_json(
+            Some(
+                &json!({ "oauthAccount": { "emailAddress": "a@b.c" }, "hasCompletedOnboarding": true }),
+            ),
+            &trusted,
+        );
         assert_eq!(v["hasCompletedOnboarding"], true);
         assert_eq!(v["oauthAccount"]["emailAddress"], "a@b.c");
         assert_eq!(
-            render_claude_json(None),
-            json!({ "hasCompletedOnboarding": true })
+            v["projects"]["/w/workspace"]["hasTrustDialogAccepted"], true,
+            "the workspace trust dialog is pre-accepted"
+        );
+        assert_eq!(
+            v["projects"]["/w/repo"]["hasTrustDialogAccepted"], true,
+            "claude keys trust on the worktree's common repo too"
+        );
+        assert_eq!(
+            render_claude_json(None, &[]),
+            json!({ "hasCompletedOnboarding": true, "projects": {} })
         );
     }
 
@@ -328,6 +360,7 @@ mod tests {
                 hooks: &hooks(),
                 git: &GitSettings::default(),
                 relay: Path::new("/opt/hecaton"),
+                trusted: &[&paths.workspace],
                 with_gh: true,
                 redact_credentials: false,
             },
@@ -353,14 +386,16 @@ mod tests {
                 .contains("gh auth git-credential")
         );
 
-        let outer = paths.home.join(".claude.json");
         let inner = paths.claude_dir().join(".claude.json");
-        assert_eq!(mode(&outer), 0o600);
         assert_eq!(mode(&inner), 0o600);
+        assert!(
+            !paths.home.join(".claude.json").exists(),
+            "claude reads $CLAUDE_CONFIG_DIR/.claude.json only (verified by hand, spec §8.1)"
+        );
+        let seed: Value = serde_json::from_str(&std::fs::read_to_string(&inner).unwrap()).unwrap();
         assert_eq!(
-            std::fs::read_to_string(&outer).unwrap(),
-            std::fs::read_to_string(&inner).unwrap(),
-            "both copies of .claude.json are written and identical"
+            seed["projects"][paths.workspace.display().to_string()]["hasTrustDialogAccepted"],
+            true
         );
         assert!(
             std::fs::read_to_string(paths.claude_dir().join(".credentials.json"))
@@ -391,6 +426,7 @@ mod tests {
                 hooks: &hooks(),
                 git: &GitSettings::default(),
                 relay: Path::new("/opt/hecaton"),
+                trusted: &[],
                 with_gh: false,
                 redact_credentials: true,
             },

@@ -63,6 +63,7 @@ impl Runtime {
                 hooks,
                 git: &agent.git,
                 relay: &self.tools.hecaton,
+                trusted: &[&paths.workspace, &crew.repo],
                 with_gh,
                 redact_credentials: opts.redact_credentials,
             },
