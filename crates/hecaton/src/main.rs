@@ -26,6 +26,7 @@ fn main() -> ExitCode {
 fn run() -> anyhow::Result<String> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Serve(args) => commands::serve::serve_command(&args),
         Command::Config {
             command: ConfigCommand::Resolve(args),
         } => commands::config::resolve_command(&args),

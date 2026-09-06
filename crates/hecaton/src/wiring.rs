@@ -1,7 +1,12 @@
 //! The only place adapters meet the process environment.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use anyhow::{Context, Result};
+use hecaton_api::Timestamp;
+use hecaton_core::Clock;
 use hecaton_runtime::{StateLayout, ToolPaths};
+use hecaton_server::ServerPaths;
 
 pub fn layout_from_env() -> Result<StateLayout> {
     let home = std::env::home_dir().context("cannot determine the home directory")?;
@@ -14,4 +19,22 @@ pub fn tool_paths() -> Result<ToolPaths> {
     ToolPaths::discover_in(&path, &me).map_err(|e| {
         anyhow::anyhow!("{e} (hecaton needs git, gh, mise, nono and tmux on PATH; see mise.toml)")
     })
+}
+
+/// Wall clock in whole seconds.
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Timestamp {
+        Timestamp(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        )
+    }
+}
+
+pub fn server_paths(layout: &StateLayout) -> ServerPaths {
+    ServerPaths::new(layout.server_dir())
 }

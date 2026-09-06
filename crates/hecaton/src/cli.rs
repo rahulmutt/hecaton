@@ -18,6 +18,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Run the daemon (foreground, or detached with -d).
+    Serve(ServeArgs),
     /// Inspect fleet configuration without talking to the daemon.
     Config {
         #[command(subcommand)]
@@ -29,6 +31,22 @@ pub enum Command {
         #[command(subcommand)]
         command: DevCommand,
     },
+}
+
+#[derive(Debug, Args)]
+pub struct ServeArgs {
+    /// Address to bind (default: config.toml `[server] bind`, else 127.0.0.1:7643).
+    #[arg(long)]
+    pub bind: Option<String>,
+    /// Re-exec detached; log to server/server.log; print the endpoint.
+    #[arg(short = 'd', long)]
+    pub detach: bool,
+    /// tmux server socket name (tests use a private one).
+    #[arg(long, hide = true, default_value = "hecaton")]
+    pub tmux_socket: String,
+    /// Set by `-d` on the child it spawns.
+    #[arg(long, hide = true)]
+    pub detached_child: bool,
 }
 
 #[derive(Debug, Subcommand)]
