@@ -1,9 +1,4 @@
 //! Tool discovery and a logged subprocess runner. Argv arrays only.
-//!
-//! `Cmd` and its builder methods are consumed by the materialization steps
-//! added in Tasks 10-16; until then they are only exercised by this module's
-//! own tests, so the plain (non-test) build sees them as dead code.
-#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -56,6 +51,8 @@ pub(crate) struct Cmd {
 
 #[derive(Debug)]
 pub(crate) struct CmdOutput {
+    // used by Task 14 (`git run` returns stdout) and Task 16 (`tmux` capture)
+    #[allow(dead_code)]
     pub stdout: String,
 }
 
@@ -89,6 +86,9 @@ impl Cmd {
             log: None,
         }
     }
+    // not used by any task in this plan (verified through Task 18); kept for
+    // symmetry with `args` and `env`/`envs`.
+    #[allow(dead_code)]
     pub(crate) fn arg(mut self, a: impl Into<String>) -> Self {
         self.args.push(a.into());
         self
@@ -97,6 +97,8 @@ impl Cmd {
         self.args.extend(a.into_iter().map(Into::into));
         self
     }
+    // used by Task 12 (`validate_profile`'s `nono profile validate HOME=`)
+    #[allow(dead_code)]
     pub(crate) fn env(mut self, k: impl Into<String>, v: impl Into<String>) -> Self {
         self.env.insert(k.into(), v.into());
         self
