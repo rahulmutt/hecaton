@@ -3,8 +3,8 @@
 
 use hecaton_api::{CredentialBundle, GitAuth, GitSettings};
 use hecaton_core::{
-    AgentId, CrewRef, HookTarget, Keep, LaunchPlan, MaterializeError, Materializer, RepoRef,
-    ResolvedAgent,
+    AgentId, AgentName, CrewRef, HookTarget, Keep, LaunchPlan, MaterializeError, Materializer,
+    RepoRef, ResolvedAgent, ResolvedPlugin,
 };
 
 use crate::env::agent_env;
@@ -256,6 +256,23 @@ impl Materializer for Runtime {
             Self::rm_rf(&id, &paths.root)?;
         }
         Ok(())
+    }
+
+    fn materialize_plugin(
+        &self,
+        plugin: &ResolvedPlugin,
+        _: &HookTarget,
+    ) -> Result<LaunchPlan, MaterializeError> {
+        Err(MaterializeError::Invalid {
+            id: plugin.id().to_string(),
+            message: "plugins are not materializable yet (Spec B phase 1, task 3)".into(),
+        })
+    }
+    fn purge_plugin(&self, name: &AgentName) -> Result<(), MaterializeError> {
+        Err(MaterializeError::Invalid {
+            id: name.to_string(),
+            message: "plugins are not materializable yet (Spec B phase 1, task 3)".into(),
+        })
     }
 }
 

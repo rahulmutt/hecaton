@@ -2,6 +2,7 @@
 //! repos are validated by `hecaton_core::Fleet`; this covers everything else.
 
 use hecaton_api::AgentSettings;
+use hecaton_core::is_exact_version;
 use serde_json::Value;
 
 use crate::ConfigError;
@@ -21,28 +22,6 @@ pub const RESERVED_ENV_PREFIXES: &[&str] = &[
     "TMPDIR",
     "CLAUDE_CODE_TMPDIR",
 ];
-
-/// Rejects mise's fuzzy forms: keywords, `prefix:`/`ref:`/`path:`/`sub-`
-/// specs, wildcards, bare `major` / `major.minor` numbers, and digit-free
-/// channel names ("nightly", "stable", "beta", "canary").
-pub fn is_exact_version(v: &str) -> bool {
-    if v.is_empty() || matches!(v, "latest" | "lts" | "system") {
-        return false;
-    }
-    if v.ends_with(".x") || v.contains('*') || v.contains(':') {
-        return false;
-    }
-    if !v.bytes().any(|b| b.is_ascii_digit()) {
-        return false;
-    }
-    let numeric_parts = v
-        .split('.')
-        .filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-        .count();
-    let total_parts = v.split('.').count();
-    // "22" and "22.11" are fuzzy; "3.7c", "1.0.0-rc.1", "v1.2.3" are exact.
-    !(numeric_parts == total_parts && total_parts < 3)
-}
 
 /// Validates one resolved settings block; `path` prefixes every message.
 pub fn validate_agent(path: &str, settings: &AgentSettings) -> Result<(), ConfigError> {
@@ -116,46 +95,6 @@ mod tests {
     use hecaton_api::{AgentSettings, ClaudeSettings};
     use serde_json::json;
     use std::collections::BTreeMap;
-
-    #[test]
-    fn exact_versions_are_accepted() {
-        for v in [
-            "22.11.0",
-            "3.7c",
-            "2026.9.1",
-            "0.75.0",
-            "2.1.261",
-            "1.0.0-rc.1",
-            "v1.2.3",
-            "8.30.1",
-        ] {
-            assert!(is_exact_version(v), "{v:?} should be exact");
-        }
-    }
-
-    #[test]
-    fn fuzzy_versions_are_rejected() {
-        for v in [
-            "22",
-            "22.11",
-            "latest",
-            "lts",
-            "system",
-            "22.x",
-            "22.11.x",
-            "22*",
-            "prefix:22",
-            "ref:main",
-            "sub-1:latest",
-            "path:/x",
-            "nightly",
-            "stable",
-            "beta",
-            "",
-        ] {
-            assert!(!is_exact_version(v), "{v:?} should be fuzzy");
-        }
-    }
 
     fn with_tools(tools: &[(&str, &str)]) -> AgentSettings {
         AgentSettings {

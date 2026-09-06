@@ -9,6 +9,7 @@ use hecaton_api::{CredentialBundle, GitSettings, Timestamp};
 
 use crate::agent::{CrewRef, ResolvedAgent};
 use crate::name::{AgentId, AgentName, CrewName, FleetName};
+use crate::plugin::ResolvedPlugin;
 use crate::repo::RepoRef;
 
 /// What the runner can see about one agent's process.
@@ -155,6 +156,17 @@ pub trait Materializer: Send + Sync {
     ) -> Result<LaunchPlan, MaterializeError>;
     fn remove_agent(&self, agent: &AgentId) -> Result<(), MaterializeError>;
     fn remove_crew(&self, crew: &CrewRef, keep: Keep) -> Result<(), MaterializeError>;
+    /// Files for one plugin (plugins spec §5.1): `home/`, profile,
+    /// `launch.sh`, tools installed. `host` carries the daemon URL and the
+    /// plugin's per-launch token.
+    fn materialize_plugin(
+        &self,
+        plugin: &ResolvedPlugin,
+        host: &HookTarget,
+    ) -> Result<LaunchPlan, MaterializeError>;
+    /// Deletes `plugins/<name>/` — kv, scratch, home, everything
+    /// (`plugin remove --purge`). Not part of any reconcile pass.
+    fn purge_plugin(&self, name: &AgentName) -> Result<(), MaterializeError>;
 }
 
 /// Makes processes exist (or not) and reports what it sees.
