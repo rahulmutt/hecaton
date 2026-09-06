@@ -31,6 +31,74 @@ pub enum Command {
         #[command(subcommand)]
         command: DevCommand,
     },
+    /// Create a fleet from a YAML file and wait until it is ready.
+    Up(ApplyArgs),
+    /// Replace a running fleet's spec; only agents whose settings changed restart.
+    Update(ApplyArgs),
+    /// Stop a fleet; keep repos and/or sessions, or purge everything.
+    Down(DownArgs),
+    /// Show one fleet.
+    Status(StatusArgs),
+    /// List fleets.
+    List(ListArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ApplyArgs {
+    /// Path to the fleet YAML file.
+    pub file: PathBuf,
+    /// Fleet name; overrides `name` in the file.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Do not layer the host's ~/.claude/settings.json or send host credentials.
+    #[arg(long)]
+    pub no_host_defaults: bool,
+    /// How long to wait for Ready (e.g. 90s, 5m, 1h).
+    #[arg(long, default_value = "5m")]
+    pub timeout: String,
+    /// Return right after the request instead of waiting for Ready.
+    #[arg(long)]
+    pub no_wait: bool,
+    /// Daemon URL (default: $HECATON_API_URL, then the running daemon's endpoint file).
+    #[arg(long)]
+    pub api_url: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct DownArgs {
+    pub fleet: String,
+    #[arg(long)]
+    pub keep_repos: bool,
+    #[arg(long)]
+    pub keep_sessions: bool,
+    /// Both --keep-repos and --keep-sessions.
+    #[arg(long)]
+    pub keep: bool,
+    /// Also delete the fleet record and everything under its directory.
+    #[arg(long)]
+    pub purge: bool,
+    #[arg(long, default_value = "5m")]
+    pub timeout: String,
+    #[arg(long)]
+    pub api_url: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct StatusArgs {
+    pub fleet: String,
+    /// Print the raw record as JSON.
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub api_url: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ListArgs {
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub api_url: Option<String>,
 }
 
 #[derive(Debug, Args)]
