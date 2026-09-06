@@ -51,8 +51,6 @@ pub(crate) struct Cmd {
 
 #[derive(Debug)]
 pub(crate) struct CmdOutput {
-    // used by Task 14 (`git run` returns stdout) and Task 16 (`tmux` capture)
-    #[allow(dead_code)]
     pub stdout: String,
 }
 

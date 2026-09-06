@@ -358,7 +358,7 @@ and its fallback.
 |---|---|
 | `CLAUDE_CONFIG_DIR` and `GH_CONFIG_DIR` relocate all state (nothing lands in nono's `$HOME`) | add explicit grants / `set_vars` for what escapes |
 | `mise exec` under `MISE_GLOBAL_CONFIG_FILE` + read-only `MISE_DATA_DIR` resolves without writing there | pin with `MISE_CONFIG_FILE`; grant the specific subdirs mise insists on. Verdict (Task 11): holds — `toolchain_it::installs_nothing_when_seeded_and_exec_resolves_read_only` seeds `MISE_DATA_DIR` with the host's `gh@2.100.0` install, chmods the whole data dir `a-w`, then runs `mise exec -- gh --version` with `MISE_GLOBAL_CONFIG_FILE`/`MISE_DATA_DIR`/`MISE_CONFIG_DIR`/`MISE_STATE_DIR`/`MISE_CACHE_DIR` all pointed outside it; it resolves and prints the pinned version with no write attempted against the read-only tree. |
-| `gh auth git-credential` works from a `hosts.yml` holding only `oauth_token` and `git_protocol: https` | resolve `user:` with `gh api user` during `ensure_crew`, or require it in the credential bundle |
+| `gh auth git-credential` works from a `hosts.yml` holding only `oauth_token` and `git_protocol: https` | resolve `user:` with `gh api user` during `ensure_crew`, or require it in the credential bundle. Verdict (Task 14): holds — `oauth_token` + `git_protocol` suffice: with only those two keys in `hosts.yml`, `GH_CONFIG_DIR=… gh auth git-credential get` (given `protocol=https`/`host=github.com` on stdin) printed `username=…` and `password=…`. |
 | the `.claude.json` seed keys that suppress first-run prompts | discover by diffing a fresh Claude run; keep the seed in one constant |
 
 Already verified (2026-09-05, this machine, nono 0.75.0, tmux 3.7c):

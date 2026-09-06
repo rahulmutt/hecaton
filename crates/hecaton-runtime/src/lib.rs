@@ -12,6 +12,7 @@ pub mod quote;
 pub mod sandbox;
 pub mod toolchain;
 pub mod tools;
+pub mod workspace;
 
 pub use env::agent_env;
 pub use home::{HOOK_EVENTS, HomeInputs, write_home};
@@ -25,3 +26,4 @@ pub use sandbox::{
 };
 pub use toolchain::{Toolchain, embedded_system_tools, mise_env, render_mise_toml, system_tools};
 pub use tools::{MissingTool, ToolPaths};
+pub use workspace::Workspace;
