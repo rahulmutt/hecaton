@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::body::Bytes;
+use axum::extract::rejection::{BytesRejection, PathRejection};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -16,26 +17,42 @@ use crate::auth::bearer;
 /// Claude blocks on the response; the handler is pure, so 2 s is generous.
 const HANDLE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// `POST /v1/agents/{fleet}/{crew}/{agent}/events`. Order: secret (401 for
-/// a bad one or an unknown agent alike), rate limit (429), body (400),
-/// then the fleet's actor and the handler under a timeout (503).
+/// `POST /v1/agents/{fleet}/{crew}/{agent}/events`. Order (spec §3.5): the
+/// path, then the secret — verified against the index in constant time,
+/// 401 for a bad one or an unknown agent alike — *then* the per-agent rate
+/// limit (429), so an unauthenticated caller can never touch, let alone
+/// drain or grow, another agent's bucket. Body next (400, or 413 for the
+/// 1 MiB cap), then the fleet's actor and the handler under a timeout
+/// (503). Every rejection renders as `ApiError`'s `{ "error": … }` JSON,
+/// never axum's own plain-text body.
 pub(crate) async fn events(
     State(state): State<AppState>,
-    Path((fleet, crew, agent)): Path<(String, String, String)>,
+    path: Result<Path<(String, String, String)>, PathRejection>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
     let unauthorized =
         || ApiError::new(StatusCode::UNAUTHORIZED, "unknown agent or bad secret").into_response();
+    let Path((fleet, crew, agent)) = match path {
+        Ok(p) => p,
+        Err(e) => return ApiError::new(e.status(), e.body_text()).into_response(),
+    };
     let Ok(id) = format!("{fleet}/{crew}/{agent}").parse::<AgentId>() else {
         return unauthorized();
     };
     let Some(secret) = bearer(&headers) else {
         return unauthorized();
     };
+    if !state.daemon.verify_secret(&id, secret).await {
+        return unauthorized();
+    }
     if !state.limiter.allow(&id.to_string()) {
         return ApiError::new(StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
     }
+    let body = match body {
+        Ok(b) => b,
+        Err(e) => return ApiError::new(e.status(), e.body_text()).into_response(),
+    };
     let parsed = match parse_event(&body) {
         Ok(p) => p,
         Err(e) => return ApiError::new(StatusCode::BAD_REQUEST, e).into_response(),

@@ -208,7 +208,10 @@ async fn the_fleet_api_and_hook_ingress_end_to_end() {
         Some(json!({ "spec": { "name": "f", "bogus": 1 } })),
     )
     .await;
-    assert_eq!(st, 400, "{v}");
+    // an unknown field is a data-level JSON error (axum's `JsonDataError`,
+    // 422), not a syntax error (400) — `body()` now reports the
+    // extractor's real status instead of hardcoding 400.
+    assert_eq!(st, 422, "{v}");
 
     // hooks
     let a: AgentId = "f/c/a".parse().unwrap();
@@ -235,6 +238,21 @@ async fn the_fleet_api_and_hook_ingress_end_to_end() {
     assert_eq!(st, 401, "unknown agent looks like a bad secret");
     let (st, _) = call(api.clone(), "POST", events.clone(), None, Some(ev.clone())).await;
     assert_eq!(st, 401);
+    // The secret is checked *before* the rate limiter (spec §3.5): a burst
+    // of wrong-secret requests — well past the burst size of 50 — must
+    // never trip the limiter (429), and must never spend the bucket that a
+    // correctly authenticated caller relies on.
+    for _ in 0..60 {
+        let (st, _) = call(
+            api.clone(),
+            "POST",
+            events.clone(),
+            Some("wrong".into()),
+            Some(ev.clone()),
+        )
+        .await;
+        assert_eq!(st, 401, "a bad secret must never be rate-limited");
+    }
     let (st, v) = call(
         api.clone(),
         "POST",
@@ -243,7 +261,11 @@ async fn the_fleet_api_and_hook_ingress_end_to_end() {
         Some(ev.clone()),
     )
     .await;
-    assert_eq!((st, v), (200, json!({})));
+    assert_eq!(
+        (st, v),
+        (200, json!({})),
+        "the unauthenticated burst must not have spent the bucket"
+    );
     wait_for(&daemon, |r| {
         r.is_some_and(|r| r.status.agents["f/c/a"].phase == AgentPhase::Ready)
     })
@@ -259,7 +281,7 @@ async fn the_fleet_api_and_hook_ingress_end_to_end() {
     assert_eq!(st, 400);
     assert_eq!(v["error"], "body must be a JSON object");
     let big = json!({ "hook_event_name": "PreToolUse", "blob": "x".repeat(2 << 20) });
-    let (st, _) = call(
+    let (st, v) = call(
         api.clone(),
         "POST",
         events.clone(),
@@ -268,6 +290,10 @@ async fn the_fleet_api_and_hook_ingress_end_to_end() {
     )
     .await;
     assert_eq!(st, 413);
+    // axum's own body-limit rejection is plain text; the handler must
+    // render it as `ApiError`'s `{ "error": "<message>" }` JSON instead.
+    let _: ErrorBody = serde_json::from_value(v.clone()).unwrap_or_else(|e| panic!("{e}: {v}"));
+    assert!(v["error"].is_string(), "{v}");
     let mut saw_429 = false;
     for _ in 0..80 {
         let (st, _) = call(

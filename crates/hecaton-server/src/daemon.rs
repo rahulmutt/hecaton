@@ -203,6 +203,18 @@ impl Daemon {
         self.shared.hook_secrets.read().await.get(agent).cloned()
     }
 
+    /// Constant-time compare against the agent's current secret. `false`
+    /// for an unknown agent and a wrong secret alike. Ingress calls this
+    /// *before* the rate limiter (spec §3.5): an unauthenticated caller
+    /// must never be able to touch — let alone drain or grow — another
+    /// agent's bucket.
+    pub async fn verify_secret(&self, agent: &AgentId, secret: &str) -> bool {
+        match self.hook_secret(agent).await {
+            Some(s) => constant_time_eq(s.as_bytes(), secret.as_bytes()),
+            None => false,
+        }
+    }
+
     /// Authenticates, forwards the event to the fleet, runs the handler.
     /// Unknown agent and bad secret are the same error on purpose.
     pub async fn event(

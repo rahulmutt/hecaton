@@ -4,7 +4,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use axum::extract::rejection::{JsonRejection, QueryRejection};
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{StatusCode, header::CONTENT_TYPE};
 use axum::middleware::{self, Next};
@@ -134,7 +134,12 @@ fn fleet_name(s: &str) -> Result<FleetName, ApiError> {
 
 fn body(b: Result<Json<FleetRequest>, JsonRejection>) -> Result<FleetRequest, ApiError> {
     b.map(|Json(r)| r)
-        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))
+        .map_err(|e| ApiError::new(e.status(), e.body_text()))
+}
+
+fn path_name(p: Result<Path<String>, PathRejection>) -> Result<String, ApiError> {
+    p.map(|Path(name)| name)
+        .map_err(|e| ApiError::new(e.status(), e.body_text()))
 }
 
 async fn create_fleet(
@@ -153,11 +158,11 @@ async fn create_fleet(
 
 async fn update_fleet(
     State(state): State<AppState>,
-    Path(name): Path<String>,
+    name: Result<Path<String>, PathRejection>,
     b: Result<Json<FleetRequest>, JsonRejection>,
 ) -> Result<Json<FleetRecord>, ApiError> {
     let req = body(b)?;
-    let name = fleet_name(&name)?;
+    let name = fleet_name(&path_name(name)?)?;
     Ok(Json(
         state
             .daemon
@@ -168,9 +173,9 @@ async fn update_fleet(
 
 async fn get_fleet(
     State(state): State<AppState>,
-    Path(name): Path<String>,
+    name: Result<Path<String>, PathRejection>,
 ) -> Result<Json<FleetRecord>, ApiError> {
-    let name = fleet_name(&name)?;
+    let name = fleet_name(&path_name(name)?)?;
     state
         .daemon
         .get(&name)
@@ -185,7 +190,7 @@ async fn list_fleets(State(state): State<AppState>) -> Json<Vec<FleetSummary>> {
 
 async fn delete_fleet(
     State(state): State<AppState>,
-    Path(name): Path<String>,
+    name: Result<Path<String>, PathRejection>,
     q: Result<Query<DownQuery>, QueryRejection>,
 ) -> Result<Json<FleetRecord>, ApiError> {
     let Query(q) = q.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))?;
@@ -195,7 +200,7 @@ async fn delete_fleet(
             "purge cannot be combined with keep flags",
         ));
     }
-    let name = fleet_name(&name)?;
+    let name = fleet_name(&path_name(name)?)?;
     let keep = Keep {
         repos: q.keep_repos,
         sessions: q.keep_sessions,
