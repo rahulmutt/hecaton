@@ -3,7 +3,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use hecaton_core::{AgentId, CrewRef, FleetName};
+use hecaton_core::{AgentId, AgentName, CrewRef, FleetName};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateLayout {
@@ -26,6 +26,23 @@ pub struct AgentPaths {
     /// nono's own `$HOME` — its state root must not overlap `home/` (P2-5).
     pub nono_home: PathBuf,
     pub mise_toml: PathBuf,
+    pub profile: PathBuf,
+    pub launch: PathBuf,
+    pub logs: PathBuf,
+}
+
+/// Where one plugin lives (plugins spec §5.1). The package itself is under
+/// `plugins_data_dir()` or wherever a directory source points.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginPaths {
+    pub root: PathBuf,
+    pub home: PathBuf,
+    /// nono's own `$HOME`, as for agents (P2-5).
+    pub nono_home: PathBuf,
+    /// Key/value store (Phase 2 of Spec B); never granted to the sandbox.
+    pub kv: PathBuf,
+    /// Bulk state, read-write inside the sandbox; `HECATON_PLUGIN_SCRATCH`.
+    pub scratch: PathBuf,
     pub profile: PathBuf,
     pub launch: PathBuf,
     pub logs: PathBuf,
@@ -90,6 +107,59 @@ impl StateLayout {
             logs: root.join("logs"),
             root,
         }
+    }
+
+    pub fn plugins_state_dir(&self) -> PathBuf {
+        self.state_root.join("plugins")
+    }
+    /// Unpacked packages: `plugins/<name>/<digest12>/`.
+    pub fn plugins_data_dir(&self) -> PathBuf {
+        self.data_root.join("plugins")
+    }
+    pub fn plugin(&self, name: &AgentName) -> PluginPaths {
+        let root = self.plugins_state_dir().join(name.as_str());
+        PluginPaths {
+            home: root.join("home"),
+            nono_home: root.join("nono"),
+            kv: root.join("kv"),
+            scratch: root.join("scratch"),
+            profile: root.join("nono-profile.json"),
+            launch: root.join("launch.sh"),
+            logs: root.join("logs"),
+            root,
+        }
+    }
+}
+
+impl PluginPaths {
+    /// Holds the plugin hash last installed and validated; removed when the
+    /// profile changes, rewritten after a successful install.
+    pub fn installed_marker(&self) -> PathBuf {
+        self.root.join(".installed")
+    }
+    pub fn tmp_dir(&self) -> PathBuf {
+        self.home.join("tmp")
+    }
+    pub fn xdg_config(&self) -> PathBuf {
+        self.home.join(".config")
+    }
+    pub fn xdg_data(&self) -> PathBuf {
+        self.home.join(".local").join("share")
+    }
+    pub fn xdg_state(&self) -> PathBuf {
+        self.home.join(".local").join("state")
+    }
+    pub fn xdg_cache(&self) -> PathBuf {
+        self.home.join(".cache")
+    }
+    pub fn mise_config_dir(&self) -> PathBuf {
+        self.xdg_config().join("mise")
+    }
+    pub fn mise_state_dir(&self) -> PathBuf {
+        self.xdg_state().join("mise")
+    }
+    pub fn mise_cache_dir(&self) -> PathBuf {
+        self.xdg_cache().join("mise")
     }
 }
 
@@ -205,6 +275,45 @@ mod tests {
         assert_eq!(
             l.fleets_dir(),
             PathBuf::from("/h/.local/state/hecaton/fleets")
+        );
+    }
+
+    #[test]
+    fn plugin_paths_live_under_plugins_in_state_and_packages_under_data() {
+        let l = StateLayout::from_env(Path::new("/h"), no_env);
+        assert_eq!(
+            l.plugins_state_dir(),
+            PathBuf::from("/h/.local/state/hecaton/plugins")
+        );
+        assert_eq!(
+            l.plugins_data_dir(),
+            PathBuf::from("/h/.local/share/hecaton/plugins")
+        );
+        let p = l.plugin(&"web".parse().unwrap());
+        let base = "/h/.local/state/hecaton/plugins/web";
+        assert_eq!(p.root, PathBuf::from(base));
+        assert_eq!(p.home, PathBuf::from(format!("{base}/home")));
+        assert_eq!(p.nono_home, PathBuf::from(format!("{base}/nono")));
+        assert_eq!(p.kv, PathBuf::from(format!("{base}/kv")));
+        assert_eq!(p.scratch, PathBuf::from(format!("{base}/scratch")));
+        assert_eq!(
+            p.profile,
+            PathBuf::from(format!("{base}/nono-profile.json"))
+        );
+        assert_eq!(p.launch, PathBuf::from(format!("{base}/launch.sh")));
+        assert_eq!(p.logs, PathBuf::from(format!("{base}/logs")));
+        assert_eq!(
+            p.installed_marker(),
+            PathBuf::from(format!("{base}/.installed"))
+        );
+        assert_eq!(p.tmp_dir(), PathBuf::from(format!("{base}/home/tmp")));
+        assert_eq!(
+            p.xdg_config(),
+            PathBuf::from(format!("{base}/home/.config"))
+        );
+        assert_eq!(
+            p.mise_state_dir(),
+            PathBuf::from(format!("{base}/home/.local/state/mise"))
         );
     }
 }

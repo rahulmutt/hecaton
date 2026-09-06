@@ -10,7 +10,7 @@ use crate::fsutil::write_atomic;
 use crate::layout::{AgentPaths, CrewPaths, StateLayout};
 use crate::tools::{Cmd, ToolPaths};
 
-const SYSTEM_READ: &[&str] = &["/usr", "/lib", "/lib64", "/bin", "/etc"];
+pub(crate) const SYSTEM_READ: &[&str] = &["/usr", "/lib", "/lib64", "/bin", "/etc"];
 
 /// Paths hecaton grants; user grants that overlap these at a different
 /// level are rejected.
@@ -207,39 +207,44 @@ pub fn check_conflicts(
 }
 
 /// Writes the profile; returns whether its bytes changed.
-pub fn write_profile(
+pub fn write_profile_at(
     id: &AgentId,
-    paths: &AgentPaths,
+    path: &Path,
     profile: &Value,
 ) -> Result<bool, MaterializeError> {
     let bytes = serde_json::to_vec_pretty(profile).unwrap_or_default();
-    if std::fs::read(&paths.profile).ok().as_deref() == Some(bytes.as_slice()) {
+    if std::fs::read(path).ok().as_deref() == Some(bytes.as_slice()) {
         return Ok(false);
     }
     // 0600: the profile is the sandbox's boundary, and a writable or
     // widely readable one is a map of every path the agent may reach.
-    write_atomic(&paths.profile, &bytes, 0o600).map_err(|e| MaterializeError::Io {
+    write_atomic(path, &bytes, 0o600).map_err(|e| MaterializeError::Io {
         id: id.to_string(),
-        path: paths.profile.clone(),
+        path: path.to_path_buf(),
         message: e.to_string(),
     })?;
     Ok(true)
 }
 
-pub fn validate_profile(
-    tools: &ToolPaths,
+pub fn write_profile(
     id: &AgentId,
     paths: &AgentPaths,
+    profile: &Value,
+) -> Result<bool, MaterializeError> {
+    write_profile_at(id, &paths.profile, profile)
+}
+
+pub fn validate_profile_at(
+    tools: &ToolPaths,
+    id: &AgentId,
+    profile: &Path,
+    nono_home: &Path,
+    log: &Path,
 ) -> Result<(), MaterializeError> {
     Cmd::new(&tools.nono)
-        .args([
-            "-s",
-            "profile",
-            "validate",
-            &paths.profile.display().to_string(),
-        ])
-        .env("HOME", paths.nono_home.display().to_string())
-        .log(&paths.logs.join("nono.validate.log"))
+        .args(["-s", "profile", "validate", &profile.display().to_string()])
+        .env("HOME", nono_home.display().to_string())
+        .log(log)
         .run()
         .map(|_| ())
         .map_err(|f| MaterializeError::Tool {
@@ -253,6 +258,20 @@ pub fn validate_profile(
                 f.stderr
             },
         })
+}
+
+pub fn validate_profile(
+    tools: &ToolPaths,
+    id: &AgentId,
+    paths: &AgentPaths,
+) -> Result<(), MaterializeError> {
+    validate_profile_at(
+        tools,
+        id,
+        &paths.profile,
+        &paths.nono_home,
+        &paths.logs.join("nono.validate.log"),
+    )
 }
 
 #[cfg(test)]

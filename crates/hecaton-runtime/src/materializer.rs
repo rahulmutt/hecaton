@@ -261,18 +261,16 @@ impl Materializer for Runtime {
     fn materialize_plugin(
         &self,
         plugin: &ResolvedPlugin,
-        _: &HookTarget,
+        host: &HookTarget,
     ) -> Result<LaunchPlan, MaterializeError> {
-        Err(MaterializeError::Invalid {
-            id: plugin.id().to_string(),
-            message: "plugins are not materializable yet (Spec B phase 1, task 3)".into(),
-        })
+        let out = self.render_plugin(plugin, host)?;
+        self.install_plugin(plugin)?;
+        Ok(out.plan)
     }
+
     fn purge_plugin(&self, name: &AgentName) -> Result<(), MaterializeError> {
-        Err(MaterializeError::Invalid {
-            id: name.to_string(),
-            message: "plugins are not materializable yet (Spec B phase 1, task 3)".into(),
-        })
+        let root = self.layout.plugin(name).root;
+        Self::rm_rf(&hecaton_core::plugin_id(name).to_string(), &root)
     }
 }
 
