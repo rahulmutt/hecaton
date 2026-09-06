@@ -21,6 +21,13 @@ use crate::vault::random_hex;
 /// The hook event that means "Claude is up and accepting input".
 pub const READY_EVENT: &str = "SessionStart";
 
+/// Floor on the actor's next-wake delay. Without it, a clean pass whose
+/// `next_restart_at` is already due (or arrives due, e.g. after a clock
+/// jump) computes a zero-length sleep and the loop spins `observe()`
+/// continuously — a clean pass leaves `next_restart_at` in place since
+/// `plan` emits no step for an unchanged `Running` agent.
+const MIN_TICK: Duration = Duration::from_secs(1);
+
 pub enum Msg {
     Apply {
         spec: FleetSpec,
@@ -169,6 +176,7 @@ impl Actor {
     fn deadline(&self) -> tokio::time::Instant {
         let now = tokio::time::Instant::now();
         let resync = now + self.ports.resync;
+        let floor = now + MIN_TICK;
         if !self.last_pass_clean {
             return resync;
         }
@@ -181,7 +189,9 @@ impl Actor {
             .filter_map(|a| a.next_restart_at)
             .min()
         {
-            Some(due) => (now + Duration::from_secs(due.0.saturating_sub(now_ts.0))).min(resync),
+            Some(due) => (now + Duration::from_secs(due.0.saturating_sub(now_ts.0)))
+                .max(floor)
+                .min(resync),
             None => resync,
         }
     }
@@ -373,7 +383,7 @@ impl Actor {
 mod tests {
     use super::*;
     use crate::testing::Harness;
-    use hecaton_api::{AgentPhase, AgentSettings, CrewSpec, FleetPhase, GitSettings};
+    use hecaton_api::{AgentPhase, AgentSettings, AgentStatus, CrewSpec, FleetPhase, GitSettings};
     use hecaton_core::ProcessState;
     use std::collections::BTreeMap;
 
@@ -638,5 +648,128 @@ mod tests {
         let rec = wait(&mut rx, |r| r.status.observed_generation == 3).await;
         assert_eq!(rec.status.agents["f/c/a"].phase, AgentPhase::Starting);
         assert_eq!(shared.hook_secrets.read().await[&id("f/c/a")], "kept");
+    }
+
+    /// A stale `next_restart_at` left over on an agent the runner reports as
+    /// still `Running` (e.g. a record loaded after a crash, before this
+    /// agent's own `Start` step ever clears the field) must not make
+    /// `deadline()` spin `observe()` with no delay: `MIN_TICK` floors the
+    /// wake even though the naive computation is due "now".
+    #[tokio::test]
+    async fn a_stale_past_next_restart_at_on_a_running_agent_does_not_spin_observe() {
+        let h = Harness::new(Duration::from_secs(10));
+        let s = spec(&["a"]);
+        let fleet = Fleet::try_from(s.clone()).unwrap();
+        let hash = ResolvedAgent::from_fleet(&fleet)[0].hash();
+        h.runner
+            .set_state(&id("f/c/a"), ProcessState::Running { pid: 1 });
+        let mut record = FleetRecord::new(s);
+        record.generation = 1;
+        record.status.generation = 1;
+        record.status.agents.insert(
+            "f/c/a".to_string(),
+            AgentStatus {
+                applied_hash: Some(hash),
+                next_restart_at: Some(Timestamp(500)), // already in FakeClock's past (1_000)
+                ..AgentStatus::default()
+            },
+        );
+        let (shared, _purged) = shared(Metrics::new().unwrap());
+        let handle = spawn(
+            "f".parse().unwrap(),
+            record,
+            FleetSecrets::default(),
+            h.ports.clone(),
+            shared,
+            true,
+        );
+        let mut rx = handle.status.clone();
+        wait(&mut rx, |r| r.status.observed_generation == 1).await;
+
+        let observe_calls = || {
+            h.runner
+                .calls()
+                .iter()
+                .filter(|c| *c == "observe f")
+                .count()
+        };
+        let before = observe_calls();
+        assert!(before >= 1, "the initial pass must have observed");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let after = observe_calls();
+        assert!(
+            after - before <= 1,
+            "expected the wake to be floored at MIN_TICK; observe grew by {} within 300ms",
+            after - before
+        );
+    }
+
+    /// Spec §3.2: a failed `observe()` is logged, counted, leaves status
+    /// unchanged, and the next tick retries at the resync cadence — even
+    /// when an agent already has a due `next_restart_at`, a failing pass
+    /// must not spin faster than resync.
+    #[tokio::test]
+    async fn a_failed_observe_leaves_status_unchanged_counts_it_and_retries_at_resync() {
+        let policy = ReconcilePolicy {
+            max_restarts: 5,
+            backoff_base_secs: 0,
+            backoff_cap_secs: 0,
+        };
+        let h = Harness::with_policy(Duration::from_millis(200), policy);
+        let (handle, shared, _purged) = start(&h);
+        apply(&handle, spec(&["a"])).await;
+        let mut rx = handle.status.clone();
+        wait(&mut rx, |r| r.status.observed_generation == 1).await;
+
+        h.runner
+            .set_state(&id("f/c/a"), ProcessState::Exited { code: Some(1) });
+        let before = wait(&mut rx, |r| {
+            r.status.agents["f/c/a"].next_restart_at.is_some()
+        })
+        .await;
+
+        let observe_calls = || {
+            h.runner
+                .calls()
+                .iter()
+                .filter(|c| *c == "observe f")
+                .count()
+        };
+        h.runner.set_fail_observe(true);
+        let base = observe_calls();
+
+        // (c) the due restart does not make the failing pass fire early.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            observe_calls(),
+            base,
+            "a failing pass must not fire before the resync cadence"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if observe_calls() > base {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the failing pass never ran");
+        // let the failing pass's persist()/publish() land.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // (a) a failed observe leaves the published status unchanged.
+        assert_eq!(
+            rx.borrow().status,
+            before.status,
+            "status must be unchanged after a failed observe"
+        );
+
+        // (b) it is counted.
+        let encoded = shared.metrics.encode();
+        assert!(
+            encoded.contains("hecaton_reconcile_errors_total{fleet=\"f\"} 1"),
+            "{encoded}"
+        );
     }
 }

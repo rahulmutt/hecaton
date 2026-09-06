@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use hecaton_api::{CredentialBundle, GitSettings, Timestamp};
 
@@ -121,6 +122,10 @@ pub struct FakeRunner {
     rec: Mutex<Recorder>,
     state: Mutex<ObservedState>,
     next_pid: Mutex<u32>,
+    /// While set, every `observe()` call fails (spec §3.2: a failed
+    /// `observe()` is logged, counted, leaves status unchanged, and the
+    /// next tick retries at the resync cadence).
+    fail_observe: AtomicBool,
 }
 
 impl FakeRunner {
@@ -137,6 +142,11 @@ impl FakeRunner {
     }
     pub fn observed(&self) -> ObservedState {
         lock(&self.state).clone()
+    }
+    /// Makes every subsequent `observe()` fail (or, passed `false`, stops
+    /// failing) until changed again.
+    pub fn set_fail_observe(&self, fail: bool) {
+        self.fail_observe.store(fail, Ordering::SeqCst);
     }
     fn check(&self, method: &str, id: &str) -> Result<(), RunnerError> {
         match lock(&self.rec).record(method, id) {
@@ -182,6 +192,14 @@ impl AgentRunner for FakeRunner {
     }
     fn observe(&self, fleet: &FleetName) -> Result<ObservedState, RunnerError> {
         self.check("observe", fleet.as_str())?;
+        if self.fail_observe.load(Ordering::SeqCst) {
+            return Err(RunnerError::Tool {
+                id: fleet.as_str().into(),
+                subcommand: "observe".into(),
+                args: vec![],
+                stderr: "fake observe failure".into(),
+            });
+        }
         Ok(self.observed())
     }
     fn send_text(&self, agent: &AgentId, text: &str, submit: bool) -> Result<(), RunnerError> {
