@@ -17,7 +17,7 @@ use proptest_state_machine::{ReferenceStateMachine, StateMachineTest, prop_state
 const AGENTS: [&str; 3] = ["a", "b", "c"];
 const MAX_RESTARTS: u32 = 2;
 const BASE: u64 = 2;
-const CAP: u64 = 8;
+const CAP: u64 = 3;
 
 fn policy() -> ReconcilePolicy {
     ReconcilePolicy {
@@ -389,4 +389,133 @@ prop_state_machine! {
     #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
     #[test]
     fn reconciler_matches_the_reference_model(sequential 1..40 => Sut);
+}
+
+/// Spec §6's model row also covers "runs where a named step is told to
+/// fail". The reference state machine above never injects a failure (it
+/// would need to model the Stop→fail intermediate phases the spec does not
+/// define), so this is a separate, narrower property: arm exactly one
+/// failing step on a fresh fleet, check the failed pass's generic
+/// consequences (degraded, no generation bump, right messages, nothing
+/// half-started), then check that a clean pass afterwards converges and a
+/// third pass is idempotent.
+#[derive(Clone, Debug)]
+enum Failure {
+    EnsureCrew,
+    Materialize(String),
+    EnsureAgent(String),
+}
+
+fn fleet_and_failure() -> impl Strategy<Value = (BTreeMap<String, u32>, Failure)> {
+    proptest::collection::btree_map(
+        proptest::sample::select(AGENTS.to_vec()).prop_map(String::from),
+        0..3u32,
+        1..=3,
+    )
+    .prop_flat_map(|map| {
+        let names: Vec<String> = map.keys().cloned().collect();
+        let failure = prop_oneof![
+            Just(Failure::EnsureCrew),
+            proptest::sample::select(names.clone()).prop_map(Failure::Materialize),
+            proptest::sample::select(names).prop_map(Failure::EnsureAgent),
+        ];
+        (Just(map), failure)
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+    #[test]
+    fn a_failed_step_degrades_the_pass_and_the_next_clean_pass_converges(
+        (map, failure) in fleet_and_failure()
+    ) {
+        let names: Vec<String> = map.keys().cloned().collect();
+        let fleet = fleet_of(&map);
+        let m = FakeMaterializer::default();
+        let r = FakeRunner::default();
+        let clock = FakeClock::new(Timestamp(1_000));
+        let creds = CredentialBundle::default();
+        let fleet_name: FleetName = "f".parse().unwrap();
+        let mut status = FleetStatus { generation: 1, ..FleetStatus::default() };
+        let desired = Some(fleet);
+
+        match &failure {
+            Failure::EnsureCrew => m.fail_next("ensure_crew", "f/c", "boom"),
+            Failure::Materialize(name) => m.fail_next("materialize", &format!("f/c/{name}"), "boom"),
+            Failure::EnsureAgent(name) => r.fail_next("ensure_agent", &format!("f/c/{name}"), "boom"),
+        }
+
+        let ctx = ReconcileContext {
+            fleet: &fleet_name,
+            desired: desired.as_ref(),
+            keep: Keep::default(),
+            materializer: &m,
+            runner: &r,
+            creds: &creds,
+            hooks: &hooks,
+            policy: &policy(),
+            clock: &clock,
+        };
+
+        // Pass 1: the armed failure fires.
+        let (_, report) = reconcile_pass(&mut status, &ctx).unwrap();
+        prop_assert!(!report.all_ok());
+        prop_assert_eq!(status.phase, FleetPhase::Degraded);
+        prop_assert_eq!(status.observed_generation, 0);
+
+        match &failure {
+            Failure::EnsureCrew => {
+                for name in &names {
+                    let a = status.agents.get(&format!("f/c/{name}")).unwrap();
+                    prop_assert!(!a.message.is_empty());
+                }
+                prop_assert!(!r.calls().iter().any(|c| c.starts_with("ensure_agent")));
+            }
+            Failure::Materialize(failing) => {
+                let a = status.agents.get(&format!("f/c/{failing}")).unwrap();
+                prop_assert!(!a.message.is_empty());
+                prop_assert_ne!(a.phase, AgentPhase::Starting);
+                let call = format!("ensure_agent f/c/{failing}");
+                prop_assert!(!r.calls().contains(&call));
+                for name in &names {
+                    if name != failing {
+                        let a = status.agents.get(&format!("f/c/{name}")).unwrap();
+                        prop_assert_eq!(a.phase, AgentPhase::Starting);
+                    }
+                }
+            }
+            Failure::EnsureAgent(failing) => {
+                let a = status.agents.get(&format!("f/c/{failing}")).unwrap();
+                prop_assert!(!a.message.is_empty());
+                prop_assert_ne!(a.phase, AgentPhase::Starting);
+                let call = format!("ensure_agent f/c/{failing}");
+                prop_assert!(r.calls().contains(&call));
+                let running = matches!(
+                    r.observed().get(&id(failing)),
+                    Some(ProcessState::Running { .. })
+                );
+                prop_assert!(!running);
+                for name in &names {
+                    if name != failing {
+                        let a = status.agents.get(&format!("f/c/{name}")).unwrap();
+                        prop_assert_eq!(a.phase, AgentPhase::Starting);
+                    }
+                }
+            }
+        }
+
+        // Pass 2: no failure armed this time; the fleet converges.
+        let (_, report2) = reconcile_pass(&mut status, &ctx).unwrap();
+        prop_assert!(report2.all_ok());
+        prop_assert_eq!(status.observed_generation, status.generation);
+        for name in &names {
+            let a = status.agents.get(&format!("f/c/{name}")).unwrap();
+            prop_assert_eq!(a.phase, AgentPhase::Starting);
+        }
+        prop_assert_eq!(status.phase, FleetPhase::Reconciling);
+
+        // Pass 3: idempotent, only EnsureCrew.
+        let (plan, _) = reconcile_pass(&mut status, &ctx).unwrap();
+        prop_assert!(plan.iter().all(|s| matches!(s, Step::EnsureCrew(_))));
+    }
 }
