@@ -115,6 +115,20 @@ impl Workspace<'_> {
         Ok(())
     }
 
+    /// Whether git knows `workspace` as a worktree of `crew.repo`.
+    fn is_registered(
+        &self,
+        id: &str,
+        crew: &CrewPaths,
+        workspace: &Path,
+    ) -> Result<bool, MaterializeError> {
+        let repo = crew.repo.display().to_string();
+        let list = self.git(id, crew, &["-C", &repo, "worktree", "list", "--porcelain"])?;
+        Ok(list
+            .lines()
+            .any(|l| l.strip_prefix("worktree ").map(Path::new) == Some(workspace)))
+    }
+
     /// Reuses a registered worktree; reuses an existing branch; otherwise
     /// creates the branch from `origin/<git_ref>`.
     pub fn ensure_worktree(
@@ -126,10 +140,7 @@ impl Workspace<'_> {
         git_ref: &str,
     ) -> Result<(), MaterializeError> {
         let repo = crew.repo.display().to_string();
-        let list = self.git(id, crew, &["-C", &repo, "worktree", "list", "--porcelain"])?;
-        let registered = list
-            .lines()
-            .any(|l| l.strip_prefix("worktree ").map(Path::new) == Some(workspace));
+        let registered = self.is_registered(id, crew, workspace)?;
         if registered && workspace.join(".git").exists() {
             return Ok(());
         }
@@ -185,7 +196,12 @@ impl Workspace<'_> {
             return Ok(());
         }
         let repo = crew.repo.display().to_string();
-        if workspace.exists() {
+        // `git worktree remove` errors on a path git does not know as a
+        // worktree ("is not a working tree"), which would fail the whole
+        // removal over a leftover plain directory. Only ask git to remove
+        // what git registered; `prune` and the caller's `rm -rf` clean up
+        // anything else.
+        if workspace.exists() && self.is_registered(id, crew, workspace)? {
             self.git(
                 id,
                 crew,

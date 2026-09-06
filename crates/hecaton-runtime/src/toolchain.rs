@@ -72,8 +72,10 @@ pub fn system_tools(
 /// System ⊕ user ⊕, when `with_gh`, `gh = <hecaton's pinned gh>` (spec §4.2
 /// step 3): a `git.auth: gh` crew always gets a `gh` entry even if an
 /// admin's system table omits one, falling back to the embedded pin; system
-/// and user values still win over that fallback. Without `with_gh`, `gh` is
-/// dropped from the table entirely.
+/// and user values still win over that fallback. Without `with_gh` the
+/// *system* `gh` is dropped — a `gh` the user asked for in `settings.tools`
+/// is merged in afterwards and always survives, since a crew that does not
+/// use gh for git auth may still want the CLI.
 pub fn render_mise_toml(
     id: &AgentId,
     system: &BTreeMap<String, String>,

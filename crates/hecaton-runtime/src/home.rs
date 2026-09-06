@@ -7,7 +7,7 @@ use hecaton_api::CredentialBundle;
 use hecaton_core::{AgentId, HookTarget, MaterializeError};
 use serde_json::{Map, Value, json};
 
-use crate::fsutil::{ensure_dir, write_atomic};
+use crate::fsutil::{ensure_dir, ensure_private_dir, write_atomic};
 use crate::layout::AgentPaths;
 
 /// Every Claude Code hook event hecaton listens to. Kept as one list so the
@@ -87,25 +87,34 @@ pub fn write_home(
     paths: &AgentPaths,
     inputs: &HomeInputs,
 ) -> Result<(), MaterializeError> {
+    // The agent root, its home and its logs hold secrets (settings.json,
+    // .credentials.json, hosts.yml) and transcripts: 0700, no group or
+    // other access. The rest are ordinary tool directories.
     for d in [
+        paths.root.clone(),
         paths.home.clone(),
         paths.claude_dir(),
+        paths.logs.clone(),
+    ] {
+        ensure_private_dir(&d).map_err(|e| io_err(id, &d, e))?;
+    }
+    for d in [
         paths.gh_dir(),
         paths.xdg_data(),
         paths.xdg_state(),
         paths.xdg_cache(),
         paths.nono_home.clone(),
-        paths.logs.clone(),
     ] {
         ensure_dir(&d).map_err(|e| io_err(id, &d, e))?;
     }
     let pretty = |v: &Value| serde_json::to_vec_pretty(v).unwrap_or_default();
 
+    // 0600: the hooks block carries the per-agent bearer secret.
     let settings_path = paths.claude_dir().join("settings.json");
     write_atomic(
         &settings_path,
         &pretty(&render_settings(inputs.settings, id, inputs.hooks)),
-        0o644,
+        0o600,
     )
     .map_err(|e| io_err(id, &settings_path, e))?;
 
@@ -117,13 +126,17 @@ pub fn write_home(
     }
     .map_err(|e| io_err(id, &creds_path, e))?;
 
-    let claude_json = paths.home.join(".claude.json");
-    write_atomic(
-        &claude_json,
-        &pretty(&render_claude_json(inputs.creds.claude_account.as_ref())),
-        0o600,
-    )
-    .map_err(|e| io_err(id, &claude_json, e))?;
+    // Written twice: Claude Code reads `$HOME/.claude.json` by default but
+    // `$CLAUDE_CONFIG_DIR/.claude.json` when that variable is set, and the
+    // sandbox profile sets it. Phase 3's e2e says which copy is live and
+    // the unused one goes then.
+    let claude_json_body = pretty(&render_claude_json(inputs.creds.claude_account.as_ref()));
+    for p in [
+        paths.home.join(".claude.json"),
+        paths.claude_dir().join(".claude.json"),
+    ] {
+        write_atomic(&p, &claude_json_body, 0o600).map_err(|e| io_err(id, &p, e))?;
+    }
 
     if inputs.with_gh
         && let Some(token) = &inputs.creds.gh_token
@@ -223,9 +236,23 @@ mod tests {
         )
         .unwrap();
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&paths.claude_dir().join("settings.json")), 0o644);
+        // settings.json holds the per-agent hook bearer secret.
+        assert_eq!(mode(&paths.claude_dir().join("settings.json")), 0o600);
         assert_eq!(mode(&paths.claude_dir().join(".credentials.json")), 0o600);
         assert_eq!(mode(&paths.gh_dir().join("hosts.yml")), 0o600);
+        assert_eq!(mode(&paths.root), 0o700);
+        assert_eq!(mode(&paths.home), 0o700);
+        assert_eq!(mode(&paths.logs), 0o700);
+
+        let outer = paths.home.join(".claude.json");
+        let inner = paths.claude_dir().join(".claude.json");
+        assert_eq!(mode(&outer), 0o600);
+        assert_eq!(mode(&inner), 0o600);
+        assert_eq!(
+            std::fs::read_to_string(&outer).unwrap(),
+            std::fs::read_to_string(&inner).unwrap(),
+            "both copies of .claude.json are written and identical"
+        );
         assert!(
             std::fs::read_to_string(paths.claude_dir().join(".credentials.json"))
                 .unwrap()

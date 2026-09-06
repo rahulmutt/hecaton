@@ -10,6 +10,16 @@ pub(crate) fn ensure_dir(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)
 }
 
+/// `create_dir_all` then `0o700` on the leaf. Used for the directories that
+/// hold an agent's secrets (`settings.json`, `.credentials.json`,
+/// `hosts.yml`): the files are 0600, and a 0700 enclosing directory keeps
+/// another local user from reaching them even if a mode is ever missed.
+/// Only the leaf is narrowed — the ancestors are hecaton's own state root.
+pub(crate) fn ensure_private_dir(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
 /// Writes `contents` to `path` via a sibling temp file and rename, with
 /// `mode` (e.g. `0o600`) applied before the rename. The temp file is
 /// created with `mode` from the start (via `OpenOptionsExt::mode`), so a
@@ -67,6 +77,18 @@ mod tests {
             1,
             "no temp file left"
         );
+    }
+
+    #[test]
+    fn private_dirs_are_0700_and_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a").join("b");
+        ensure_private_dir(&p).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&p), 0o700);
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_dir(&p).unwrap();
+        assert_eq!(mode(&p), 0o700, "an existing dir is narrowed too");
     }
 
     #[test]

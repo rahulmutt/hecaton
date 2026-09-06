@@ -179,7 +179,9 @@ pub fn write_profile(
     profile: &Value,
 ) -> Result<(), MaterializeError> {
     let bytes = serde_json::to_vec_pretty(profile).unwrap_or_default();
-    write_atomic(&paths.profile, &bytes, 0o644).map_err(|e| MaterializeError::Io {
+    // 0600: the profile is the sandbox's boundary, and a writable or
+    // widely readable one is a map of every path the agent may reach.
+    write_atomic(&paths.profile, &bytes, 0o600).map_err(|e| MaterializeError::Io {
         id: id.to_string(),
         path: paths.profile.clone(),
         message: e.to_string(),

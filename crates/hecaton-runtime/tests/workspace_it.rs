@@ -114,6 +114,19 @@ fn clone_worktree_reuse_and_remove() {
         .unwrap();
     assert!(!b.workspace.join("work.txt").exists());
     assert!(crew.root.join("logs").join("git.log").exists());
+
+    // An unregistered plain directory where a worktree used to be (a crashed
+    // pass, or a `.git` file removed by hand): `git worktree remove` would
+    // fail with "is not a working tree", so it is not called at all. Removal
+    // succeeds and leaves the directory for the caller's rm -rf to take.
+    let c = layout.agent(&"f/c/c".parse().unwrap());
+    std::fs::create_dir_all(&c.workspace).unwrap();
+    std::fs::write(c.workspace.join("stray.txt"), "not a worktree\n").unwrap();
+    ws.remove_worktree("f/c/c", &crew, &c.workspace).unwrap();
+    assert!(
+        c.workspace.join("stray.txt").exists(),
+        "an unregistered directory is left for remove_agent's rm -rf"
+    );
 }
 
 #[test]
