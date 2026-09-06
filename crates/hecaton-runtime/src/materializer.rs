@@ -1,8 +1,11 @@
 //! `Runtime`: the `Materializer` over real tools. `render_agent` is the
 //! pure-ish half (files only) shared with `hecaton dev materialize`.
 
-use hecaton_api::{CredentialBundle, GitAuth};
-use hecaton_core::{HookTarget, LaunchPlan, MaterializeError, ResolvedAgent};
+use hecaton_api::{CredentialBundle, GitAuth, GitSettings};
+use hecaton_core::{
+    AgentId, CrewRef, HookTarget, Keep, LaunchPlan, MaterializeError, Materializer, RepoRef,
+    ResolvedAgent,
+};
 
 use crate::env::agent_env;
 use crate::home::{HomeInputs, write_home};
@@ -11,6 +14,7 @@ use crate::layout::StateLayout;
 use crate::sandbox::{hecaton_grants, render_profile, validate_profile, write_profile};
 use crate::toolchain::{Toolchain, system_tools};
 use crate::tools::ToolPaths;
+use crate::workspace::Workspace;
 
 pub struct Runtime {
     pub layout: StateLayout,
@@ -91,5 +95,111 @@ impl Runtime {
         }
         .install(&agent.id, &paths)?;
         validate_profile(&self.tools, &agent.id, &paths)
+    }
+}
+
+impl Runtime {
+    fn workspace(&self, fleet: &hecaton_core::FleetName, git: &GitSettings) -> Workspace<'_> {
+        Workspace {
+            tools: &self.tools,
+            gh_config_dir: (git.auth == GitAuth::Gh).then(|| self.layout.fleet_gh_dir(fleet)),
+        }
+    }
+
+    fn rm_rf(id: &str, path: &std::path::Path) -> Result<(), MaterializeError> {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(MaterializeError::Io {
+                id: id.to_string(),
+                path: path.to_path_buf(),
+                message: e.to_string(),
+            }),
+        }
+    }
+}
+
+impl Materializer for Runtime {
+    fn ensure_crew(
+        &self,
+        crew: &CrewRef,
+        repo: &RepoRef,
+        git_ref: &str,
+        git: &GitSettings,
+        creds: &CredentialBundle,
+    ) -> Result<(), MaterializeError> {
+        let id = crew.to_string();
+        if git.auth == GitAuth::Gh {
+            let token = creds.gh_token.as_deref().ok_or_else(|| MaterializeError::Invalid {
+                id: id.clone(),
+                message: "git.auth is gh but no gh token was provided (run `gh auth login` on the client)".into(),
+            })?;
+            Workspace::write_fleet_gh_config(&self.layout.fleet_gh_dir(&crew.fleet), token, &id)?;
+        }
+        self.workspace(&crew.fleet, git)
+            .ensure_repo(&id, &self.layout.crew(crew), repo, git_ref)
+    }
+
+    fn materialize(
+        &self,
+        agent: &ResolvedAgent,
+        creds: &CredentialBundle,
+        hooks: &HookTarget,
+    ) -> Result<LaunchPlan, MaterializeError> {
+        let id = agent.id.to_string();
+        let crew = self.layout.crew(&agent.id.crew_ref());
+        let paths = self.layout.agent(&agent.id);
+        self.workspace(&agent.id.fleet, &agent.git)
+            .ensure_worktree(
+                &id,
+                &crew,
+                &paths.workspace,
+                &agent.branch(),
+                &agent.git_ref,
+            )?;
+        let plan = self.render_agent(agent, creds, hooks, &RenderOptions::default())?;
+        self.install_and_validate(agent)?;
+        Ok(plan)
+    }
+
+    fn remove_agent(&self, agent: &AgentId) -> Result<(), MaterializeError> {
+        let id = agent.to_string();
+        let crew = self.layout.crew(&agent.crew_ref());
+        let paths = self.layout.agent(agent);
+        Workspace {
+            tools: &self.tools,
+            gh_config_dir: None,
+        }
+        .remove_worktree(&id, &crew, &paths.workspace)?;
+        Self::rm_rf(&id, &paths.root)
+    }
+
+    fn remove_crew(&self, crew: &CrewRef, keep: Keep) -> Result<(), MaterializeError> {
+        let id = crew.to_string();
+        let paths = self.layout.crew(crew);
+        if !keep.sessions {
+            let agents_dir = paths.root.join("agents");
+            if let Ok(entries) = std::fs::read_dir(&agents_dir) {
+                for e in entries.flatten() {
+                    Workspace {
+                        tools: &self.tools,
+                        gh_config_dir: None,
+                    }
+                    .remove_worktree(
+                        &id,
+                        &paths,
+                        &e.path().join("workspace"),
+                    )?;
+                }
+            }
+            Self::rm_rf(&id, &agents_dir)?;
+        }
+        if !keep.repos {
+            Self::rm_rf(&id, &paths.repo)?;
+        }
+        if !keep.repos && !keep.sessions {
+            Self::rm_rf(&id, &paths.root)?;
+        }
+        Ok(())
     }
 }
