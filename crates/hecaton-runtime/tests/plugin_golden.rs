@@ -16,13 +16,19 @@ fn plugin_files_match_the_snapshot() {
         data_root: dir.path().join("data"),
         config_root: dir.path().join("config"),
     };
+    // Fixed tool paths so launch.sh and the profile are deterministic;
+    // nothing is executed. They must not exist: `plugin_grants`
+    // canonicalizes `mise`, and a real `/usr/local/bin/mise` is a symlink
+    // on a Homebrew or `mise.run` install, which would move the snapshot's
+    // `filesystem.read` entry from machine to machine (cf.
+    // `generated_golden.rs`).
     let tools = ToolPaths {
-        git: "/usr/bin/git".into(),
-        gh: "/usr/bin/gh".into(),
-        mise: "/usr/local/bin/mise".into(),
-        nono: "/usr/local/bin/nono".into(),
-        tmux: "/usr/bin/tmux".into(),
-        hecaton: "/usr/local/bin/hecaton".into(),
+        git: "/tools/git".into(),
+        gh: "/tools/gh".into(),
+        mise: "/tools/mise".into(),
+        nono: "/tools/nono".into(),
+        tmux: "/tools/tmux".into(),
+        hecaton: "/tools/hecaton".into(),
     };
     let rt = Runtime::new(layout.clone(), tools);
     let manifest: PluginManifest = serde_json::from_value(json!({

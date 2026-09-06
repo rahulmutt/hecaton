@@ -39,8 +39,8 @@ expression: profile
       "/etc",
       "<root>/data/mise",
       "<root>/data/plugins/web/0123456789ab",
-      "/usr/local/bin/hecaton",
-      "/usr/local/bin/mise",
+      "/tools/hecaton",
+      "/tools/mise",
       "/opt/data"
     ]
   },
