@@ -10,6 +10,7 @@ pub mod layout;
 pub mod materializer;
 pub mod quote;
 pub mod sandbox;
+pub mod tmux;
 pub mod toolchain;
 pub mod tools;
 pub mod workspace;
@@ -24,6 +25,7 @@ pub use sandbox::{
     Grants, check_conflicts, hecaton_grants, merge_profile, render_profile, validate_profile,
     write_profile,
 };
+pub use tmux::{ANCHOR_WINDOW, TmuxRunner};
 pub use toolchain::{Toolchain, embedded_system_tools, mise_env, render_mise_toml, system_tools};
 pub use tools::{MissingTool, ToolPaths};
 pub use workspace::Workspace;
