@@ -319,7 +319,7 @@ $XDG_STATE_HOME/hecaton/fleets/<fleet>/
   "filesystem": { "read":  ["/usr", "/lib", "/lib64", "/bin", "/etc", "<shared mise>"],
                   "allow": ["<home>", "<workspace>", "<repo>/.git"] },
   "workdir": { "access": "none" },
-  "network": { "connect_port": [<daemon_port>] },
+  "network": { "open_port": [<daemon_port>] },   // was connect_port; see the Phase 3 spec §8.1 (Landlock allowlist)
   "environment": { "deny_vars": ["*"],
                    "set_vars": { "HOME": "<home>", "XDG_CONFIG_HOME": …, "XDG_DATA_HOME": …,
                                  "XDG_STATE_HOME": …, "XDG_CACHE_HOME": …, "CLAUDE_CONFIG_DIR": …,

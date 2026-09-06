@@ -104,6 +104,13 @@ impl AgentPaths {
     pub fn claude_dir(&self) -> PathBuf {
         self.home.join(".claude")
     }
+    /// The agent's temp dir, 0700 inside `home/`. The sandbox grants nothing
+    /// under `/tmp`, and claude refuses to start when its temp dir
+    /// (`/tmp/claude-<uid>` by default) is unreachable, so `TMPDIR` and
+    /// `CLAUDE_CODE_TMPDIR` point here.
+    pub fn tmp_dir(&self) -> PathBuf {
+        self.home.join("tmp")
+    }
     pub fn claude_projects(&self) -> PathBuf {
         self.claude_dir().join("projects")
     }
@@ -165,6 +172,7 @@ mod tests {
         let base = "/h/.local/state/hecaton/fleets/payments/crews/backend/agents/alice";
         assert_eq!(a.root, PathBuf::from(base));
         assert_eq!(a.home, PathBuf::from(format!("{base}/home")));
+        assert_eq!(a.tmp_dir(), PathBuf::from(format!("{base}/home/tmp")));
         assert_eq!(a.nono_home, PathBuf::from(format!("{base}/nono")));
         assert_eq!(
             a.profile,

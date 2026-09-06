@@ -127,11 +127,13 @@ pub fn write_home(
     // The agent root, its home and its logs hold secrets (settings.json,
     // .credentials.json, hosts.yml) and transcripts: 0700, no group or
     // other access. The rest are ordinary tool directories.
+    // `tmp/` is 0700 too: claude checks its temp dir's mode before using it.
     for d in [
         paths.root.clone(),
         paths.home.clone(),
         paths.claude_dir(),
         paths.logs.clone(),
+        paths.tmp_dir(),
     ] {
         ensure_private_dir(&d).map_err(|e| io_err(id, &d, e))?;
     }
@@ -339,6 +341,11 @@ mod tests {
         assert_eq!(mode(&paths.root), 0o700);
         assert_eq!(mode(&paths.home), 0o700);
         assert_eq!(mode(&paths.logs), 0o700);
+        assert_eq!(
+            mode(&paths.tmp_dir()),
+            0o700,
+            "claude refuses a shared temp dir"
+        );
         assert_eq!(mode(&paths.home.join(".gitconfig")), 0o600);
         assert!(
             std::fs::read_to_string(paths.home.join(".gitconfig"))

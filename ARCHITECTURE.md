@@ -77,8 +77,16 @@ a clean terminating pass settles in `Down`, `--purge` deletes the directory.
 - **The agent environment lives in the nono profile, not in `env -i`.** nono
   refuses a read-write grant on any directory holding its own state root, and
   it derives that root from its own `$HOME`. So nono runs with `HOME=agents/<a>/nono`
-  and sets the agent's `HOME`, `XDG_*`, `HECATON_*` through `environment.set_vars`
-  with `deny_vars: ["*"]`. `PATH` is the one variable that crosses from outside.
+  and sets the agent's `HOME`, `XDG_*`, `HECATON_*`, `TMPDIR`/`CLAUDE_CODE_TMPDIR`
+  (the 0700 `home/tmp`; nothing under `/tmp` is granted and claude refuses an
+  unreachable temp dir) through `environment.set_vars` with `deny_vars: ["*"]`.
+  `PATH` is the one variable that crosses from outside.
+- **The daemon port is an `open_port`, not a `connect_port`.** On Landlock a
+  `connect_port` list is an outbound allowlist: the agent could reach the daemon
+  and nothing else, not even DNS or the Anthropic API. `open_port` grants
+  localhost TCP on that port only, leaves other egress at nono's default
+  (allowed) for the fleet's `sandbox.network` to tighten, and still holds under
+  a user `block: true`, so hooks keep flowing when egress is cut off.
 - **Worktree branches are reused, never reset.** `-B … origin/<ref>` would drop
   unpushed agent commits on every re-`up` after `down --keep-repos`.
 - **The planner is pure; the executor is dumb.** Every decision is in

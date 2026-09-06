@@ -152,6 +152,7 @@ python = "3.12.8"
       "*"
     ],
     "set_vars": {
+      "CLAUDE_CODE_TMPDIR": "<root>/state/fleets/payments/crews/backend/agents/alice/home/tmp",
       "CLAUDE_CONFIG_DIR": "<root>/state/fleets/payments/crews/backend/agents/alice/home/.claude",
       "GH_CONFIG_DIR": "<root>/state/fleets/payments/crews/backend/agents/alice/home/.config/gh",
       "HECATON_AGENT": "alice",
@@ -168,6 +169,7 @@ python = "3.12.8"
       "MISE_GLOBAL_CONFIG_FILE": "<root>/state/fleets/payments/crews/backend/agents/alice/mise.toml",
       "MISE_STATE_DIR": "<root>/state/fleets/payments/crews/backend/agents/alice/home/.local/state/mise",
       "RUST_LOG": "info",
+      "TMPDIR": "<root>/state/fleets/payments/crews/backend/agents/alice/home/tmp",
       "XDG_CACHE_HOME": "<root>/state/fleets/payments/crews/backend/agents/alice/home/.cache",
       "XDG_CONFIG_HOME": "<root>/state/fleets/payments/crews/backend/agents/alice/home/.config",
       "XDG_DATA_HOME": "<root>/state/fleets/payments/crews/backend/agents/alice/home/.local/share",
@@ -196,10 +198,10 @@ python = "3.12.8"
     "name": "hecaton-payments-backend-alice"
   },
   "network": {
-    "connect_port": [
+    "mode": "allow",
+    "open_port": [
       7643
-    ],
-    "mode": "allow"
+    ]
   },
   "workdir": {
     "access": "none"
@@ -361,6 +363,7 @@ python = "3.12.8"
       "*"
     ],
     "set_vars": {
+      "CLAUDE_CODE_TMPDIR": "<root>/state/fleets/payments/crews/backend/agents/bob/home/tmp",
       "CLAUDE_CONFIG_DIR": "<root>/state/fleets/payments/crews/backend/agents/bob/home/.claude",
       "GH_CONFIG_DIR": "<root>/state/fleets/payments/crews/backend/agents/bob/home/.config/gh",
       "HECATON_AGENT": "bob",
@@ -377,6 +380,7 @@ python = "3.12.8"
       "MISE_GLOBAL_CONFIG_FILE": "<root>/state/fleets/payments/crews/backend/agents/bob/mise.toml",
       "MISE_STATE_DIR": "<root>/state/fleets/payments/crews/backend/agents/bob/home/.local/state/mise",
       "RUST_LOG": "info",
+      "TMPDIR": "<root>/state/fleets/payments/crews/backend/agents/bob/home/tmp",
       "XDG_CACHE_HOME": "<root>/state/fleets/payments/crews/backend/agents/bob/home/.cache",
       "XDG_CONFIG_HOME": "<root>/state/fleets/payments/crews/backend/agents/bob/home/.config",
       "XDG_DATA_HOME": "<root>/state/fleets/payments/crews/backend/agents/bob/home/.local/share",
@@ -405,10 +409,10 @@ python = "3.12.8"
     "name": "hecaton-payments-backend-bob"
   },
   "network": {
-    "connect_port": [
+    "mode": "allow",
+    "open_port": [
       7643
-    ],
-    "mode": "allow"
+    ]
   },
   "workdir": {
     "access": "none"

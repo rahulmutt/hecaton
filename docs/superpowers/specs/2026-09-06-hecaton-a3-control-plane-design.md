@@ -306,21 +306,22 @@ hecaton --test e2e` with `HECATON_REQUIRE_TOOLS=1`).
 |---|---|---|
 | nono accepts a single file path (the hecaton binary) in `filesystem.read` | grant the binary's parent directory | **Holds.** Probed 2026-09-06 with nono 0.75.0: the profile's single-file `read` grant validates, is enforced, and the granted binary executes inside the sandbox. |
 | Claude runs `SessionStart` `command` hooks with the hook JSON on stdin and the profile environment (`HECATON_HOOK_SECRET` visible) | pass the secret as a 0600 file path in the command | **Not yet verified** — requires the hand-run described below. Holds in the e2e via `dev fake-claude`: the relay ran as the `SessionStart` command hook from inside nono, read `HECATON_API_URL`/`HECATON_AGENT_ID`/`HECATON_HOOK_SECRET` from the profile environment, and reached the daemon (`SessionStart` relay: holds for the fake). The real Claude's behaviour is untested. |
-| the real Claude fires HTTP hooks to a loopback `http://` URL with the literal `Authorization` header (checked once by hand with claude 2.1.263; the strings `allowedHttpHookUrls` and "HTTP hook not sent: … proxy, TLS trust or resolver settings differ" exist in the binary and their triggers are unknown) | move the remaining events to the relay | **Not yet verified** — requires the hand-run described below. The fake POSTed a `Notification` and got 200, which proves the daemon's ingress and the generated `settings.json`, not the real Claude's HTTP-hook client. |
+| the real Claude fires HTTP hooks to a loopback `http://` URL with the literal `Authorization` header (checked once by hand with claude 2.1.263; the strings `allowedHttpHookUrls` and "HTTP hook not sent: … proxy, TLS trust or resolver settings differ" exist in the binary and their triggers are unknown) | move the remaining events to the relay | **Holds.** Observed 2026-09-06 during `mise run verify-claude` (claude 2.1.263 inside the generated nono profile): claude's debug log shows `Hooks: HTTP hook POST to http://127.0.0.1:<port>/v1/agents/verify/c/a/events` followed by `HTTP hook response status 200` — a 200 means the daemon matched the literal bearer secret from `settings.json`. |
+| the real Claude starts inside the generated profile at all | — | **FAILED, then fixed.** claude 2.1.263 refused to start: "Temp directory /tmp/claude-1000 is not readable … Set CLAUDE_CODE_TMPDIR" — the profile grants nothing under `/tmp`. Fix: `home/tmp` (0700) with `TMPDIR` and `CLAUDE_CODE_TMPDIR` in `set_vars`; both names reserved from user `env`. The e2e never saw it because `dev fake-claude` needs no temp dir. |
+| the real Claude can reach the Anthropic API from inside the profile | — | **FAILED, then fixed.** With the Phase 2 base `network.connect_port: [<daemon_port>]`, Landlock treats the list as an outbound allowlist: `curl https://api.anthropic.com` got "Could not resolve host" and claude's log showed `getaddrinfo ETIMEOUT`. Probed 2026-09-06 with nono 0.75.0: without `connect_port` egress is allowed and the daemon stays reachable; `open_port: [<daemon_port>]` behaves the same and additionally survives a user `block: true`. Fix: the base profile uses `open_port`, matching the architecture spec's "loopback to the daemon always allowed; other network unrestricted by default". |
 | a repository's own `mise.toml` is ignored as untrusted inside the sandbox (e2e repo carries one) | pin `MISE_TRUSTED_CONFIG_PATHS` / `MISE_CONFIG_FILE` | **FAILS.** mise 2026.9.1 honours `[tools]` from an untrusted config — observed trying to install `node@0.0.1` from the e2e repo's `mise.toml`. Applied fallback (differs from the one above): the nono profile now sets `MISE_CEILING_PATHS` to the agent workspace and grants read on the agent's own rendered `mise.toml` (`crates/hecaton-runtime/src/env.rs`, `sandbox.rs`, commit `3059886`). Consequence: agents see no project-level mise config at all; hecaton's `tools:` table is the only toolchain source inside the sandbox. |
 | which `.claude.json` copy Claude reads under `CLAUDE_CONFIG_DIR`, and whether the seed suppresses onboarding (by hand) | keep both copies; extend the seed | **Not yet verified** — requires the hand-run described below. No interactive real-Claude session runs from an automated session. |
 | `HOME` relocation under a live `claude`: nothing lands in nono's `$HOME` (by hand) | add grants | **Not yet verified** — requires the hand-run described below. No interactive real-Claude session runs from an automated session. |
 
-**The hand-run.** The four rows above need one real `claude` session: on this
-machine, write a fleet file with `repo:` pointing at a small public
-repository, `git: { auth: none, push: false }`, run `serve -d`, `up`, attach
-with `tmux -L hecaton attach -t <fleet>/<crew>`, confirm Claude reaches its
-prompt without onboarding, then check `hecaton status` shows `Ready` (relay),
-`/metrics` shows a `UserPromptSubmit` or `Notification` count after typing
-one prompt (HTTP hooks), `ls agents/<a>/nono` (relocation), and which
-`.claude.json` has a newer mtime. Write each result into the table above. If
-the HTTP-hook row fails, open a follow-up item "move remaining events to the
-relay" rather than changing code in this task.
+**The hand-run.** The remaining "not yet verified" rows need one real
+`claude` session: `mise run verify-claude` (`scripts/verify-claude.sh`) stands
+up a scratch daemon with the real `claude` and the host credentials, pauses
+for the operator to attach (`tmux -L hecaton-verify-<pid> attach -t verify/c`)
+and type one prompt, then prints a report with `hecaton status` (relay →
+`Ready`), the `/metrics` hook counts (HTTP hooks), both `.claude.json`
+mtimes, and a listing of nono's own `$HOME` (relocation). Write each result
+into the table above. If the HTTP-hook row ever fails, open a follow-up item
+"move remaining events to the relay" rather than changing code in this task.
 
 ## 9. Errors, security, docs
 

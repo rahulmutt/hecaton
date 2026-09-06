@@ -22,6 +22,12 @@ pub fn agent_env(
         ("XDG_DATA_HOME".to_string(), s(&paths.xdg_data())),
         ("XDG_STATE_HOME".to_string(), s(&paths.xdg_state())),
         ("XDG_CACHE_HOME".to_string(), s(&paths.xdg_cache())),
+        // No path under `/tmp` is granted, and claude 2.1.263 refuses to
+        // start when `/tmp/claude-<uid>` is unreachable ("Temp directory …
+        // is not readable … Set CLAUDE_CODE_TMPDIR"). Both names point at
+        // the 0700 `home/tmp` so every tool in the sandbox shares it.
+        ("TMPDIR".to_string(), s(&paths.tmp_dir())),
+        ("CLAUDE_CODE_TMPDIR".to_string(), s(&paths.tmp_dir())),
         ("CLAUDE_CONFIG_DIR".to_string(), s(&paths.claude_dir())),
         ("GH_CONFIG_DIR".to_string(), s(&paths.gh_dir())),
         ("MISE_GLOBAL_CONFIG_FILE".to_string(), s(&paths.mise_toml)),
@@ -97,6 +103,14 @@ mod tests {
             "/h/.local/state/hecaton/fleets/payments/crews/backend/agents/alice/workspace"
         );
         assert!(!env.contains_key("PATH"), "PATH is nono's");
-        assert_eq!(env.len(), 20);
+        assert_eq!(
+            env["TMPDIR"],
+            "/h/.local/state/hecaton/fleets/payments/crews/backend/agents/alice/home/tmp"
+        );
+        assert_eq!(
+            env["CLAUDE_CODE_TMPDIR"], env["TMPDIR"],
+            "claude checks its own variable before TMPDIR"
+        );
+        assert_eq!(env.len(), 22);
     }
 }

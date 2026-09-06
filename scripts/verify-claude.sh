@@ -70,6 +70,20 @@ hr "build"
 HECATON="$REPO/target/debug/hecaton"
 
 hr "scratch root"
+# A previous run (interrupted, or still parked at the prompt) leaves its
+# daemon and tmux session behind; stop them before the root is wiped, or
+# they outlive their endpoint file and squat the agent's windows.
+if [ -f "$SERVER/hecaton.pid" ]; then
+  old="$(cat "$SERVER/hecaton.pid" 2>/dev/null || true)"
+  say "stopping the previous run's daemon (pid ${old:-?})"
+  "$HECATON" down "$FLEET" --keep --timeout 1m >/dev/null 2>&1 || true
+  [ -n "$old" ] && kill -TERM "$old" 2>/dev/null || true
+  for _ in $(seq 1 50); do [ -f "$SERVER/hecaton.pid" ] || break; sleep 0.1; done
+  [ -n "$old" ] && [ -f "$SERVER/hecaton.pid" ] && kill -KILL "$old" 2>/dev/null || true
+fi
+for sock in /tmp/tmux-"$(id -u)"/hecaton-verify-*; do
+  [ -S "$sock" ] && tmux -S "$sock" kill-server >/dev/null 2>&1 || true
+done
 rm -rf "$ROOT"
 mkdir -p "$ROOT/xdg/config/hecaton" "$XDG_STATE_HOME" "$XDG_DATA_HOME"
 if [ "$FAKE" = 1 ]; then

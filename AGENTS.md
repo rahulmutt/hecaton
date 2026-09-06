@@ -50,6 +50,12 @@ credentials, hook input, or sandbox rules.
   changes what agents get.
 - nono's state root follows nono's own `$HOME`; never point that at the agent's
   `home/` (see ARCHITECTURE.md).
+- Never put the daemon port in the profile's `network.connect_port`: on
+  Landlock that list is an outbound allowlist and the agent loses DNS and the
+  API. The daemon port is an `open_port` (localhost only), and claude's temp
+  dir is `home/tmp` via `TMPDIR`/`CLAUDE_CODE_TMPDIR` — nothing under `/tmp`
+  is granted. Both were found by `mise run verify-claude` against the real
+  `claude`, not by the e2e (the fake needs neither).
 - `Workspace::git` (`crates/hecaton-runtime/src/workspace.rs`) scrubs
   `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_PREFIX`/`GIT_COMMON_DIR` from
   every git call via `Cmd::env_remove`, and the integration-test `git`

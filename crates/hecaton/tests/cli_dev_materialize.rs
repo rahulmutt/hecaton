@@ -87,7 +87,7 @@ fn renders_the_four_files_with_redacted_credentials_by_default() {
     assert!(
         fs::read_to_string(Path::new(&agent_dir).join("nono-profile.json"))
             .unwrap()
-            .contains("\"connect_port\"")
+            .contains("\"open_port\"")
     );
     let launch = fs::read_to_string(Path::new(&agent_dir).join("launch.sh")).unwrap();
     assert!(launch.starts_with("#!/bin/sh"));
