@@ -76,10 +76,23 @@ fn clone_worktree_reuse_and_remove() {
     ws.ensure_repo("f/c", &crew, &repo, "main").unwrap();
     assert!(crew.repo.join(".git").is_dir());
     assert!(!crew.repo.join("README").exists(), "--no-checkout");
-    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap(); // fetch path
+    ws.ensure_repo("f/c", &crew, &repo, "main").unwrap(); // present → no git call
+    let git_log =
+        || std::fs::read_to_string(crew.root.join("logs").join("git.log")).unwrap_or_default();
+    let fetches = |log: &str| {
+        log.lines()
+            .filter(|l| l.starts_with("$ git") && l.contains(" fetch "))
+            .count()
+    };
+    assert_eq!(
+        fetches(&git_log()),
+        0,
+        "a second ensure_repo must not fetch"
+    );
 
     ws.ensure_worktree("f/c/a", &crew, &paths.workspace, "hecaton/f/c/a", "main")
         .unwrap();
+    assert_eq!(fetches(&git_log()), 1, "creating a branch fetches first");
     assert_eq!(
         std::fs::read_to_string(paths.workspace.join("README")).unwrap(),
         "hi\n"
@@ -90,6 +103,11 @@ fn clone_worktree_reuse_and_remove() {
     );
     ws.ensure_worktree("f/c/a", &crew, &paths.workspace, "hecaton/f/c/a", "main")
         .unwrap(); // idempotent
+    assert_eq!(
+        fetches(&git_log()),
+        1,
+        "a registered worktree costs no fetch"
+    );
 
     // agent commits; remove the worktree; re-adding must keep the commit (P2-6)
     std::fs::write(paths.workspace.join("work.txt"), "unpushed\n").unwrap();

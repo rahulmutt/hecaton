@@ -26,6 +26,15 @@ pub struct RenderOptions {
     pub redact_credentials: bool,
 }
 
+/// What `render_agent` produced and whether the installable inputs moved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderOutcome {
+    pub plan: LaunchPlan,
+    /// `mise.toml` or `nono-profile.json` changed: the install marker was
+    /// removed and `install_and_validate` will run the tools again.
+    pub toolchain_changed: bool,
+}
+
 impl Runtime {
     pub fn new(layout: StateLayout, tools: ToolPaths) -> Self {
         Self { layout, tools }
@@ -39,7 +48,7 @@ impl Runtime {
         creds: &CredentialBundle,
         hooks: &HookTarget,
         opts: &RenderOptions,
-    ) -> Result<LaunchPlan, MaterializeError> {
+    ) -> Result<RenderOutcome, MaterializeError> {
         let id = &agent.id;
         let paths = self.layout.agent(id);
         let crew = self.layout.crew(&id.crew_ref());
@@ -60,7 +69,7 @@ impl Runtime {
         )?;
 
         let system = system_tools(&self.layout, id)?;
-        Toolchain {
+        let tools_changed = Toolchain {
             tools: &self.tools,
             layout: &self.layout,
         }
@@ -81,7 +90,7 @@ impl Runtime {
             &env,
             &agent.settings.sandbox,
         )?;
-        write_profile(id, &paths, &profile)?;
+        let profile_changed = write_profile(id, &paths, &profile)?;
 
         let resume = wants_continue(&agent.settings.claude, &paths);
         let (script, plan) = render_launch(
@@ -92,18 +101,42 @@ impl Runtime {
             resume,
         );
         write_launch(id, &paths, &script)?;
-        Ok(plan)
+
+        let toolchain_changed = tools_changed || profile_changed;
+        if toolchain_changed
+            && let Err(e) = std::fs::remove_file(paths.installed_marker())
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(MaterializeError::Io {
+                id: id.to_string(),
+                path: paths.installed_marker(),
+                message: e.to_string(),
+            });
+        }
+        Ok(RenderOutcome {
+            plan,
+            toolchain_changed,
+        })
     }
 
-    /// The subprocess half of steps 3 and 4.
+    /// The subprocess half of steps 3 and 4. Skipped when the marker from a
+    /// previous success exists (Phase 3 spec §6.2); written on success.
     pub fn install_and_validate(&self, agent: &ResolvedAgent) -> Result<(), MaterializeError> {
         let paths = self.layout.agent(&agent.id);
+        if paths.installed_marker().exists() {
+            return Ok(());
+        }
         Toolchain {
             tools: &self.tools,
             layout: &self.layout,
         }
         .install(&agent.id, &paths)?;
-        validate_profile(&self.tools, &agent.id, &paths)
+        validate_profile(&self.tools, &agent.id, &paths)?;
+        std::fs::write(paths.installed_marker(), b"").map_err(|e| MaterializeError::Io {
+            id: agent.id.to_string(),
+            path: paths.installed_marker(),
+            message: e.to_string(),
+        })
     }
 }
 
@@ -166,9 +199,9 @@ impl Materializer for Runtime {
                 &agent.branch(),
                 &agent.git_ref,
             )?;
-        let plan = self.render_agent(agent, creds, hooks, &RenderOptions::default())?;
+        let out = self.render_agent(agent, creds, hooks, &RenderOptions::default())?;
         self.install_and_validate(agent)?;
-        Ok(plan)
+        Ok(out.plan)
     }
 
     fn remove_agent(&self, agent: &AgentId) -> Result<(), MaterializeError> {
@@ -211,5 +244,117 @@ impl Materializer for Runtime {
             Self::rm_rf(&id, &paths.root)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hecaton_api::{AgentSettings, CrewSpec, FleetSpec};
+    use hecaton_core::Fleet;
+    use std::collections::BTreeMap;
+
+    fn runtime(root: &std::path::Path) -> Runtime {
+        let layout = StateLayout {
+            state_root: root.join("state"),
+            data_root: root.join("data"),
+            config_root: root.join("config"),
+        };
+        std::fs::create_dir_all(&layout.config_root).unwrap();
+        std::fs::write(layout.system_mise_toml(), "[tools]\n").unwrap();
+        let tools = ToolPaths {
+            git: "/nonexistent/git".into(),
+            gh: "/nonexistent/gh".into(),
+            mise: "/nonexistent/mise".into(),
+            nono: "/nonexistent/nono".into(),
+            tmux: "/nonexistent/tmux".into(),
+            hecaton: "/nonexistent/hecaton".into(),
+        };
+        Runtime::new(layout, tools)
+    }
+
+    fn agent(tools: &[(&str, &str)]) -> ResolvedAgent {
+        let s = AgentSettings {
+            tools: tools
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..AgentSettings::default()
+        };
+        let fleet = Fleet::try_from(FleetSpec {
+            name: "f".into(),
+            crews: BTreeMap::from([(
+                "c".to_string(),
+                CrewSpec {
+                    repo: "acme/x".into(),
+                    git_ref: "main".into(),
+                    git: GitSettings::default(),
+                    agents: BTreeMap::from([("a".to_string(), s)]),
+                },
+            )]),
+        })
+        .unwrap();
+        ResolvedAgent::from_fleet(&fleet).remove(0)
+    }
+
+    fn hooks() -> HookTarget {
+        HookTarget {
+            url: "http://127.0.0.1:7643".into(),
+            secret: "s".into(),
+        }
+    }
+
+    #[test]
+    fn rendering_reports_toolchain_changes_and_clears_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime(dir.path());
+        let creds = CredentialBundle::default();
+        let a = agent(&[("node", "22.11.0")]);
+        let paths = rt.layout.agent(&a.id);
+        let first = rt
+            .render_agent(&a, &creds, &hooks(), &RenderOptions::default())
+            .unwrap();
+        assert!(first.toolchain_changed);
+        let again = rt
+            .render_agent(&a, &creds, &hooks(), &RenderOptions::default())
+            .unwrap();
+        assert!(!again.toolchain_changed, "same inputs, same files");
+        assert_eq!(again.plan, first.plan);
+
+        std::fs::write(paths.installed_marker(), "").unwrap();
+        rt.render_agent(&a, &creds, &hooks(), &RenderOptions::default())
+            .unwrap();
+        assert!(
+            paths.installed_marker().exists(),
+            "unchanged render keeps the marker"
+        );
+        let b = agent(&[("node", "22.12.0")]);
+        let changed = rt
+            .render_agent(&b, &creds, &hooks(), &RenderOptions::default())
+            .unwrap();
+        assert!(changed.toolchain_changed);
+        assert!(
+            !paths.installed_marker().exists(),
+            "a new table invalidates the install"
+        );
+    }
+
+    #[test]
+    fn install_is_skipped_when_the_marker_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime(dir.path());
+        let a = agent(&[]);
+        let paths = rt.layout.agent(&a.id);
+        rt.render_agent(
+            &a,
+            &CredentialBundle::default(),
+            &hooks(),
+            &RenderOptions::default(),
+        )
+        .unwrap();
+        // tools point nowhere: running mise would fail with "cannot execute"
+        assert!(rt.install_and_validate(&a).is_err());
+        std::fs::write(paths.installed_marker(), "").unwrap();
+        rt.install_and_validate(&a).unwrap();
     }
 }

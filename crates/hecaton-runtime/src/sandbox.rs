@@ -182,19 +182,24 @@ pub fn check_conflicts(
     Ok(())
 }
 
+/// Writes the profile; returns whether its bytes changed.
 pub fn write_profile(
     id: &AgentId,
     paths: &AgentPaths,
     profile: &Value,
-) -> Result<(), MaterializeError> {
+) -> Result<bool, MaterializeError> {
     let bytes = serde_json::to_vec_pretty(profile).unwrap_or_default();
+    if std::fs::read(&paths.profile).ok().as_deref() == Some(bytes.as_slice()) {
+        return Ok(false);
+    }
     // 0600: the profile is the sandbox's boundary, and a writable or
     // widely readable one is a map of every path the agent may reach.
     write_atomic(&paths.profile, &bytes, 0o600).map_err(|e| MaterializeError::Io {
         id: id.to_string(),
         path: paths.profile.clone(),
         message: e.to_string(),
-    })
+    })?;
+    Ok(true)
 }
 
 pub fn validate_profile(

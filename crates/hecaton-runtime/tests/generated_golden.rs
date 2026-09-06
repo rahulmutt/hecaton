@@ -89,7 +89,8 @@ fn payments_agents_generate_known_files() {
                     redact_credentials: true,
                 },
             )
-            .unwrap();
+            .unwrap()
+            .plan;
         let paths = layout.agent(&agent.id);
         assert_eq!(plan.script, paths.launch);
         for (label, path) in [

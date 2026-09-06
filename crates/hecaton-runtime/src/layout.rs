@@ -94,6 +94,13 @@ impl StateLayout {
 }
 
 impl AgentPaths {
+    /// Written after `mise install` and `nono profile validate` succeed for
+    /// the current `mise.toml` + `nono-profile.json`; removed when either
+    /// rendered file changes (Phase 3 spec §6.2).
+    pub fn installed_marker(&self) -> PathBuf {
+        self.root.join(".installed")
+    }
+
     pub fn claude_dir(&self) -> PathBuf {
         self.home.join(".claude")
     }
