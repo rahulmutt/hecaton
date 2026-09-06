@@ -41,6 +41,12 @@ pub enum Command {
     Status(StatusArgs),
     /// List fleets.
     List(ListArgs),
+
+    // -- internal --
+    /// Reads the SessionStart hook JSON on stdin, posts it to the daemon,
+    /// prints the reply; on any failure prints `{}` and exits 0.
+    #[command(hide = true)]
+    HookRelay,
 }
 
 #[derive(Debug, Args)]
@@ -143,6 +149,16 @@ pub enum DevCommand {
     /// Render one agent's generated files (settings.json, mise.toml,
     /// nono-profile.json, launch.sh) without launching anything.
     Materialize(MaterializeArgs),
+    /// Stand-in for `claude` in the e2e: runs the SessionStart command hooks
+    /// and one Notification HTTP hook from settings.json, then sleeps.
+    FakeClaude(FakeClaudeArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct FakeClaudeArgs {
+    /// Whatever the fleet passes to claude (`--verbose`, `--continue`, …); recorded, not interpreted.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub rest: Vec<String>,
 }
 
 #[derive(Debug, Args)]

@@ -1,12 +1,18 @@
-//! `hecaton dev …` (Phase 2 spec §5).
+//! `hecaton dev …` (Phase 2 spec §5; `fake-claude` is Phase 3 spec §7).
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use hecaton_config::{HostPaths, ResolveOptions, host, read, resolve};
 use hecaton_core::{Fleet, HookTarget, ResolvedAgent};
 use hecaton_runtime::{RenderOptions, Runtime, StateLayout};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::cli::MaterializeArgs;
+use crate::cli::{FakeClaudeArgs, MaterializeArgs};
 use crate::wiring::{layout_from_env, tool_paths};
 
 pub fn materialize_command(args: &MaterializeArgs) -> Result<String> {
@@ -114,4 +120,150 @@ fn throwaway_secret() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     hex::encode(Sha256::digest(format!("{}-{nanos}", std::process::id())))[..32].to_string()
+}
+
+/// `hecaton dev fake-claude` (Phase 3 spec §7): what the e2e launches in
+/// place of `claude`. Runs once, then sleeps until the runner kills it.
+pub fn fake_claude_command(args: &FakeClaudeArgs) -> Result<String> {
+    let config_dir =
+        PathBuf::from(std::env::var_os("CLAUDE_CONFIG_DIR").context("CLAUDE_CONFIG_DIR not set")?);
+    let home = PathBuf::from(std::env::var_os("HOME").context("HOME not set")?);
+    fake_claude_once(&config_dir, &home, &args.rest)?;
+    eprintln!("fake-claude: hooks done; sleeping until killed");
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
+}
+
+/// Records argv, marks a session so `--continue` triggers next time, runs
+/// every `SessionStart` command hook with a payload on stdin (as Claude
+/// does), and posts one `Notification` to every HTTP hook for that event.
+pub fn fake_claude_once(config_dir: &Path, home: &Path, argv: &[String]) -> Result<()> {
+    std::fs::write(home.join("fake-claude.argv"), argv.join("\n") + "\n")?;
+    let projects = config_dir.join("projects").join("e2e");
+    std::fs::create_dir_all(&projects)?;
+    std::fs::write(projects.join("session.marker"), "fake\n")?;
+    let settings: Value =
+        serde_json::from_slice(&std::fs::read(config_dir.join("settings.json"))?)?;
+    let cwd = std::env::current_dir()?;
+
+    for hook in hooks_of(&settings, "SessionStart") {
+        let Some(cmd) = (hook["type"] == "command")
+            .then(|| hook["command"].as_str())
+            .flatten()
+        else {
+            continue;
+        };
+        let payload = json!({
+            "hook_event_name": "SessionStart", "session_id": "fake-claude",
+            "cwd": cwd, "source": "startup"
+        });
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(cmd)
+            .env("HOME", home)
+            .env("CLAUDE_CONFIG_DIR", config_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| format!("cannot run SessionStart hook {cmd:?}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(payload.to_string().as_bytes())?;
+        }
+        let out = child.wait_with_output()?;
+        eprintln!(
+            "fake-claude: SessionStart hook {cmd:?} exited {} with {}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout).trim()
+        );
+    }
+
+    for hook in hooks_of(&settings, "Notification") {
+        let Some(url) = (hook["type"] == "http")
+            .then(|| hook["url"].as_str())
+            .flatten()
+        else {
+            continue;
+        };
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(5)))
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let mut req = agent.post(url).header("Content-Type", "application/json");
+        if let Some(headers) = hook["headers"].as_object() {
+            for (k, v) in headers {
+                if let Some(v) = v.as_str() {
+                    req = req.header(k, v);
+                }
+            }
+        }
+        let payload = json!({
+            "hook_event_name": "Notification", "session_id": "fake-claude",
+            "message": "fake claude is up"
+        });
+        // A raw compact body, not `send_json` (which pretty-prints), to
+        // match the payload shape Claude actually sends.
+        match req.send(payload.to_string().as_bytes()) {
+            Ok(r) => eprintln!("fake-claude: Notification hook → {}", r.status()),
+            Err(e) => eprintln!("fake-claude: Notification hook failed: {e}"),
+        }
+    }
+    Ok(())
+}
+
+fn hooks_of(settings: &Value, event: &str) -> Vec<Value> {
+    settings["hooks"][event]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|m| m["hooks"].as_array().cloned().unwrap_or_default())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::stub_server;
+    use serde_json::json;
+
+    #[test]
+    fn fake_claude_runs_command_hooks_posts_one_http_hook_and_records_argv() {
+        let (url, seen) = stub_server("200 OK", "{}");
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let config_dir = home.join(".claude");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let settings = json!({
+            "hooks": {
+                "SessionStart": [{ "hooks": [{ "type": "command", "command": "cat > \"$HOME/seen.json\"", "timeout": 10 }] }],
+                "Notification": [{ "hooks": [{ "type": "http", "url": format!("{url}/v1/agents/f/c/a/events"), "headers": { "Authorization": "Bearer s3" } }] }],
+                "Stop": [{ "hooks": [{ "type": "http", "url": "http://127.0.0.1:1/never" }] }]
+            }
+        });
+        std::fs::write(config_dir.join("settings.json"), settings.to_string()).unwrap();
+        fake_claude_once(
+            &config_dir,
+            &home,
+            &["--verbose".into(), "--continue".into()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(home.join("fake-claude.argv")).unwrap(),
+            "--verbose\n--continue\n"
+        );
+        let seen_payload: Value =
+            serde_json::from_str(&std::fs::read_to_string(home.join("seen.json")).unwrap())
+                .unwrap();
+        assert_eq!(seen_payload["hook_event_name"], "SessionStart");
+        assert!(config_dir.join("projects/e2e/session.marker").exists());
+        let req = seen.recv().unwrap();
+        assert!(
+            req.contains("Authorization: Bearer s3") || req.contains("authorization: Bearer s3"),
+            "{req}"
+        );
+        assert!(req.contains(r#""hook_event_name":"Notification""#), "{req}");
+    }
 }
