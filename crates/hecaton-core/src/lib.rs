@@ -5,6 +5,7 @@ pub mod fakes;
 pub mod fleet;
 pub mod name;
 pub mod ports;
+pub mod reconcile;
 pub mod repo;
 
 pub use agent::{CrewRef, ResolvedAgent};
@@ -14,4 +15,5 @@ pub use ports::{
     AgentRunner, Clock, HookTarget, Keep, LaunchPlan, MaterializeError, Materializer,
     ObservedState, ProcessState, RunnerError, first_line,
 };
+pub use reconcile::{Plan, ReconcilePolicy, Step};
 pub use repo::{RepoError, RepoRef};
