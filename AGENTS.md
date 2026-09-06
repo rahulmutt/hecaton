@@ -7,6 +7,10 @@ credentials, hook input, or sandbox rules.
 
 ## Tasks (`mise run <task>`)
 - `check` — lint + test; run before every commit.
+- `test-it` — the `hecaton-runtime` integration tests against real
+  git/mise/nono/tmux, with `HECATON_REQUIRE_TOOLS=1` so a missing tool fails
+  instead of skipping.
+- `mutants` — nightly tier: mutation-tests `hecaton-core` (the reconciler).
 - `lint`, `test`, `fmt`, `precommit`, `audit` — defined in `mise.toml`.
 
 ## Conventions

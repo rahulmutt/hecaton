@@ -18,9 +18,11 @@ against what was declared.
 - `hecaton-api` — serde wire types. A leaf; no logic. Anything that holds a secret
   hand-implements `Debug` and prints `<redacted>`.
 - `hecaton-core` — the domain: validated names (`FleetName`, …), `RepoRef`, the
-  `Fleet` that `FleetSpec` converts into with `TryFrom`. Later: the reconciler and
-  the ports (`AgentRunner`, `FleetStore`, `EventHandler`) adapters implement.
-  Never does I/O, so it tests with fakes.
+  `Fleet` that `FleetSpec` converts into with `TryFrom`, the pure reconciler
+  (`reconcile::plan`/`execute`/`apply`), and the ports adapters implement —
+  `Materializer`, `AgentRunner`, `Clock` today; `FleetStore` and
+  `EventHandler` arrive with the server. Never does I/O, so it tests with
+  fakes (`hecaton_core::fakes`).
 - `hecaton-config` — YAML → resolved `FleetSpec`. Parses the three-level file,
   deep-merges settings layers as JSON values, types and validates each agent.
 - `hecaton` — the binary, and the only crate allowed to see both ports and
