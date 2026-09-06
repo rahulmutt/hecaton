@@ -54,3 +54,16 @@ run = "cargo mutants -p hecaton-core --in-place"
 description = "Integration tests against real git/mise/nono/tmux, failing (not skipping) when a tool is missing"
 env = { HECATON_REQUIRE_TOOLS = "1" }
 run = "cargo nextest run -p hecaton-runtime"
+
+[tasks.e2e]
+description = "End-to-end journey against a real daemon, git, mise, nono and tmux (fails, not skips, without tools)"
+env = { HECATON_REQUIRE_TOOLS = "1" }
+run = "cargo nextest run -p hecaton --test e2e"
+
+[tasks.serve]
+description = "Run a daemon in the foreground under target/tmp/serve (a scratch XDG root)"
+env = { HOME = "{{config_root}}/target/tmp/serve/home" }
+run = [
+  "mkdir -p target/tmp/serve/home",
+  "cargo run -q -p hecaton -- serve --tmux-socket hecaton-dev",
+]

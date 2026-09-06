@@ -11,6 +11,7 @@ env:
   # (two cargo: tools build from source); each job installs only what it needs.
   MISE_AUTO_INSTALL: "false"
 jobs:
+  # check runs the whole workspace, e2e included; HECATON_REQUIRE_TOOLS makes a missing tool fail.
   check:
     runs-on: ubuntu-latest
     env:
