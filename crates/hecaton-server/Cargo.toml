@@ -1,0 +1,30 @@
+[package]
+name = "hecaton-server"
+description = "The hecaton daemon: fleet registry, reconcile tasks, HTTP API, hook ingress"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hecaton-api = { workspace = true }
+hecaton-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+prometheus = { workspace = true }
+chacha20poly1305 = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = { workspace = true }
+ureq = { workspace = true }
+
+[lints]
+workspace = true

@@ -19,7 +19,7 @@ pub use env::agent_env;
 pub use home::{HOOK_EVENTS, HomeInputs, write_home};
 pub use launch::{hooks_port, render_launch, wants_continue};
 pub use layout::{AgentPaths, CrewPaths, StateLayout};
-pub use materializer::{RenderOptions, Runtime};
+pub use materializer::{RenderOptions, RenderOutcome, Runtime};
 pub use quote::sh_quote;
 pub use sandbox::{
     Grants, check_conflicts, hecaton_grants, merge_profile, render_profile, validate_profile,

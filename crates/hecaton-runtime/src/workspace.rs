@@ -73,7 +73,9 @@ impl Workspace<'_> {
             })
     }
 
-    /// Clone without a checkout if absent, else fetch. Idempotent.
+    /// Clone without a checkout if absent; otherwise nothing (Phase 3 spec
+    /// §6.1: a steady-state pass costs no git call). `ensure_worktree`
+    /// fetches when it actually needs `origin/<ref>`.
     pub fn ensure_repo(
         &self,
         id: &str,
@@ -83,35 +85,24 @@ impl Workspace<'_> {
     ) -> Result<(), MaterializeError> {
         let _ = git_ref;
         if crew.repo.join(".git").is_dir() {
-            self.git(
-                id,
-                crew,
-                &[
-                    "-C",
-                    &crew.repo.display().to_string(),
-                    "fetch",
-                    "--quiet",
-                    "origin",
-                ],
-            )?;
-        } else {
-            std::fs::create_dir_all(&crew.root).map_err(|e| MaterializeError::Io {
-                id: id.to_string(),
-                path: crew.root.clone(),
-                message: e.to_string(),
-            })?;
-            self.git(
-                id,
-                crew,
-                &[
-                    "clone",
-                    "--quiet",
-                    "--no-checkout",
-                    &repo.clone_url(),
-                    &crew.repo.display().to_string(),
-                ],
-            )?;
+            return Ok(());
         }
+        std::fs::create_dir_all(&crew.root).map_err(|e| MaterializeError::Io {
+            id: id.to_string(),
+            path: crew.root.clone(),
+            message: e.to_string(),
+        })?;
+        self.git(
+            id,
+            crew,
+            &[
+                "clone",
+                "--quiet",
+                "--no-checkout",
+                &repo.clone_url(),
+                &crew.repo.display().to_string(),
+            ],
+        )?;
         Ok(())
     }
 
@@ -167,6 +158,8 @@ impl Workspace<'_> {
                 &["-C", &repo, "worktree", "add", "--quiet", &ws, branch],
             )?;
         } else {
+            // the only moment `origin/<ref>` must be current
+            self.git(id, crew, &["-C", &repo, "fetch", "--quiet", "origin"])?;
             self.git(
                 id,
                 crew,

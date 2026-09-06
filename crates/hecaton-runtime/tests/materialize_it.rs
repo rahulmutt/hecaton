@@ -50,6 +50,7 @@ fn fleet(repo_url: &str) -> Fleet {
                 git: GitSettings {
                     push: false,
                     auth: GitAuth::None,
+                    ..GitSettings::default()
                 },
                 agents: BTreeMap::from([("a".to_string(), s)]),
             },
@@ -120,7 +121,7 @@ fn materialize_then_remove_round_trip() {
     let crew = agent.id.crew_ref();
     let creds = CredentialBundle::default();
     let hooks = HookTarget {
-        url: "https://127.0.0.1:7643".into(),
+        url: "http://127.0.0.1:7643".into(),
         secret: "s".into(),
     };
 
@@ -140,6 +141,16 @@ fn materialize_then_remove_round_trip() {
     rt.ensure_crew(&crew, &agent.repo, &agent.git_ref, &agent.git, &creds)
         .unwrap();
     rt.materialize(&agent, &creds, &hooks).unwrap();
+    assert!(paths.installed_marker().exists());
+    let mise_log = std::fs::read_to_string(paths.logs.join("mise.toolchain.log")).unwrap();
+    assert_eq!(
+        mise_log
+            .lines()
+            .filter(|l| l.starts_with("$ mise install"))
+            .count(),
+        1,
+        "unchanged table → install skipped on the second pass"
+    );
 
     // Exercise remove_crew's per-agent worktree-removal loop while the
     // agent's worktree still exists: removing the agent first would empty

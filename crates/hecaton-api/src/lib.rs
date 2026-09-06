@@ -8,15 +8,19 @@ pub const API_VERSION: &str = "hecaton/v1";
 
 pub mod credentials;
 pub mod fleet;
+pub mod hook;
 pub mod request;
 pub mod settings;
 pub mod status;
 
 pub use credentials::CredentialBundle;
-pub use fleet::{CrewSpec, FleetSpec, GitAuth, GitSettings};
-pub use request::FleetRequest;
+pub use fleet::{CrewSpec, FleetSpec, GitAuth, GitIdentity, GitSettings};
+pub use hook::HookEvent;
+pub use request::{DownQuery, ErrorBody, FleetRequest};
 pub use settings::{AgentSettings, ClaudeSettings, RunnerSettings};
-pub use status::{AgentPhase, AgentStatus, FleetPhase, FleetStatus, SpecHash, Timestamp};
+pub use status::{
+    AgentPhase, AgentStatus, FleetPhase, FleetStatus, FleetSummary, SpecHash, Timestamp,
+};
 
 #[cfg(test)]
 mod tests {

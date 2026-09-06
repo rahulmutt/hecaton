@@ -1,7 +1,10 @@
 //! `hecaton` — CLI entry point.
 
 mod cli;
+mod client;
 mod commands;
+#[cfg(test)]
+mod testutil;
 mod wiring;
 
 use std::process::ExitCode;
@@ -26,11 +29,21 @@ fn main() -> ExitCode {
 fn run() -> anyhow::Result<String> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Serve(args) => commands::serve::serve_command(&args),
         Command::Config {
             command: ConfigCommand::Resolve(args),
         } => commands::config::resolve_command(&args),
         Command::Dev {
             command: DevCommand::Materialize(args),
         } => commands::dev::materialize_command(&args),
+        Command::Dev {
+            command: DevCommand::FakeClaude(args),
+        } => commands::dev::fake_claude_command(&args),
+        Command::Up(args) => commands::fleet::up_command(&args),
+        Command::Update(args) => commands::fleet::update_command(&args),
+        Command::Down(args) => commands::fleet::down_command(&args),
+        Command::Status(args) => commands::fleet::status_command(&args),
+        Command::List(args) => commands::fleet::list_command(&args),
+        Command::HookRelay => commands::relay::hook_relay_command(),
     }
 }

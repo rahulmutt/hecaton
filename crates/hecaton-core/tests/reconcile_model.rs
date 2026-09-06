@@ -266,10 +266,11 @@ impl StateMachineTest for Sut {
         // `proptest-state-machine` checks invariants on the initial state too
         // (before any transition is applied), and the model's init state
         // (`desired: None`, no agents) is defined in terms of a fleet phase
-        // that only exists after a reconcile pass has run (spec §3.4:
-        // `Terminating` if desired is `None`, `Pending` for no agents). Run
-        // one pass up front so the SUT's `FleetStatus::default()` reaches the
-        // same already-settled state the reference model starts in.
+        // that only exists after a reconcile pass has run (spec §3.4 and
+        // Phase 3 spec P3-5: `Down` once a down pass has run clean, `Pending`
+        // for no agents). Run one pass up front so the SUT's
+        // `FleetStatus::default()` reaches the same already-settled state the
+        // reference model starts in.
         sut.pass();
         sut
     }
@@ -342,7 +343,9 @@ impl StateMachineTest for Sut {
         }
 
         let expected_fleet = if r.desired.is_none() {
-            FleetPhase::Terminating
+            // every pass with `desired: None` stops and removes everything,
+            // so a settled down fleet is `Down`, never left `Terminating`
+            FleetPhase::Down
         } else if r.agents.values().any(|a| a.phase == AgentPhase::Dead) {
             FleetPhase::Degraded
         } else if r.agents.values().any(|a| a.phase == AgentPhase::Starting) {

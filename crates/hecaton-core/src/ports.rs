@@ -83,7 +83,8 @@ impl fmt::Debug for HookTarget {
 }
 
 /// What `down` leaves behind (spec D6).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Keep {
     pub repos: bool,
     pub sessions: bool,

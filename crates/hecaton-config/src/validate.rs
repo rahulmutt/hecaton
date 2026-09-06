@@ -16,6 +16,10 @@ pub const RESERVED_ENV_PREFIXES: &[&str] = &[
     "MISE_",
     "HECATON_",
     "PATH",
+    // claude refuses a temp dir it cannot reach; hecaton points both at the
+    // agent's own `home/tmp`.
+    "TMPDIR",
+    "CLAUDE_CODE_TMPDIR",
 ];
 
 /// Rejects mise's fuzzy forms: keywords, `prefix:`/`ref:`/`path:`/`sub-`
@@ -232,6 +236,8 @@ mod tests {
             "MISE_DATA_DIR",
             "HECATON_FLEET",
             "PATH",
+            "TMPDIR",
+            "CLAUDE_CODE_TMPDIR",
         ] {
             let s = AgentSettings {
                 env: BTreeMap::from([(key.to_string(), "x".to_string())]),

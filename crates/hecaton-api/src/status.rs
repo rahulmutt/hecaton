@@ -37,6 +37,7 @@ pub enum FleetPhase {
     Ready,
     Degraded,
     Terminating,
+    Down,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +107,16 @@ impl FleetStatus {
     }
 }
 
+/// One row of `GET /v1/fleets`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetSummary {
+    pub name: String,
+    pub phase: FleetPhase,
+    pub generation: u64,
+    pub observed_generation: u64,
+    pub agents: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +162,23 @@ mod tests {
         .unwrap();
         assert_eq!(s.agents["f/c/a"].applied_hash, None);
         let back: FleetStatus = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn down_is_a_phase_and_summaries_round_trip() {
+        assert_eq!(
+            serde_json::to_value(FleetPhase::Down).unwrap(),
+            json!("down")
+        );
+        let s = FleetSummary {
+            name: "payments".into(),
+            phase: FleetPhase::Ready,
+            generation: 3,
+            observed_generation: 3,
+            agents: 2,
+        };
+        let back: FleetSummary = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);
     }
 }

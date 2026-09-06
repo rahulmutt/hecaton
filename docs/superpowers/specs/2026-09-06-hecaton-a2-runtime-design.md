@@ -319,7 +319,7 @@ $XDG_STATE_HOME/hecaton/fleets/<fleet>/
   "filesystem": { "read":  ["/usr", "/lib", "/lib64", "/bin", "/etc", "<shared mise>"],
                   "allow": ["<home>", "<workspace>", "<repo>/.git"] },
   "workdir": { "access": "none" },
-  "network": { "connect_port": [<daemon_port>] },
+  "network": { "open_port": [<daemon_port>] },   // was connect_port; see the Phase 3 spec §8.1 (Landlock allowlist)
   "environment": { "deny_vars": ["*"],
                    "set_vars": { "HOME": "<home>", "XDG_CONFIG_HOME": …, "XDG_DATA_HOME": …,
                                  "XDG_STATE_HOME": …, "XDG_CACHE_HOME": …, "CLAUDE_CONFIG_DIR": …,
@@ -392,7 +392,7 @@ and its fallback.
 | `CLAUDE_CONFIG_DIR` and `GH_CONFIG_DIR` relocate all state (nothing lands in nono's `$HOME`) | add explicit grants / `set_vars` for what escapes. Verdict (Task 18): partial — hecaton's own files land under `home/` (settings.json, .credentials.json, hosts.yml verified by home.rs tests and generated_golden); nono's `$HOME` (`agents/<a>/nono`, per `sandbox_it::generated_profile_validates_and_enforces_isolation`) held only nono's own bookkeeping — `.config/nono/{profiles,profile-drafts}` and `.local/state/nono/{sessions,audit}` — no Claude or gh state, since that test never runs `claude`/`gh` inside the sandbox; relocation under a live `claude` run is verified in Phase 3's e2e. |
 | `mise exec` under `MISE_GLOBAL_CONFIG_FILE` + read-only `MISE_DATA_DIR` resolves without writing there | pin with `MISE_CONFIG_FILE`; grant the specific subdirs mise insists on. Verdict (Task 11): holds — `toolchain_it::installs_nothing_when_seeded_and_exec_resolves_read_only` seeds `MISE_DATA_DIR` with the host's `gh@2.100.0` install, chmods the whole data dir `a-w`, then runs `mise exec -- gh --version` with `MISE_GLOBAL_CONFIG_FILE`/`MISE_DATA_DIR`/`MISE_CONFIG_DIR`/`MISE_STATE_DIR`/`MISE_CACHE_DIR` all pointed outside it; it resolves and prints the pinned version with no write attempted against the read-only tree. |
 | `gh auth git-credential` works from a `hosts.yml` holding only `oauth_token` and `git_protocol: https` | resolve `user:` with `gh api user` during `ensure_crew`, or require it in the credential bundle. Verdict (Task 14): holds — `oauth_token` + `git_protocol` suffice: with only those two keys in `hosts.yml`, `GH_CONFIG_DIR=… gh auth git-credential get` (given `protocol=https`/`host=github.com` on stdin) printed `username=…` and `password=…`. |
-| the `.claude.json` seed keys that suppress first-run prompts | discover by diffing a fresh Claude run; keep the seed in one constant. Verdict (Task 18): seed is the single constant in `crates/hecaton-runtime/src/home.rs` (`hasCompletedOnboarding: true`, overlaid by `claude_account`); unverified against a fresh Claude run until Phase 3's e2e, and written to both `home/.claude.json` and `home/.claude/.claude.json` because Claude Code reads `$CLAUDE_CONFIG_DIR/.claude.json` when the variable is set; Phase 3's e2e removes the unused copy. |
+| the `.claude.json` seed keys that suppress first-run prompts | discover by diffing a fresh Claude run; keep the seed in one constant. Verdict (Task 18): seed is the single constant in `crates/hecaton-runtime/src/home.rs` (`hasCompletedOnboarding: true`, overlaid by `claude_account`); unverified against a fresh Claude run until Phase 3's e2e, and written to both `home/.claude.json` and `home/.claude/.claude.json` because Claude Code reads `$CLAUDE_CONFIG_DIR/.claude.json` when the variable is set; Phase 3's e2e removes the unused copy. Phase 3 verdict (by hand, claude 2.1.263): only `$CLAUDE_CONFIG_DIR/.claude.json` is read, the `$HOME` copy is gone, and the seed also pre-accepts the trust dialog for the workspace and the crew `repo/` (Phase 3 spec §8.1). |
 
 Already verified (2026-09-05, this machine, nono 0.75.0, tmux 3.7c):
 `environment.deny_vars/set_vars` relocate `HOME` and pass `PATH`; Landlock
@@ -484,7 +484,9 @@ for §4 environment, §6 worktree and pipeline changes, and §3 ports.
 
 - In-sandbox `git push` needs a credential helper: `home/.gitconfig` with
   `[credential "https://github.com"] helper = !gh auth git-credential` (or
-  `gh auth setup-git` at materialize time). Phase 3.
+  `gh auth setup-git` at materialize time). Phase 3. — Resolved in Phase 3
+  (§6.3 of its spec): `home/.gitconfig` carries the gh credential helper for
+  crews that may push.
 
 ## 10. Done when
 

@@ -16,6 +16,7 @@ hecaton-api = { workspace = true }
 hecaton-config = { workspace = true }
 hecaton-core = { workspace = true }
 hecaton-runtime = { workspace = true }
+hecaton-server = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
@@ -23,6 +24,12 @@ serde_norway = { workspace = true }
 tempfile = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+tokio = { workspace = true }
+ureq = { workspace = true }
+toml = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

@@ -5,9 +5,12 @@ use std::path::{Path, PathBuf};
 
 use hecaton_runtime::{StateLayout, ToolPaths};
 
-/// Tools from the test process's PATH (mise puts the pinned ones there).
+/// Tools from the test process's PATH (mise puts the pinned ones there); the
+/// relay binary slot is filled with this test executable — it only has to
+/// exist for the profile to validate.
 pub fn tools() -> Option<ToolPaths> {
-    ToolPaths::discover_in(&std::env::var_os("PATH").unwrap_or_default()).ok()
+    let exe = std::env::current_exe().ok()?;
+    ToolPaths::discover_in(&std::env::var_os("PATH").unwrap_or_default(), &exe).ok()
 }
 
 /// Returns `true` if the test may run. Otherwise prints a skip reason, or

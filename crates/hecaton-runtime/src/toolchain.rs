@@ -284,6 +284,7 @@ mod tests {
             mise: "/m".into(),
             nono: "/n".into(),
             tmux: "/t".into(),
+            hecaton: "/x".into(),
         };
         let tc = Toolchain {
             tools: &tools,

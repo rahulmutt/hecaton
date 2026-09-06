@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# The by-hand check for Phase 3 spec §8.1: a real `claude` under a real
+# daemon, on a scratch state root. Prints a report to paste back.
+#
+# What it settles (spec §8.1 rows): SessionStart command hook with the profile
+# environment (relay → Ready), HTTP hooks to loopback http:// with the literal
+# header (event counts after one prompt), which `.claude.json` copy Claude
+# read, whether onboarding appeared, and HOME relocation (nono's own $HOME).
+#
+# Your real $HOME stays: the client needs ~/.claude for credentials and the
+# host settings layer. Only the three XDG roots move to target/tmp/verify-claude,
+# so your real hecaton state is untouched. Nothing secret is printed: no
+# settings.json, no hosts.yml, no token, no hook secret.
+#
+# HECATON_VERIFY_FAKE=1 swaps in `hecaton dev fake-claude`, an empty tool table
+# and no host defaults — the maintainers' self-test of this script.
+set -uo pipefail
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="$REPO/target/tmp/verify-claude"
+FLEET=verify
+CREW=c
+AGENT=a
+SOCKET="hecaton-verify-$$"
+UP_TIMEOUT="${HECATON_VERIFY_TIMEOUT:-10m}"
+FAKE="${HECATON_VERIFY_FAKE:-0}"
+
+export XDG_CONFIG_HOME="$ROOT/xdg/config"
+export XDG_STATE_HOME="$ROOT/xdg/state"
+export XDG_DATA_HOME="$ROOT/xdg/data"
+unset HECATON_API_URL
+STATE="$XDG_STATE_HOME/hecaton"
+SERVER="$STATE/server"
+AGENT_DIR="$STATE/fleets/$FLEET/crews/$CREW/agents/$AGENT"
+
+say() { printf '%s\n' "$*"; }
+hr() { say "----- $* -----"; }
+tail_file() { # tail_file <label> <path> [lines]
+  if [ -f "$2" ]; then hr "$1 (last ${3:-20} lines of $2)"; tail -n "${3:-20}" "$2"; else hr "$1: $2 absent"; fi
+}
+stat_mtime() { stat -c '%y %n' "$1" 2>/dev/null || say "absent: $1"; }
+git_q() { git -C "$1" "${@:2}" >/dev/null 2>&1; }
+
+cleanup() {
+  hr "teardown"
+  if [ -f "$SERVER/hecaton.pid" ]; then
+    "$HECATON" down "$FLEET" --keep --timeout 2m >/dev/null 2>&1 || say "down --keep failed or fleet absent (fine)"
+    pid="$(cat "$SERVER/hecaton.pid" 2>/dev/null || true)"
+    if [ -n "$pid" ]; then
+      kill -TERM "$pid" 2>/dev/null || true
+      for _ in $(seq 1 50); do [ -f "$SERVER/hecaton.pid" ] || break; sleep 0.1; done
+      [ -f "$SERVER/hecaton.pid" ] && kill -KILL "$pid" 2>/dev/null || true
+    fi
+  fi
+  tmux -L "$SOCKET" kill-server >/dev/null 2>&1 || true
+  say "state kept for inspection under $STATE (delete target/tmp/verify-claude when done)"
+}
+trap cleanup EXIT
+
+hr "preflight"
+for t in git mise nono tmux; do command -v "$t" >/dev/null || { say "missing tool on PATH: $t (run: mise install)"; exit 2; }; done
+if [ "$FAKE" = 0 ]; then
+  [ -f "$HOME/.claude/.credentials.json" ] || say "WARNING: $HOME/.claude/.credentials.json not found; Claude will ask you to log in"
+fi
+say "host claude: $(command -v claude || echo 'not on host PATH (the agent installs its own pinned claude)')"
+say "nono: $(nono --version 2>/dev/null | head -1)   tmux: $(tmux -V)   mise: $(mise --version 2>/dev/null | head -1)"
+
+hr "build"
+(cd "$REPO" && cargo build -q -p hecaton) || { say "cargo build failed"; exit 2; }
+HECATON="$REPO/target/debug/hecaton"
+
+hr "scratch root"
+# A previous run (interrupted, or still parked at the prompt) leaves its
+# daemon and tmux session behind; stop them before the root is wiped, or
+# they outlive their endpoint file and squat the agent's windows.
+if [ -f "$SERVER/hecaton.pid" ]; then
+  old="$(cat "$SERVER/hecaton.pid" 2>/dev/null || true)"
+  say "stopping the previous run's daemon (pid ${old:-?})"
+  "$HECATON" down "$FLEET" --keep --timeout 1m >/dev/null 2>&1 || true
+  [ -n "$old" ] && kill -TERM "$old" 2>/dev/null || true
+  for _ in $(seq 1 50); do [ -f "$SERVER/hecaton.pid" ] || break; sleep 0.1; done
+  [ -n "$old" ] && [ -f "$SERVER/hecaton.pid" ] && kill -KILL "$old" 2>/dev/null || true
+fi
+for sock in /tmp/tmux-"$(id -u)"/hecaton-verify-*; do
+  [ -S "$sock" ] && tmux -S "$sock" kill-server >/dev/null 2>&1 || true
+done
+rm -rf "$ROOT"
+mkdir -p "$ROOT/xdg/config/hecaton" "$XDG_STATE_HOME" "$XDG_DATA_HOME"
+if [ "$FAKE" = 1 ]; then
+  printf '[tools]\n' > "$ROOT/xdg/config/hecaton/mise.toml"   # nothing to download in the self-test
+fi
+WORK="$ROOT/work"; BARE="$ROOT/repo.git"
+mkdir -p "$WORK"
+git_q "$WORK" init -q -b main
+printf 'hello from hecaton verify\n' > "$WORK/README"
+git_q "$WORK" add README
+git -C "$WORK" -c user.name=verify -c user.email=verify@hecaton.invalid commit -q -m init >/dev/null 2>&1
+git clone -q --bare "$WORK" "$BARE"
+if [ "$FAKE" = 1 ]; then
+  CLAUDE_BLOCK="    binary: \"$HECATON\"
+    args: [dev, fake-claude, \"--verbose\"]
+    settings: {}"
+  HOST_FLAG=--no-host-defaults
+else
+  CLAUDE_BLOCK="    settings: {}"
+  HOST_FLAG=
+fi
+cat > "$ROOT/fleet.yaml" <<EOF
+apiVersion: hecaton/v1
+kind: Fleet
+name: $FLEET
+defaults:
+  claude:
+$CLAUDE_BLOCK
+  tools: {}
+crews:
+  $CREW:
+    repo: "file://$BARE"
+    ref: main
+    git: { push: false, auth: none }
+    agents:
+      $AGENT: {}
+EOF
+say "fleet file: $ROOT/fleet.yaml (repo: file://$BARE)"
+
+hr "serve -d"
+"$HECATON" serve -d --bind 127.0.0.1:0 --tmux-socket "$SOCKET" || { say "serve -d failed"; tail_file server.log "$SERVER/server.log" 40; exit 1; }
+URL="$(cat "$SERVER/endpoint")"
+say "endpoint: $URL"
+
+hr "up (timeout $UP_TIMEOUT; the first run installs the agent's pinned claude)"
+# shellcheck disable=SC2086
+if "$HECATON" up "$ROOT/fleet.yaml" $HOST_FLAG --timeout "$UP_TIMEOUT"; then
+  UP=ok
+else
+  UP=failed
+fi
+
+metrics() { curl -sf "$URL/metrics" 2>/dev/null | grep '^hecaton_hook_events_total' || say "(no hook events counted yet)"; }
+
+say
+say "=============================== REPORT (paste everything from here) ==============================="
+say "date: $(date -u +%FT%TZ)   branch: $(git -C "$REPO" rev-parse --short HEAD)   fake: $FAKE   up: $UP"
+hr "A. SessionStart command hook with the profile environment (relay → Ready)"
+"$HECATON" status "$FLEET" || true
+metrics
+if [ "$UP" = failed ]; then
+  tail_file "agent tmux.log" "$AGENT_DIR/logs/tmux.log" 40
+  tail_file "agent nono.log" "$AGENT_DIR/logs/nono.log" 20
+  tail_file "server.log" "$SERVER/server.log" 30
+  say "=============================== END REPORT ==============================="
+  exit 1
+fi
+
+if [ "$FAKE" = 1 ]; then
+  ONBOARD="n (fake)"
+  sleep 2
+else
+  say
+  say ">>> Now attach in another terminal:"
+  say ">>>     tmux -L $SOCKET attach -t $FLEET/$CREW"
+  say ">>> Wait for Claude's prompt, type one message (e.g. \"say hi\"), wait for the reply,"
+  say ">>> detach with Ctrl-b then d, and come back here."
+  ONBOARD=""
+  while [ -z "$ONBOARD" ]; do
+    printf '>>> Did Claude show a login, onboarding or trust prompt before its normal prompt? [y/n] '
+    read -r ONBOARD < /dev/tty
+    case "$ONBOARD" in y|Y|n|N) ;; *) ONBOARD="" ;; esac
+  done
+  sleep 2
+fi
+
+hr "B. HTTP hooks to loopback http:// with the literal header (counts after one prompt)"
+metrics
+hr "C. which .claude.json copy Claude read (newest mtime wins); onboarding seen: $ONBOARD"
+stat_mtime "$AGENT_DIR/home/.claude.json"
+stat_mtime "$AGENT_DIR/home/.claude/.claude.json"
+say "home/.claude contents:"; ls -la "$AGENT_DIR/home/.claude" 2>/dev/null | sed 's/^/  /'
+say "home/.claude/projects:"; find "$AGENT_DIR/home/.claude/projects" -maxdepth 2 2>/dev/null | sed 's/^/  /'
+hr "D. HOME relocation: nono's own \$HOME (should hold only nono's state, nothing of Claude's)"
+find "$AGENT_DIR/nono" -maxdepth 3 2>/dev/null | sed 's/^/  /'
+say "top-level agent dir:"; ls -la "$AGENT_DIR" 2>/dev/null | sed 's/^/  /'
+hr "E. status and logs"
+"$HECATON" status "$FLEET" || true
+tail_file "agent nono.log" "$AGENT_DIR/logs/nono.log" 10
+tail_file "server.log" "$SERVER/server.log" 15
+say "=============================== END REPORT ==============================="
+exit 0

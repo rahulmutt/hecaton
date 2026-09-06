@@ -54,8 +54,15 @@ impl StateLayout {
     pub fn system_mise_toml(&self) -> PathBuf {
         self.config_root.join("mise.toml")
     }
+    /// `server/`: token, vault key, endpoint, pid, log (Phase 3 spec §3.3, §5).
+    pub fn server_dir(&self) -> PathBuf {
+        self.state_root.join("server")
+    }
+    pub fn fleets_dir(&self) -> PathBuf {
+        self.state_root.join("fleets")
+    }
     pub fn fleet_dir(&self, f: &FleetName) -> PathBuf {
-        self.state_root.join("fleets").join(f.as_str())
+        self.fleets_dir().join(f.as_str())
     }
     pub fn fleet_gh_dir(&self, f: &FleetName) -> PathBuf {
         self.fleet_dir(f).join("gh")
@@ -87,8 +94,22 @@ impl StateLayout {
 }
 
 impl AgentPaths {
+    /// Written after `mise install` and `nono profile validate` succeed for
+    /// the current `mise.toml` + `nono-profile.json`; removed when either
+    /// rendered file changes (Phase 3 spec §6.2).
+    pub fn installed_marker(&self) -> PathBuf {
+        self.root.join(".installed")
+    }
+
     pub fn claude_dir(&self) -> PathBuf {
         self.home.join(".claude")
+    }
+    /// The agent's temp dir, 0700 inside `home/`. The sandbox grants nothing
+    /// under `/tmp`, and claude refuses to start when its temp dir
+    /// (`/tmp/claude-<uid>` by default) is unreachable, so `TMPDIR` and
+    /// `CLAUDE_CODE_TMPDIR` point here.
+    pub fn tmp_dir(&self) -> PathBuf {
+        self.home.join("tmp")
     }
     pub fn claude_projects(&self) -> PathBuf {
         self.claude_dir().join("projects")
@@ -151,6 +172,7 @@ mod tests {
         let base = "/h/.local/state/hecaton/fleets/payments/crews/backend/agents/alice";
         assert_eq!(a.root, PathBuf::from(base));
         assert_eq!(a.home, PathBuf::from(format!("{base}/home")));
+        assert_eq!(a.tmp_dir(), PathBuf::from(format!("{base}/home/tmp")));
         assert_eq!(a.nono_home, PathBuf::from(format!("{base}/nono")));
         assert_eq!(
             a.profile,
@@ -175,6 +197,14 @@ mod tests {
         assert_eq!(
             l.mise_data_dir(),
             PathBuf::from("/h/.local/share/hecaton/mise")
+        );
+        assert_eq!(
+            l.server_dir(),
+            PathBuf::from("/h/.local/state/hecaton/server")
+        );
+        assert_eq!(
+            l.fleets_dir(),
+            PathBuf::from("/h/.local/state/hecaton/fleets")
         );
     }
 }

@@ -406,3 +406,11 @@ Facts assumed here that Spec A must confirm early, with the fallback if they fai
 corrections Phase 2 made to §3 (ports), §4 (agent environment via the nono
 profile; nono's own `$HOME`), and §6 (worktree branch reuse, pipeline split
 into `Materializer`). Where they differ, the Phase 2 spec wins.
+
+## Addendum 2026-09-06 (Phase 3)
+`docs/superpowers/specs/2026-09-06-hecaton-a3-control-plane-design.md` §10 lists
+the corrections Phase 3 made: D4 (TLS deferred), D5 (`SessionStart` via
+`hecaton hook-relay`), §3 (`FleetStore` without `get`; `EventHandler` in
+`core`), §7 (`FleetPhase::Down`, re-`up` in place, `status`/`list`), §8
+(`Outcome` without actions until Spec B), §10 (e2e in the PR tier). Where they
+differ, the Phase 3 spec wins. Spec A is complete.

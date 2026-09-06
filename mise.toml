@@ -54,3 +54,24 @@ run = "cargo mutants -p hecaton-core --in-place"
 description = "Integration tests against real git/mise/nono/tmux, failing (not skipping) when a tool is missing"
 env = { HECATON_REQUIRE_TOOLS = "1" }
 run = "cargo nextest run -p hecaton-runtime"
+
+[tasks.e2e]
+description = "End-to-end journey against a real daemon, git, mise, nono and tmux (fails, not skips, without tools)"
+env = { HECATON_REQUIRE_TOOLS = "1" }
+run = "cargo nextest run -p hecaton --test e2e"
+
+[tasks.serve]
+# HOME alone is not enough: StateLayout prefers XDG_STATE_HOME/XDG_DATA_HOME/
+# XDG_CONFIG_HOME whenever they are set, so on a machine that exports them the
+# dev daemon would write its endpoint, pid, token and vault key into the user's
+# live hecaton state root and collide with a real daemon. Override all four.
+description = "Run a daemon in the foreground under target/tmp/serve (HOME and every XDG root overridden, so it never touches the user's hecaton state)"
+env = { HOME = "{{config_root}}/target/tmp/serve/home", XDG_CONFIG_HOME = "{{config_root}}/target/tmp/serve/home/.config", XDG_STATE_HOME = "{{config_root}}/target/tmp/serve/home/.local/state", XDG_DATA_HOME = "{{config_root}}/target/tmp/serve/home/.local/share" }
+run = [
+  "mkdir -p target/tmp/serve/home",
+  "cargo run -q -p hecaton -- serve --tmux-socket hecaton-dev",
+]
+
+[tasks.verify-claude]
+description = "By-hand spec §8.1 check: a real claude under a scratch daemon (XDG roots under target/tmp/verify-claude, your HOME kept for credentials); pauses for you to attach and type one prompt, then prints a report to paste back"
+run = "scripts/verify-claude.sh"

@@ -44,7 +44,7 @@ pub struct FleetSecrets {
 pub trait FleetStore: Send + Sync {
     fn load_all(&self) -> Result<Vec<(FleetRecord, FleetSecrets)>, StoreError>;
     fn put(&self, record: &FleetRecord, secrets: &FleetSecrets) -> Result<(), StoreError>; // atomic
-    fn delete(&self, name: &FleetName) -> Result<(), StoreError>;                        // record + secrets only
+    fn purge(&self, name: &FleetName) -> Result<(), StoreError>;                         // record + secrets only
 }
 
 pub trait EventHandler: Send + Sync { fn handle(&self, event: &HookEvent) -> Outcome; }
@@ -55,7 +55,8 @@ pub struct PassThrough;                                    // returns `{}`
 - `FleetPhase` gains `Down`. `finish_pass(status, terminating: true, all_ok: true)`
   sets `Down`; `plan` for a `Down` fleet with nothing observed is `[]`.
 - The architecture spec's `FleetStore::get` is dropped: the in-memory registry
-  is authoritative while the daemon runs.
+  is authoritative while the daemon runs. `delete` from the brainstorm draft
+  was dropped: nothing calls it; a downed fleet keeps its record until purged.
 - `HookEvent` lives in `hecaton-api`, payload kept raw:
   `{ agent: String, name: String, session_id: Option<String>, received_at: Timestamp, payload: Value }`.
 - `hecaton-api::GitSettings` gains `identity: Option<GitIdentity { name, email }>`
@@ -114,9 +115,13 @@ and publishes a snapshot (`FleetRecord`) on its `watch` channel; `GET` handlers
 read the snapshot without touching the actor.
 
 When a pass ends with phase `Down` and `purge` is set, the actor calls
-`store.delete`, removes `fleets/<name>/` entirely, removes its handle from the
+`store.purge`, removes `fleets/<name>/` entirely, removes its handle from the
 registry and its agents from the secret index, and exits. Without `purge` it
 stays, idle apart from resync observes.
+
+A pass with a failed step retries at the resync cadence, not at
+`next_restart_at`. `Down` requires a clean terminating pass **and** an empty
+agent map; `Apply` and `Down` persist before replying.
 
 ### 3.3 Store and vault
 
@@ -129,7 +134,7 @@ stays, idle apart from resync observes.
   leaves a readable pair (a record whose secrets are one write ahead).
 - `server/vault.key` — 32 random bytes, 0600, created on first `serve`.
   `chacha20poly1305` + `rand`; `VaultError::Tampered` on any AEAD failure.
-- `delete` removes the two files only; directories under `crews/` are the
+- `purge` removes the two files only; directories under `crews/` are the
   materializer's (`RemoveCrew` with `keep`) and the purge path's.
 
 ### 3.4 API
@@ -145,9 +150,11 @@ Body limit 4 MiB on fleet routes.
 | `PUT /v1/fleets/{name}` | 404 if absent; 400 if `spec.name != name`; `Apply` |
 | `GET /v1/fleets/{name}` | the `FleetRecord` snapshot |
 | `GET /v1/fleets` | `[{ name, phase, generation, observed_generation, agents }]` |
-| `DELETE /v1/fleets/{name}?keep_repos&keep_sessions&purge` | 404 if absent; 400 for `purge` with any keep flag; `Down` |
+| `DELETE /v1/fleets/{name}?keep_repos=true&keep_sessions=true&purge=true` | 404 if absent; 400 for `purge` with any keep flag; `Down` |
 | `POST /v1/agents/{f}/{c}/{a}/events` | hook ingress (§3.5) |
 | `GET /metrics`, `GET /healthz` | unauthenticated |
+
+Flags travel as `key=true|false`; axum's `Query` rejects bare keys.
 
 Retry semantics as the architecture spec: a 409 after a lost `POST` response
 means the create applied; a replayed `PUT` bumps `generation` but restarts
@@ -164,6 +171,10 @@ agents; per-agent token bucket, 20 events/s, burst 50, 429 beyond; body limit
 `Event` to the fleet actor, calls `handler.handle(&event)` and writes
 `outcome.response` back, all bounded by a 2 s timeout. Payloads are logged at
 `debug` only.
+
+The secret is verified before the rate limiter. Every non-2xx response,
+including extractor rejections (413/415), is `{ "error": … }`; a malformed or
+unknown-field fleet body is 400.
 
 ### 3.6 Metrics
 
@@ -195,13 +206,25 @@ Runtime changes that support it:
   prefix already keeps user `env` out).
 - `HookTarget.url` is `http://127.0.0.1:<port>`; `dev materialize --hooks-url`
   defaults to `http://127.0.0.1:7643`.
+- `env.rs` sets `MISE_CEILING_PATHS` to the agent workspace so mise's config
+  walk stops there instead of applying the repository's own `mise.toml`
+  (§8.1); `sandbox.rs` grants a single-file `read` on the agent's own
+  rendered `mise.toml` (`MISE_GLOBAL_CONFIG_FILE`), without which `mise exec`
+  cannot read its own config inside the sandbox.
 
 ## 5. CLI
 
 Client commands resolve the endpoint from `--api-url`, then `HECATON_API_URL`,
 then `server/endpoint`; the token from `server/token`. An unreachable daemon
-fails with `daemon not running; run \`hecaton serve -d\``. Exit codes: 0 ok, 1
+fails with `daemon not running; run \`hecaton serve -d\``. A daemon that
+accepts the connection but does not answer in time fails with `daemon did not
+answer within Ns`, distinct from the not-running case. Exit codes: 0 ok, 1
 failure or timeout, 2 usage.
+
+`serve` gains the hidden `--tmux-socket` and `--detached-child` flags (used to
+give the integration tests a private tmux socket and to drive the `-d`
+re-exec); `up`/`update` client-validate with `Fleet::try_from` before any
+request.
 
 | Command | Behaviour |
 |---|---|
@@ -213,6 +236,12 @@ failure or timeout, 2 usage.
 | `list [--json]` | `GET /v1/fleets` as `name  phase  gen/observed  agents` |
 | `hook-relay` | §4; listed under an "internal" help heading |
 | `dev fake-claude` | hidden; §7 |
+
+**Implementation refinements** (Task 13): `list`'s table renders `GEN` and
+`OBSERVED` as two separate columns rather than a combined `gen/observed`
+column. `hook-relay` is a `#[command(hide = true)]` subcommand (so it never
+appears in `--help` at all) rather than a command listed under a visible
+"internal" heading.
 
 ## 6. Runtime carry-overs
 
@@ -273,14 +302,26 @@ hecaton --test e2e` with `HECATON_REQUIRE_TOOLS=1`).
 
 ### 8.1 Verify at implementation time
 
-| Assumption | Fallback |
-|---|---|
-| nono accepts a single file path (the hecaton binary) in `filesystem.read` | grant the binary's parent directory |
-| Claude runs `SessionStart` `command` hooks with the hook JSON on stdin and the profile environment (`HECATON_HOOK_SECRET` visible) | pass the secret as a 0600 file path in the command |
-| the real Claude fires HTTP hooks to a loopback `http://` URL with the literal `Authorization` header (checked once by hand with claude 2.1.263; the strings `allowedHttpHookUrls` and "HTTP hook not sent: … proxy, TLS trust or resolver settings differ" exist in the binary and their triggers are unknown) | move the remaining events to the relay |
-| a repository's own `mise.toml` is ignored as untrusted inside the sandbox (e2e repo carries one) | pin `MISE_TRUSTED_CONFIG_PATHS` / `MISE_CONFIG_FILE` |
-| which `.claude.json` copy Claude reads under `CLAUDE_CONFIG_DIR`, and whether the seed suppresses onboarding (by hand) | keep both copies; extend the seed |
-| `HOME` relocation under a live `claude`: nothing lands in nono's `$HOME` (by hand) | add grants |
+| Assumption | Fallback | Verdict |
+|---|---|---|
+| nono accepts a single file path (the hecaton binary) in `filesystem.read` | grant the binary's parent directory | **Holds.** Probed 2026-09-06 with nono 0.75.0: the profile's single-file `read` grant validates, is enforced, and the granted binary executes inside the sandbox. |
+| Claude runs `SessionStart` `command` hooks with the hook JSON on stdin and the profile environment (`HECATON_HOOK_SECRET` visible) | pass the secret as a 0600 file path in the command | **Holds.** `mise run verify-claude` 2026-09-06 with claude 2.1.263 inside the generated profile: the relay posted `SessionStart` (`hecaton_hook_events_total{event="SessionStart"} 1`) and `hecaton status` showed the agent `ready` with 0 restarts. The e2e proves the same path with `dev fake-claude`. |
+| the real Claude fires HTTP hooks to a loopback `http://` URL with the literal `Authorization` header (checked once by hand with claude 2.1.263; the strings `allowedHttpHookUrls` and "HTTP hook not sent: … proxy, TLS trust or resolver settings differ" exist in the binary and their triggers are unknown) | move the remaining events to the relay | **Holds.** Observed 2026-09-06 during `mise run verify-claude` (claude 2.1.263 inside the generated nono profile): claude's debug log shows `Hooks: HTTP hook POST to http://127.0.0.1:<port>/v1/agents/verify/c/a/events` followed by `HTTP hook response status 200` — a 200 means the daemon matched the literal bearer secret from `settings.json`. |
+| the real Claude starts inside the generated profile at all | — | **FAILED, then fixed.** claude 2.1.263 refused to start: "Temp directory /tmp/claude-1000 is not readable … Set CLAUDE_CODE_TMPDIR" — the profile grants nothing under `/tmp`. Fix: `home/tmp` (0700) with `TMPDIR` and `CLAUDE_CODE_TMPDIR` in `set_vars`; both names reserved from user `env`. The e2e never saw it because `dev fake-claude` needs no temp dir. |
+| the real Claude can reach the Anthropic API from inside the profile | — | **FAILED, then fixed.** With the Phase 2 base `network.connect_port: [<daemon_port>]`, Landlock treats the list as an outbound allowlist: `curl https://api.anthropic.com` got "Could not resolve host" and claude's log showed `getaddrinfo ETIMEOUT`. Probed 2026-09-06 with nono 0.75.0: without `connect_port` egress is allowed and the daemon stays reachable; `open_port: [<daemon_port>]` behaves the same and additionally survives a user `block: true`. Fix: the base profile uses `open_port`, matching the architecture spec's "loopback to the daemon always allowed; other network unrestricted by default". |
+| a repository's own `mise.toml` is ignored as untrusted inside the sandbox (e2e repo carries one) | pin `MISE_TRUSTED_CONFIG_PATHS` / `MISE_CONFIG_FILE` | **FAILS.** mise 2026.9.1 honours `[tools]` from an untrusted config — observed trying to install `node@0.0.1` from the e2e repo's `mise.toml`. Applied fallback (differs from the one above): the nono profile now sets `MISE_CEILING_PATHS` to the agent workspace and grants read on the agent's own rendered `mise.toml` (`crates/hecaton-runtime/src/env.rs`, `sandbox.rs`, commit `3059886`). Consequence: agents see no project-level mise config at all; hecaton's `tools:` table is the only toolchain source inside the sandbox. |
+| which `.claude.json` copy Claude reads under `CLAUDE_CONFIG_DIR`, and whether the seed suppresses onboarding (by hand) | keep both copies; extend the seed | **Settled, seed extended.** Same run: only `$CLAUDE_CONFIG_DIR/.claude.json` (`home/.claude/.claude.json`) was rewritten by Claude; `home/.claude.json` kept its materialization mtime, so the Phase 2 double write is gone. No login or onboarding prompt appeared (`hasCompletedOnboarding` works), but the per-folder **trust dialog** did, and `up` cannot reach `ready` until someone accepts it. Claude recorded the acceptance under `projects.<crew repo dir>.hasTrustDialogAccepted` — keyed on the worktree's common git dir, not the workspace it asked about. The seed now pre-accepts both the workspace and the crew `repo/` (`render_claude_json`, `crates/hecaton-runtime/src/home.rs`); confirmed on a second run: a fresh `up` reached `ready` unattended in ~5 s and Claude opened on its prompt with no dialog. |
+| `HOME` relocation under a live `claude`: nothing lands in nono's `$HOME` (by hand) | add grants | **Holds.** Same run: after a full session `agents/a/nono` held only `.config/nono/{profiles,profile-drafts}` and `.local/state/nono`; every Claude file (`.claude.json`, sessions, projects, history, plugins) landed under `home/.claude`. |
+
+**The hand-run.** The remaining "not yet verified" rows need one real
+`claude` session: `mise run verify-claude` (`scripts/verify-claude.sh`) stands
+up a scratch daemon with the real `claude` and the host credentials, pauses
+for the operator to attach (`tmux -L hecaton-verify-<pid> attach -t verify/c`)
+and type one prompt, then prints a report with `hecaton status` (relay →
+`Ready`), the `/metrics` hook counts (HTTP hooks), both `.claude.json`
+mtimes, and a listing of nono's own `$HOME` (relocation). Write each result
+into the table above. If the HTTP-hook row ever fails, open a follow-up item
+"move remaining events to the relay" rather than changing code in this task.
 
 ## 9. Errors, security, docs
 

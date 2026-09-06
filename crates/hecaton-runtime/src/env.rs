@@ -12,6 +12,7 @@ pub fn agent_env(
     paths: &AgentPaths,
     layout: &StateLayout,
     api_url: &str,
+    hook_secret: &str,
     user_env: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
     let s = |p: &std::path::Path| p.display().to_string();
@@ -21,9 +22,31 @@ pub fn agent_env(
         ("XDG_DATA_HOME".to_string(), s(&paths.xdg_data())),
         ("XDG_STATE_HOME".to_string(), s(&paths.xdg_state())),
         ("XDG_CACHE_HOME".to_string(), s(&paths.xdg_cache())),
+        // No path under `/tmp` is granted, and claude 2.1.263 refuses to
+        // start when `/tmp/claude-<uid>` is unreachable ("Temp directory …
+        // is not readable … Set CLAUDE_CODE_TMPDIR"). Both names point at
+        // the 0700 `home/tmp` so every tool in the sandbox shares it.
+        ("TMPDIR".to_string(), s(&paths.tmp_dir())),
+        ("CLAUDE_CODE_TMPDIR".to_string(), s(&paths.tmp_dir())),
         ("CLAUDE_CONFIG_DIR".to_string(), s(&paths.claude_dir())),
         ("GH_CONFIG_DIR".to_string(), s(&paths.gh_dir())),
         ("MISE_GLOBAL_CONFIG_FILE".to_string(), s(&paths.mise_toml)),
+        // The in-sandbox counterpart of the `cwd=/` the daemon's `mise
+        // install` uses: mise otherwise walks up from the workspace and
+        // applies every `mise.toml` it finds. The repository's own file is
+        // applied even though `mise trust` never covered it (mise 2026.9.1
+        // honours `[tools]` from an untrusted config), which pulls in tools
+        // the daemon never installed and the sandbox cannot download; an
+        // ancestor file that the profile does not grant is worse still —
+        // mise exits on the read error. A ceiling at the workspace stops the
+        // walk before either, leaving only the generated global file. This
+        // ceiling only stops the upward walk: a `mise.toml` in a
+        // subdirectory of the workspace is still discovered if the agent
+        // `cd`s there, same as it would be for any other mise invocation —
+        // and the sandbox has no network for installs either way, so a
+        // subdirectory config naming an uninstalled tool fails the same way
+        // the repository's own file would.
+        ("MISE_CEILING_PATHS".to_string(), s(&paths.workspace)),
         ("MISE_DATA_DIR".to_string(), s(&layout.mise_data_dir())),
         ("MISE_CONFIG_DIR".to_string(), s(&paths.mise_config_dir())),
         ("MISE_STATE_DIR".to_string(), s(&paths.mise_state_dir())),
@@ -33,6 +56,9 @@ pub fn agent_env(
         ("HECATON_AGENT".to_string(), id.agent.to_string()),
         ("HECATON_AGENT_ID".to_string(), id.to_string()),
         ("HECATON_API_URL".to_string(), api_url.to_string()),
+        // What `hecaton hook-relay` presents; the reserved `HECATON_` prefix
+        // keeps user `env` away from it.
+        ("HECATON_HOOK_SECRET".to_string(), hook_secret.to_string()),
     ]);
     // Reserved keys were rejected at config validation; `entry().or_insert`
     // keeps the isolation rows authoritative even so.
@@ -56,7 +82,14 @@ mod tests {
             ("RUST_LOG".to_string(), "info".to_string()),
             ("HOME".to_string(), "/evil".to_string()),
         ]);
-        let env = agent_env(&id, &paths, &layout, "https://127.0.0.1:7643", &user);
+        let env = agent_env(
+            &id,
+            &paths,
+            &layout,
+            "http://127.0.0.1:7643",
+            "hook-s3",
+            &user,
+        );
         assert_eq!(
             env["HOME"],
             "/h/.local/state/hecaton/fleets/payments/crews/backend/agents/alice/home"
@@ -64,7 +97,20 @@ mod tests {
         assert_eq!(env["RUST_LOG"], "info");
         assert_eq!(env["HECATON_AGENT_ID"], "payments/backend/alice");
         assert_eq!(env["MISE_DATA_DIR"], "/h/.local/share/hecaton/mise");
+        assert_eq!(env["HECATON_HOOK_SECRET"], "hook-s3");
+        assert_eq!(
+            env["MISE_CEILING_PATHS"],
+            "/h/.local/state/hecaton/fleets/payments/crews/backend/agents/alice/workspace"
+        );
         assert!(!env.contains_key("PATH"), "PATH is nono's");
-        assert_eq!(env.len(), 18);
+        assert_eq!(
+            env["TMPDIR"],
+            "/h/.local/state/hecaton/fleets/payments/crews/backend/agents/alice/home/tmp"
+        );
+        assert_eq!(
+            env["CLAUDE_CODE_TMPDIR"], env["TMPDIR"],
+            "claude checks its own variable before TMPDIR"
+        );
+        assert_eq!(env.len(), 22);
     }
 }

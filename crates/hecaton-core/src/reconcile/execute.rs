@@ -304,7 +304,7 @@ mod tests {
     }
 
     #[test]
-    fn down_stops_and_removes_then_terminating() {
+    fn down_stops_and_removes_then_down() {
         let h = Harness::new();
         let f = fleet(&["a"]);
         let mut st = FleetStatus::default();
@@ -326,7 +326,7 @@ mod tests {
             ]
         );
         assert!(st.agents.is_empty());
-        assert_eq!(st.phase, FleetPhase::Terminating);
+        assert_eq!(st.phase, FleetPhase::Down);
         assert!(
             h.m.calls()
                 .contains(&"remove_crew f/c repos=true sessions=true".to_string())

@@ -18,6 +18,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Run the daemon (foreground, or detached with -d).
+    Serve(ServeArgs),
     /// Inspect fleet configuration without talking to the daemon.
     Config {
         #[command(subcommand)]
@@ -29,6 +31,96 @@ pub enum Command {
         #[command(subcommand)]
         command: DevCommand,
     },
+    /// Create a fleet from a YAML file and wait until it is ready.
+    Up(ApplyArgs),
+    /// Replace a running fleet's spec; only agents whose settings changed restart.
+    Update(ApplyArgs),
+    /// Stop a fleet; keep repos and/or sessions, or purge everything.
+    Down(DownArgs),
+    /// Show one fleet.
+    Status(StatusArgs),
+    /// List fleets.
+    List(ListArgs),
+
+    // -- internal --
+    /// Reads the SessionStart hook JSON on stdin, posts it to the daemon,
+    /// prints the reply; on any failure prints `{}` and exits 0.
+    #[command(hide = true)]
+    HookRelay,
+}
+
+#[derive(Debug, Args)]
+pub struct ApplyArgs {
+    /// Path to the fleet YAML file.
+    pub file: PathBuf,
+    /// Fleet name; overrides `name` in the file.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Do not layer the host's ~/.claude/settings.json or send host credentials.
+    #[arg(long)]
+    pub no_host_defaults: bool,
+    /// How long to wait for Ready (e.g. 90s, 5m, 1h).
+    #[arg(long, default_value = "5m")]
+    pub timeout: String,
+    /// Return right after the request instead of waiting for Ready.
+    #[arg(long)]
+    pub no_wait: bool,
+    /// Daemon URL (default: $HECATON_API_URL, then the running daemon's endpoint file).
+    #[arg(long)]
+    pub api_url: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct DownArgs {
+    pub fleet: String,
+    #[arg(long)]
+    pub keep_repos: bool,
+    #[arg(long)]
+    pub keep_sessions: bool,
+    /// Both --keep-repos and --keep-sessions.
+    #[arg(long)]
+    pub keep: bool,
+    /// Also delete the fleet record and everything under its directory.
+    #[arg(long)]
+    pub purge: bool,
+    #[arg(long, default_value = "5m")]
+    pub timeout: String,
+    #[arg(long)]
+    pub api_url: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct StatusArgs {
+    pub fleet: String,
+    /// Print the raw record as JSON.
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub api_url: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ListArgs {
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub api_url: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ServeArgs {
+    /// Address to bind (default: config.toml `[server] bind`, else 127.0.0.1:7643).
+    #[arg(long)]
+    pub bind: Option<String>,
+    /// Re-exec detached; log to server/server.log; print the endpoint.
+    #[arg(short = 'd', long)]
+    pub detach: bool,
+    /// tmux server socket name (tests use a private one).
+    #[arg(long, hide = true, default_value = "hecaton")]
+    pub tmux_socket: String,
+    /// Set by `-d` on the child it spawns.
+    #[arg(long, hide = true)]
+    pub detached_child: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -57,6 +149,16 @@ pub enum DevCommand {
     /// Render one agent's generated files (settings.json, mise.toml,
     /// nono-profile.json, launch.sh) without launching anything.
     Materialize(MaterializeArgs),
+    /// Stand-in for `claude` in the e2e: runs the SessionStart command hooks
+    /// and one Notification HTTP hook from settings.json, then sleeps.
+    FakeClaude(FakeClaudeArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct FakeClaudeArgs {
+    /// Whatever the fleet passes to claude (`--verbose`, `--continue`, …); recorded, not interpreted.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub rest: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -75,7 +177,7 @@ pub struct MaterializeArgs {
     #[arg(long)]
     pub no_host_defaults: bool,
     /// Where the generated hooks post to.
-    #[arg(long, default_value = "https://127.0.0.1:7643")]
+    #[arg(long, default_value = "http://127.0.0.1:7643")]
     pub hooks_url: String,
     /// Also run `mise install` and `nono profile validate`.
     #[arg(long)]
