@@ -2,7 +2,7 @@
 //! `apply` folds each outcome into the status. Nothing here does I/O.
 
 // mod execute; // Task 7
-// mod status; // Task 6
+mod status;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -15,7 +15,7 @@ use crate::name::{AgentId, FleetName};
 use crate::ports::{Keep, ObservedState, ProcessState};
 
 // pub use execute::{ExecuteReport, ReconcileContext, execute, reconcile_pass}; // Task 7
-// pub use status::{StepOutcome, agent_ready, apply, finish_pass, set_desired}; // Task 6
+pub use status::{StepOutcome, agent_ready, apply, finish_pass, set_desired};
 
 /// Restart limits (spec §7 "bounded exponential backoff").
 #[derive(Debug, Clone, PartialEq, Eq)]
