@@ -34,19 +34,28 @@ pub fn materialize_command(args: &MaterializeArgs) -> Result<String> {
         .with_context(|| format!("no agent {wanted:?} in the fleet (expected crew/agent)"))?;
 
     let real = layout_from_env()?;
+    let tools = tool_paths()?;
+
+    // Only claim (`.keep()`) the fallback temp dir after everything below
+    // succeeds; on an early return via `?` this drops and cleans up.
+    let mut fallback_tmp = None;
     let out_root = match &args.out {
         Some(p) => p.clone(),
-        None => tempfile::Builder::new()
-            .prefix("hecaton-materialize-")
-            .tempdir()?
-            .keep(),
+        None => {
+            let dir = tempfile::Builder::new()
+                .prefix("hecaton-materialize-")
+                .tempdir()?;
+            let path = dir.path().to_path_buf();
+            fallback_tmp = Some(dir);
+            path
+        }
     };
     let layout = StateLayout {
         state_root: out_root.join("state"),
         data_root: out_root.join("data"),
         config_root: real.config_root,
     };
-    let rt = Runtime::new(layout.clone(), tool_paths()?);
+    let rt = Runtime::new(layout.clone(), tools);
 
     let paths = layout.agent(&agent.id);
     std::fs::create_dir_all(&paths.workspace)?;
@@ -66,15 +75,17 @@ pub fn materialize_command(args: &MaterializeArgs) -> Result<String> {
     if args.install {
         rt.install_and_validate(&agent)?;
     }
+    if let Some(dir) = fallback_tmp {
+        let _ = dir.keep();
+    }
 
     let mut out = format!("agent dir: {}\n", paths.root.display());
+    let credentials_path = paths.claude_dir().join(".credentials.json");
+    let hosts_path = paths.gh_dir().join("hosts.yml");
     for (label, p) in [
         ("settings.json", paths.claude_dir().join("settings.json")),
-        (
-            ".credentials.json",
-            paths.claude_dir().join(".credentials.json"),
-        ),
-        ("hosts.yml", paths.gh_dir().join("hosts.yml")),
+        (".credentials.json", credentials_path.clone()),
+        ("hosts.yml", hosts_path.clone()),
         ("mise.toml", paths.mise_toml.clone()),
         ("nono-profile.json", paths.profile.clone()),
         ("launch.sh", paths.launch.clone()),
@@ -85,8 +96,10 @@ pub fn materialize_command(args: &MaterializeArgs) -> Result<String> {
     }
     out.push_str(if args.with_credentials {
         "credentials: written (real)\n"
-    } else {
+    } else if credentials_path.exists() || hosts_path.exists() {
         "credentials: <redacted> placeholders (pass --with-credentials to write them)\n"
+    } else {
+        "credentials: none found on the host (nothing to redact)\n"
     });
     if !args.install {
         out.push_str("not run: mise install, nono profile validate (pass --install)\n");

@@ -144,7 +144,9 @@ fn unknown_agent_and_missing_tools_fail_clearly() {
             "no agent \"payments/backend/nobody\"",
         ));
     let empty = tempfile::tempdir().unwrap();
+    let tmpdir = tempfile::tempdir().unwrap();
     hecaton(home.path(), empty.path())
+        .env("TMPDIR", tmpdir.path())
         .args([
             "dev",
             "materialize",
@@ -155,6 +157,9 @@ fn unknown_agent_and_missing_tools_fail_clearly() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("required tool not found on PATH"));
+    // A failure before rendering must leave no `hecaton-materialize-*` temp
+    // dir behind.
+    assert_eq!(fs::read_dir(tmpdir.path()).unwrap().count(), 0);
 }
 
 #[test]
