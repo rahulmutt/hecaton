@@ -34,7 +34,13 @@ pub enum FleetError {
     InvalidRepo { path: String, source: RepoError },
     #[error("{path}: must not be empty")]
     EmptyRef { path: String },
+    #[error("{path}: reserved name (tmux anchor window)")]
+    ReservedAgentName { path: String },
 }
+
+/// The tmux anchor window that keeps a crew's session alive is named
+/// `hecaton` (spec §4.3); an agent may not claim that name.
+pub const RESERVED_AGENT_NAME: &str = "hecaton";
 
 impl TryFrom<FleetSpec> for Fleet {
     type Error = FleetError;
@@ -71,6 +77,9 @@ fn convert_crew(path: &str, crew: CrewSpec) -> Result<Crew, FleetError> {
     let mut agents = BTreeMap::new();
     for (agent_name, settings) in crew.agents {
         let agent_path = format!("{path}.agents.{agent_name}");
+        if agent_name == RESERVED_AGENT_NAME {
+            return Err(FleetError::ReservedAgentName { path: agent_path });
+        }
         let agent_name =
             AgentName::try_from(agent_name).map_err(|source| FleetError::InvalidName {
                 path: agent_path,
@@ -184,6 +193,22 @@ mod tests {
             err.to_string()
                 .starts_with("crews.backend.agents.Bob: invalid agent name"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn the_anchor_window_name_is_reserved() {
+        let err = Fleet::try_from(spec(
+            "payments",
+            "backend",
+            "acme/api",
+            "main",
+            &["hecaton"],
+        ))
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "crews.backend.agents.hecaton: reserved name (tmux anchor window)"
         );
     }
 

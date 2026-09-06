@@ -9,7 +9,7 @@ pub mod reconcile;
 pub mod repo;
 
 pub use agent::{CrewRef, ResolvedAgent};
-pub use fleet::{Crew, Fleet, FleetError};
+pub use fleet::{Crew, Fleet, FleetError, RESERVED_AGENT_NAME};
 pub use name::{AgentId, AgentName, CrewName, FleetName, NameError};
 pub use ports::{
     AgentRunner, Clock, HookTarget, Keep, LaunchPlan, MaterializeError, Materializer,

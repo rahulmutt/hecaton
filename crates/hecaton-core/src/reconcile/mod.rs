@@ -113,9 +113,9 @@ pub fn backoff_secs(policy: &ReconcilePolicy, restarts: u32) -> u64 {
 /// | absent | otherwise | `Materialize`, `Start` |
 ///
 /// Known-but-not-desired agents get `Stop` (if observed) and `RemoveAgent`;
-/// their crews, if no longer desired, `RemoveCrew`. With `desired == None`
-/// (down) every observed agent is stopped and every known crew removed with
-/// `keep`; nothing is ensured.
+/// their crews, if no longer desired, `RemoveCrew` with the caller's `keep`.
+/// With `desired == None` (down) every observed agent is stopped and every
+/// known crew removed with `keep`; nothing is ensured.
 pub fn plan(
     fleet: &FleetName,
     desired: Option<&Fleet>,
@@ -166,12 +166,7 @@ pub fn plan(
     }
     for crew in &known_crews {
         if !desired_crews.contains(crew) {
-            let k = if desired.is_some() {
-                Keep::default()
-            } else {
-                keep
-            };
-            remove_crews.push(Step::RemoveCrew(crew.clone(), k));
+            remove_crews.push(Step::RemoveCrew(crew.clone(), keep));
         }
     }
     for crew in &desired_crews {
@@ -375,6 +370,29 @@ mod tests {
         );
         assert_eq!(got[4], "ensure-crew f/c");
         assert!(got[5].starts_with("materialize f/c/a"));
+    }
+
+    #[test]
+    fn an_undesired_crew_is_removed_with_the_callers_keep() {
+        let f = fleet(&[("a", 1)]);
+        let mut st = FleetStatus::default();
+        st.entry("f/old/z").phase = AgentPhase::Ready;
+        let got = render(&plan(
+            &fleet_name(),
+            Some(&f),
+            Keep {
+                repos: true,
+                sessions: false,
+            },
+            &st,
+            &ObservedState::default(),
+            &ReconcilePolicy::default(),
+            Timestamp(0),
+        ));
+        assert!(
+            got.contains(&"remove-crew f/old keep-repos=true keep-sessions=false".to_string()),
+            "{got:?}"
+        );
     }
 
     #[test]

@@ -23,7 +23,8 @@ use hecaton_core::{
 use crate::tools::Cmd;
 
 /// The window that keeps a session alive when every agent window is gone.
-pub const ANCHOR_WINDOW: &str = "hecaton";
+/// `Fleet::try_from` reserves this name so no agent window can collide.
+pub const ANCHOR_WINDOW: &str = hecaton_core::RESERVED_AGENT_NAME;
 const WINDOW_FORMAT: &str = "#{window_name}\t#{pane_dead}\t#{pane_pid}\t#{pane_dead_status}";
 /// Command for a window that should sit idle: the crew anchor, and an
 /// agent's window between creation and its first `respawn-window` into the
