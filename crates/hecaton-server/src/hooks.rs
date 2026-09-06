@@ -1,7 +1,52 @@
-//! Hook ingress (Phase 3 spec §3.5): body validation here; the axum
-//! handler joins in `api.rs`'s router (Task 8).
+//! Hook ingress (Phase 3 spec §3.5): body validation and the axum handler.
 
+use std::time::Duration;
+
+use axum::Json;
+use axum::body::Bytes;
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use hecaton_core::AgentId;
 use serde_json::Value;
+
+use crate::api::{ApiError, AppState};
+use crate::auth::bearer;
+
+/// Claude blocks on the response; the handler is pure, so 2 s is generous.
+const HANDLE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// `POST /v1/agents/{fleet}/{crew}/{agent}/events`. Order: secret (401 for
+/// a bad one or an unknown agent alike), rate limit (429), body (400),
+/// then the fleet's actor and the handler under a timeout (503).
+pub(crate) async fn events(
+    State(state): State<AppState>,
+    Path((fleet, crew, agent)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let unauthorized =
+        || ApiError::new(StatusCode::UNAUTHORIZED, "unknown agent or bad secret").into_response();
+    let Ok(id) = format!("{fleet}/{crew}/{agent}").parse::<AgentId>() else {
+        return unauthorized();
+    };
+    let Some(secret) = bearer(&headers) else {
+        return unauthorized();
+    };
+    if !state.limiter.allow(&id.to_string()) {
+        return ApiError::new(StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
+    }
+    let parsed = match parse_event(&body) {
+        Ok(p) => p,
+        Err(e) => return ApiError::new(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    match tokio::time::timeout(HANDLE_TIMEOUT, state.daemon.event(&id, secret, parsed)).await {
+        Ok(Ok(outcome)) => Json(outcome.response).into_response(),
+        Ok(Err(e)) => ApiError::from(e).into_response(),
+        Err(_) => ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "hook handling timed out")
+            .into_response(),
+    }
+}
 
 /// The three things the daemon needs from a hook body.
 #[derive(Debug, Clone, PartialEq)]
