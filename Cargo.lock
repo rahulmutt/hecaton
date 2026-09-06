@@ -320,9 +320,13 @@ dependencies = [
  "clap",
  "hecaton-api",
  "hecaton-config",
+ "hecaton-core",
+ "hecaton-runtime",
+ "hex",
  "predicates",
  "serde_json",
  "serde_norway",
+ "sha2",
  "tempfile",
 ]
 

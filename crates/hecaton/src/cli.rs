@@ -23,6 +23,12 @@ pub enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Developer tools; not part of the supported surface.
+    #[command(hide = true)]
+    Dev {
+        #[command(subcommand)]
+        command: DevCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -44,4 +50,37 @@ pub struct ResolveArgs {
     /// Print JSON instead of YAML.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DevCommand {
+    /// Render one agent's generated files (settings.json, mise.toml,
+    /// nono-profile.json, launch.sh) without launching anything.
+    Materialize(MaterializeArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct MaterializeArgs {
+    /// Path to the fleet YAML file.
+    pub file: PathBuf,
+    /// Agent to render, as crew/agent.
+    pub agent: String,
+    /// Output root (default: a fresh temp dir, printed).
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+    /// Fleet name; overrides `name` in the file.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Do not layer the host's ~/.claude/settings.json beneath the file.
+    #[arg(long)]
+    pub no_host_defaults: bool,
+    /// Where the generated hooks post to.
+    #[arg(long, default_value = "https://127.0.0.1:7643")]
+    pub hooks_url: String,
+    /// Also run `mise install` and `nono profile validate`.
+    #[arg(long)]
+    pub install: bool,
+    /// Write real credentials instead of "<redacted>" placeholders.
+    #[arg(long)]
+    pub with_credentials: bool,
 }
