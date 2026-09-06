@@ -31,6 +31,7 @@ fn session_window_observe_exit_respawn_and_teardown() {
 
     let agent_dir = root.join("a");
     std::fs::create_dir_all(agent_dir.join("logs")).unwrap();
+    let log = agent_dir.join("logs").join("tmux.log");
     let script = agent_dir.join("launch.sh");
     std::fs::write(
         &script,
@@ -61,10 +62,7 @@ fn session_window_observe_exit_respawn_and_teardown() {
         Some(ProcessState::Running { pid }) => *pid,
         other => panic!("expected running, got {other:?}"),
     };
-    wait_for(|| {
-        std::fs::read_to_string(agent_dir.join("logs").join("tmux.log"))
-            .is_ok_and(|s| s.contains("hello-from-agent"))
-    });
+    wait_for(|| std::fs::read_to_string(&log).is_ok_and(|s| s.contains("hello-from-agent")));
 
     // kill the script's process group leader → pane dead, remain-on-exit keeps the window
     assert!(
@@ -81,10 +79,15 @@ fn session_window_observe_exit_respawn_and_teardown() {
         )
     });
 
+    // Truncate first so this assertion can only pass if the respawn path
+    // itself (not the leftover content from the first start) re-attaches
+    // the pipe before the respawned script writes.
+    std::fs::write(&log, "").unwrap();
     r.ensure_agent(&id, &plan).unwrap(); // respawn
     wait_for(
         || matches!(r.observe(&fleet).unwrap().get(&id), Some(ProcessState::Running { pid: p }) if *p != pid),
     );
+    wait_for(|| std::fs::read_to_string(&log).is_ok_and(|s| s.contains("hello-from-agent")));
 
     r.send_text(&id, "ignored", true).unwrap();
     r.stop_agent(&id).unwrap();

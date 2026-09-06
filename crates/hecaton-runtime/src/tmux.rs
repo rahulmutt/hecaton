@@ -1,4 +1,16 @@
 //! `AgentRunner` over a dedicated tmux server (Phase 2 spec §4.3).
+//!
+//! `ensure_agent` diverges from the spec's §4.3 table, which shows a window
+//! created (or respawned) directly with the agent's script: instead it
+//! always brings the window to an idle, live pane first (creating it idle if
+//! absent, or `respawn-window`-ing it into idle if its pane already exited)
+//! and only then attaches `pipe-pane` and `respawn-window`s into the real
+//! script. tmux reads (and, once read, discards) a pane's pty output as soon
+//! as the child produces it, so a script that writes immediately can race
+//! ahead of a `pipe-pane` attached to that same window after it was started
+//! with the real command, losing that output to the log forever; going
+//! through an idle pane first, and only ever attaching `pipe-pane` to a live
+//! one, removes the race (a dead pane refuses `pipe-pane` outright).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -13,6 +25,10 @@ use crate::tools::Cmd;
 /// The window that keeps a session alive when every agent window is gone.
 pub const ANCHOR_WINDOW: &str = "hecaton";
 const WINDOW_FORMAT: &str = "#{window_name}\t#{pane_dead}\t#{pane_pid}\t#{pane_dead_status}";
+/// Command for a window that should sit idle: the crew anchor, and an
+/// agent's window between creation and its first `respawn-window` into the
+/// real script.
+const IDLE_ARGV: [&str; 3] = ["/bin/sh", "-c", "while :; do sleep 3600; done"];
 
 pub struct TmuxRunner {
     pub tmux: PathBuf,
@@ -44,15 +60,15 @@ impl TmuxRunner {
             })
     }
 
-    /// tmux exits non-zero with "no server running" / "can't find" when
-    /// nothing exists; those are "absent", not errors.
+    /// tmux exits non-zero with "no server running" / "can't find" /
+    /// "error connecting" when nothing exists; those are "absent", not
+    /// errors.
     fn run_optional(&self, id: &str, args: &[&str]) -> Result<Option<String>, RunnerError> {
         match self.cmd().args(args.iter().copied()).run() {
             Ok(o) => Ok(Some(o.stdout)),
             Err(f)
                 if f.stderr.contains("no server running")
                     || f.stderr.contains("can't find")
-                    || f.stderr.contains("no such")
                     || f.stderr.contains("error connecting") =>
             {
                 Ok(None)
@@ -154,9 +170,9 @@ impl AgentRunner for TmuxRunner {
                 "-n",
                 ANCHOR_WINDOW,
                 "--",
-                "/bin/sh",
-                "-c",
-                "while :; do sleep 3600; done",
+                IDLE_ARGV[0],
+                IDLE_ARGV[1],
+                IDLE_ARGV[2],
             ],
         )
         .map(|_| ())
@@ -165,46 +181,65 @@ impl AgentRunner for TmuxRunner {
     fn ensure_agent(&self, agent: &AgentId, plan: &LaunchPlan) -> Result<(), RunnerError> {
         let id = agent.to_string();
         let crew = agent.crew_ref();
-        let exists = self
+        let state = self
             .windows(&crew)?
-            .is_some_and(|w| w.contains_key(&agent.agent));
+            .and_then(|w| w.get(&agent.agent).copied());
         let cwd = plan.cwd.display().to_string();
         let script = plan.script.display().to_string();
         let target = Self::window_target(agent);
-        if exists {
-            return self
-                .run(
+        match state {
+            None => {
+                // Window absent: create it idle, not with the real script
+                // directly. See the module doc for why (a `pipe-pane`
+                // output-loss race).
+                self.run(
                     &id,
-                    &["respawn-window", "-k", "-t", &target, "-c", &cwd, &script],
-                )
-                .map(|_| ());
+                    &[
+                        "new-window",
+                        "-d",
+                        "-t",
+                        &Self::session_target(&crew),
+                        "-n",
+                        agent.agent.as_str(),
+                        "-c",
+                        &cwd,
+                        "--",
+                        IDLE_ARGV[0],
+                        IDLE_ARGV[1],
+                        IDLE_ARGV[2],
+                    ],
+                )?;
+            }
+            Some(ProcessState::Exited { .. }) => {
+                // Window exists but its pane already exited: tmux's
+                // `pipe-pane` refuses a dead pane ("target pane has
+                // exited"), so revive it into the idle placeholder first,
+                // for the same reason as the `None` arm above.
+                self.run(
+                    &id,
+                    &[
+                        "respawn-window",
+                        "-k",
+                        "-t",
+                        &target,
+                        "-c",
+                        &cwd,
+                        IDLE_ARGV[0],
+                        IDLE_ARGV[1],
+                        IDLE_ARGV[2],
+                    ],
+                )?;
+            }
+            Some(ProcessState::Running { .. }) => {}
         }
-        // Start with a no-op placeholder, not the real script directly: tmux
-        // reads (and, once read, discards) the pane's pty output as soon as
-        // the child produces it, which can race ahead of the `pipe-pane`
-        // call below and silently drop the script's earliest output (seen
-        // in practice: a script that echoes immediately lost that line in
-        // tmux.log most of the time). Attaching `pipe-pane` to an
-        // already-quiescent placeholder and then `respawn-window`-ing into
-        // the real script guarantees the pipe is active before the script
-        // writes anything.
-        self.run(
-            &id,
-            &[
-                "new-window",
-                "-d",
-                "-t",
-                &Self::session_target(&crew),
-                "-n",
-                agent.agent.as_str(),
-                "-c",
-                &cwd,
-                "--",
-                "/bin/sh",
-                "-c",
-                "while :; do sleep 3600; done",
-            ],
-        )?;
+        // `set-option` is idempotent and, by this point, always aimed at a
+        // live pane, so re-applying it here unconditionally (not only right
+        // after creating or reviving the window above) repairs a window
+        // that exists without it: one left by a create that failed between
+        // here and `respawn-window` below, one from before this repair
+        // existed, or one an operator created by hand. Without this, such a
+        // window would never gain remain-on-exit, and the reconciler would
+        // recreate/restart it forever.
         self.run(
             &id,
             &["set-option", "-w", "-t", &target, "remain-on-exit", "on"],
@@ -214,11 +249,21 @@ impl AgentRunner for TmuxRunner {
             .parent()
             .map(|p| p.join("logs").join("tmux.log"))
             .unwrap_or_else(|| PathBuf::from("tmux.log"));
+        // No `-o` here: tmux tracks "already piping" on the pane itself, and
+        // that flag survives both the pane dying and `respawn-window`
+        // reviving it with a fresh pty. `-o` reads that stale flag, believes
+        // a pipe is already attached, and silently drops the (already-dead)
+        // one without opening a new one — the revived pane then never gets
+        // piped at all. Without `-o`, `pipe-pane` always closes any existing
+        // pipe and opens this one, which is exactly what every call site
+        // wants: this runs immediately before `respawn-window` starts the
+        // process whose output we actually want captured, so there is never
+        // a live process (from *this* pane, going forward) whose output
+        // could fall in the close/reopen gap.
         self.run(
             &id,
             &[
                 "pipe-pane",
-                "-o",
                 "-t",
                 &target,
                 &format!(
@@ -278,7 +323,7 @@ impl AgentRunner for TmuxRunner {
     fn send_text(&self, agent: &AgentId, text: &str, submit: bool) -> Result<(), RunnerError> {
         let id = agent.to_string();
         let target = Self::window_target(agent);
-        self.run(&id, &["send-keys", "-t", &target, "-l", text])?;
+        self.run(&id, &["send-keys", "-t", &target, "-l", "--", text])?;
         if submit {
             self.run(&id, &["send-keys", "-t", &target, "Enter"])?;
         }
