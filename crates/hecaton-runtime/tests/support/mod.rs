@@ -45,9 +45,18 @@ pub fn layout(root: &Path) -> StateLayout {
 /// True when Landlock is usable: `nono run` of `true` succeeds. `--allow-cwd`
 /// is required because nono 0.75.0 refuses CWD access non-interactively
 /// without it; without the flag the probe fails even though Landlock itself
-/// is fine.
+/// is fine. `$HOME` must be a sibling of `root`, not nested inside it: nono's
+/// built-in default profile denies a set of sensitive dotfiles under `$HOME`
+/// (`.aws`, `.ssh`, `.1password`, …), and when `--allow-cwd` broadly allows a
+/// directory that contains `$HOME`, those per-file denials sit underneath an
+/// allowed parent — a shape Landlock cannot express, so nono refuses to start
+/// ("Sandbox initialization failed: Landlock deny-overlap is not
+/// enforceable") rather than silently under-enforcing.
 pub fn landlock_works(tools: &ToolPaths, root: &Path) -> bool {
-    let home = root.join("nono-probe-home");
+    let home = root.with_file_name(format!(
+        "{}-nono-probe-home",
+        root.file_name().unwrap_or_default().to_string_lossy()
+    ));
     std::fs::create_dir_all(&home).unwrap();
     std::process::Command::new(&tools.nono)
         .args(["-s", "run", "--allow-cwd", "--", "/bin/true"])

@@ -7,6 +7,7 @@ pub mod fsutil;
 pub mod home;
 pub mod layout;
 pub mod quote;
+pub mod sandbox;
 pub mod toolchain;
 pub mod tools;
 
@@ -14,5 +15,9 @@ pub use env::agent_env;
 pub use home::{HOOK_EVENTS, HomeInputs, write_home};
 pub use layout::{AgentPaths, CrewPaths, StateLayout};
 pub use quote::sh_quote;
+pub use sandbox::{
+    Grants, check_conflicts, hecaton_grants, merge_profile, render_profile, validate_profile,
+    write_profile,
+};
 pub use toolchain::{Toolchain, embedded_system_tools, mise_env, render_mise_toml, system_tools};
 pub use tools::{MissingTool, ToolPaths};

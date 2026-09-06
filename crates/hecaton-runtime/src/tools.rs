@@ -90,8 +90,6 @@ impl Cmd {
         self.args.extend(a.into_iter().map(Into::into));
         self
     }
-    // used by Task 12 (`validate_profile`'s `nono profile validate HOME=`)
-    #[allow(dead_code)]
     pub(crate) fn env(mut self, k: impl Into<String>, v: impl Into<String>) -> Self {
         self.env.insert(k.into(), v.into());
         self
