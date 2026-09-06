@@ -10,11 +10,13 @@ pub mod credentials;
 pub mod fleet;
 pub mod request;
 pub mod settings;
+pub mod status;
 
 pub use credentials::CredentialBundle;
 pub use fleet::{CrewSpec, FleetSpec, GitAuth, GitSettings};
 pub use request::FleetRequest;
 pub use settings::{AgentSettings, ClaudeSettings, RunnerSettings};
+pub use status::{AgentPhase, AgentStatus, FleetPhase, FleetStatus, SpecHash, Timestamp};
 
 #[cfg(test)]
 mod tests {
