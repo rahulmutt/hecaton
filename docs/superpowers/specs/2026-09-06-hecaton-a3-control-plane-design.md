@@ -237,6 +237,12 @@ request.
 | `hook-relay` | §4; listed under an "internal" help heading |
 | `dev fake-claude` | hidden; §7 |
 
+**Implementation refinements** (Task 13): `list`'s table renders `GEN` and
+`OBSERVED` as two separate columns rather than a combined `gen/observed`
+column. `hook-relay` is a `#[command(hide = true)]` subcommand (so it never
+appears in `--help` at all) rather than a command listed under a visible
+"internal" heading.
+
 ## 6. Runtime carry-overs
 
 ### 6.1 Cheap steady state

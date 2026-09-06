@@ -33,7 +33,13 @@ pub fn agent_env(
         // the daemon never installed and the sandbox cannot download; an
         // ancestor file that the profile does not grant is worse still —
         // mise exits on the read error. A ceiling at the workspace stops the
-        // walk before either, leaving only the generated global file.
+        // walk before either, leaving only the generated global file. This
+        // ceiling only stops the upward walk: a `mise.toml` in a
+        // subdirectory of the workspace is still discovered if the agent
+        // `cd`s there, same as it would be for any other mise invocation —
+        // and the sandbox has no network for installs either way, so a
+        // subdirectory config naming an uninstalled tool fails the same way
+        // the repository's own file would.
         ("MISE_CEILING_PATHS".to_string(), s(&paths.workspace)),
         ("MISE_DATA_DIR".to_string(), s(&layout.mise_data_dir())),
         ("MISE_CONFIG_DIR".to_string(), s(&paths.mise_config_dir())),
