@@ -66,8 +66,10 @@ pub struct Timestamp(/* seconds since epoch, u64 */);
 with `BTreeMap`s, which every wire type already uses). `ResolvedAgent::from_fleet(&Fleet) -> Vec<ResolvedAgent>` is the only way the runtime reaches the fleet.
 
 Addendum (Task 18): `Timestamp` and `SpecHash` are defined in
-`hecaton-api::status` and re-exported from `hecaton-core`, not defined there
-directly.
+`hecaton-api::status` and re-exported at the `hecaton-api` crate root;
+`hecaton-core` uses them from `hecaton_api` (`hecaton-runtime` depends on
+`hecaton-api` too but does not yet reference either type directly — that
+arrives with Phase 3's `Clock` adapter).
 
 ### 2.2 Ports
 
@@ -165,10 +167,11 @@ last. Within each group, alphabetical by id. Tests compare plans with `==`.
 | `NoteExit(agent, code)` | agent observed `Exited`, not yet noted (`next_restart_at.is_none()`) |
 
 Addendum (Task 18): the row that was `MarkDead(agent)` in this draft became
-`NoteExit(agent, code)` — every observed exit is noted, moving the agent to
-`Exited`, not `Dead`, with `next_restart_at` set (or left `None` when the exit
-is not yet noted). `apply` moves the agent to `Dead` only when the resulting
-`restarts` exceeds `max_restarts`.
+`NoteExit(agent, code)` — emitted when the window is observed `Exited` (a
+`ProcessState`), the agent is not `Dead`, and `next_restart_at` is `None`;
+`apply` records the exit (`restarts += 1`, `next_restart_at = now + backoff`)
+and moves the agent to `Dead` when `restarts > max_restarts`; otherwise the
+agent's phase is unchanged until the restart is due.
 
 Every step carries the ids it needs and nothing else; `Start` carries the
 `SpecHash` so `apply` can record `applied_hash` without recomputing it.

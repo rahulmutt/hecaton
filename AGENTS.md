@@ -40,7 +40,9 @@ credentials, hook input, or sandbox rules.
   changes what agents get.
 - nono's state root follows nono's own `$HOME`; never point that at the agent's
   `home/` (see ARCHITECTURE.md).
-- `Cmd` (tools.rs) scrubs `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_PREFIX`/`GIT_COMMON_DIR`
-  from git calls, and the integration-test `git` fixtures do the same — the
-  pre-commit hook exports them, and a git subprocess that inherits them
-  operates on this repository instead of the test's.
+- `Workspace::git` (`crates/hecaton-runtime/src/workspace.rs`) scrubs
+  `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_PREFIX`/`GIT_COMMON_DIR` from
+  every git call via `Cmd::env_remove`, and the integration-test `git`
+  fixtures do the same — the pre-commit hook exports them, and a git
+  subprocess that inherits them operates on this repository instead of the
+  test's.

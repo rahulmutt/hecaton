@@ -25,7 +25,9 @@ against what was declared.
   deep-merges settings layers as JSON values, types and validates each agent.
 - `hecaton` — the binary, and the only crate allowed to see both ports and
   adapters; it does the wiring.
-- `hecaton-runtime` — driven adapters over git, gh, mise, nono, tmux. One module per materialization step; every path from StateLayout, every binary from ToolPaths; never reads the process environment.
+- `hecaton-runtime` — driven adapters over git, gh, mise, nono, tmux. One
+  module per materialization step; every path from StateLayout, every binary
+  from ToolPaths; never reads the process environment.
 
 ## How it flows
 **Config (Phase 1):** `read` (file.rs) → `resolve` (resolve.rs): for each agent fold
