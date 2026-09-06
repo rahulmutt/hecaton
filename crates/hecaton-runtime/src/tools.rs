@@ -86,13 +86,6 @@ impl Cmd {
             log: None,
         }
     }
-    // not used by any task in this plan (verified through Task 18); kept for
-    // symmetry with `args` and `env`/`envs`.
-    #[allow(dead_code)]
-    pub(crate) fn arg(mut self, a: impl Into<String>) -> Self {
-        self.args.push(a.into());
-        self
-    }
     pub(crate) fn args<I: IntoIterator<Item = S>, S: Into<String>>(mut self, a: I) -> Self {
         self.args.extend(a.into_iter().map(Into::into));
         self
@@ -244,7 +237,7 @@ mod tests {
     #[test]
     fn run_reports_a_missing_program() {
         let err = Cmd::new(Path::new("/nonexistent/tool"))
-            .arg("x")
+            .args(["x"])
             .run()
             .unwrap_err();
         assert!(err.stderr.starts_with("cannot execute /nonexistent/tool"));
