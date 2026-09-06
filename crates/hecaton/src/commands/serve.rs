@@ -2,6 +2,7 @@
 //! daemon, bind, publish the endpoint, run until SIGINT/SIGTERM.
 
 use std::fs::OpenOptions;
+use std::net::SocketAddr;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -62,11 +63,29 @@ impl ServerConfig {
     }
 }
 
+/// Reject any `bind` address that is not loopback (Phase 3 spec P3-1: the
+/// daemon speaks plain HTTP, so it may only ever listen on 127.0.0.1 / ::1).
+/// Checked once here so both the foreground and `-d` (detach, which
+/// re-execs itself with the same `--bind`) paths hit it before anything
+/// else runs.
+fn require_loopback(bind: &str) -> Result<SocketAddr> {
+    let addr: SocketAddr = bind
+        .parse()
+        .with_context(|| format!("bind address {bind:?} is not a valid host:port"))?;
+    if !addr.ip().is_loopback() {
+        bail!(
+            "bind address {addr} is not loopback; the daemon speaks plain HTTP and only listens on 127.0.0.1 (Phase 3 spec P3-1)"
+        );
+    }
+    Ok(addr)
+}
+
 pub fn serve_command(args: &ServeArgs) -> Result<String> {
     let layout = layout_from_env()?;
     let paths = server_paths(&layout);
     let config = ServerConfig::load(&layout.config_root.join("config.toml"))?;
     let bind = args.bind.clone().unwrap_or(config.bind);
+    require_loopback(&bind)?;
     if args.detach {
         return detach(&paths, &bind, &args.tmux_socket);
     }
@@ -263,5 +282,13 @@ mod tests {
         std::fs::write(&path, "[server]\nport = 1\n").unwrap();
         let e = ServerConfig::load(&path).unwrap_err().to_string();
         assert!(e.contains("config.toml") && e.contains("port"), "{e}");
+    }
+
+    #[test]
+    fn require_loopback_accepts_loopback_and_rejects_everything_else() {
+        require_loopback("127.0.0.1:0").unwrap();
+        require_loopback("[::1]:0").unwrap();
+        let e = require_loopback("0.0.0.0:1").unwrap_err().to_string();
+        assert!(e.contains("not loopback"), "{e}");
     }
 }

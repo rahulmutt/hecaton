@@ -167,3 +167,22 @@ fn detached_serve_prints_the_endpoint_logs_to_a_file_and_stops_on_term() {
     }
     assert!(!server_dir.join("hecaton.pid").exists());
 }
+
+#[test]
+fn serve_rejects_a_non_loopback_bind_and_writes_no_endpoint() {
+    let home = tempfile::tempdir().unwrap();
+    let tools = tempfile::tempdir().unwrap();
+    fake_tools(tools.path());
+    let server_dir = home.path().join(".local/state/hecaton/server");
+    let out = hecaton(home.path(), tools.path())
+        .args(["serve", "--bind", "0.0.0.0:0"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not loopback"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!server_dir.join("endpoint").exists());
+}
