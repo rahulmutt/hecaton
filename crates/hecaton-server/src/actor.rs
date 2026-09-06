@@ -149,6 +149,7 @@ impl Actor {
                 }
                 Some(Msg::Down { keep, purge, reply }) => {
                     self.record.desired = Desired::Down { keep, purge };
+                    self.persist().await;
                     self.publish();
                     let _ = reply.send(self.record.clone());
                     self.pass().await;
@@ -235,6 +236,7 @@ impl Actor {
                 }
             }
         }
+        self.persist().await;
         self.publish();
     }
 
@@ -457,6 +459,12 @@ mod tests {
         let reply = apply(&handle, spec(&["a", "b"])).await;
         assert_eq!(reply.generation, 1);
         assert_eq!(reply.desired, Desired::Up);
+        // persist happens before the reply (spec §3.2): the store already
+        // has generation 1 and both freshly minted secrets, before the pass
+        // that follows the reply has had a chance to run.
+        let (stored_before_pass, secrets_before_pass) = h.store.get("f").unwrap();
+        assert_eq!(stored_before_pass.generation, 1);
+        assert_eq!(secrets_before_pass.hook_secrets.len(), 2);
         let mut rx = handle.status.clone();
         let rec = wait(&mut rx, |r| r.status.observed_generation == 1).await;
         assert_eq!(rec.status.agents["f/c/a"].phase, AgentPhase::Starting);
@@ -543,6 +551,13 @@ mod tests {
 
         let reply = down(&handle, false).await;
         assert!(matches!(reply.desired, Desired::Down { purge: false, .. }));
+        // persist happens before the reply (spec §3.2): the store already
+        // has the new `desired` before the pass that follows the reply has
+        // had a chance to settle the fleet to `Down`.
+        assert!(matches!(
+            h.store.get("f").unwrap().0.desired,
+            Desired::Down { purge: false, .. }
+        ));
         let rec = wait(&mut rx, |r| r.status.phase == FleetPhase::Down).await;
         assert!(rec.is_down());
         assert!(h.runner.observed().crews.is_empty());
