@@ -20,9 +20,18 @@ pub struct Grants {
     pub allow: Vec<PathBuf>,
 }
 
-pub fn hecaton_grants(paths: &AgentPaths, crew: &CrewPaths, layout: &StateLayout) -> Grants {
+pub fn hecaton_grants(
+    paths: &AgentPaths,
+    crew: &CrewPaths,
+    layout: &StateLayout,
+    hecaton: &Path,
+) -> Grants {
     let mut read: Vec<PathBuf> = SYSTEM_READ.iter().map(PathBuf::from).collect();
     read.push(layout.mise_data_dir());
+    // The `SessionStart` relay hook runs this binary inside the sandbox
+    // (nono 0.75.0 validates and enforces a single-file `read` entry, and
+    // `nono run` inside such a profile executes the granted binary).
+    read.push(hecaton.to_path_buf());
     Grants {
         read,
         allow: vec![
@@ -226,7 +235,7 @@ mod tests {
         let id: AgentId = "f/c/a".parse().unwrap();
         let paths = layout.agent(&id);
         let crew = layout.crew(&id.crew_ref());
-        let grants = hecaton_grants(&paths, &crew, &layout);
+        let grants = hecaton_grants(&paths, &crew, &layout, Path::new("/opt/hecaton"));
         (
             id,
             grants,
@@ -241,6 +250,7 @@ mod tests {
         assert_eq!(p["meta"]["name"], "hecaton-f-c-a");
         assert_eq!(p["filesystem"]["read"][0], "/usr");
         assert_eq!(p["filesystem"]["read"][5], "/h/.local/share/hecaton/mise");
+        assert_eq!(p["filesystem"]["read"][6], "/opt/hecaton");
         assert_eq!(
             p["filesystem"]["allow"][2],
             "/h/.local/state/hecaton/fleets/f/crews/c/repo/.git"

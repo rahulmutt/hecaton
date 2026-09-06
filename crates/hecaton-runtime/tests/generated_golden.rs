@@ -59,6 +59,7 @@ fn payments_agents_generate_known_files() {
         mise: "/tools/mise".into(),
         nono: "/tools/nono".into(),
         tmux: "/tools/tmux".into(),
+        hecaton: "/tools/hecaton".into(),
     };
     // fixed system table so the snapshot does not move with the repo's claude pin
     std::fs::create_dir_all(&layout.config_root).unwrap();
@@ -76,7 +77,7 @@ fn payments_agents_generate_known_files() {
     let mut out = String::new();
     for agent in ResolvedAgent::from_fleet(&fleet()) {
         let hooks = HookTarget {
-            url: "https://127.0.0.1:7643".into(),
+            url: "http://127.0.0.1:7643".into(),
             secret: format!("secret-{}", agent.id.agent),
         };
         let plan = rt
@@ -93,6 +94,7 @@ fn payments_agents_generate_known_files() {
         assert_eq!(plan.script, paths.launch);
         for (label, path) in [
             ("settings.json", paths.claude_dir().join("settings.json")),
+            (".gitconfig", paths.home.join(".gitconfig")),
             ("mise.toml", paths.mise_toml.clone()),
             ("nono-profile.json", paths.profile.clone()),
             ("launch.sh", paths.launch.clone()),

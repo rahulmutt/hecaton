@@ -52,6 +52,8 @@ impl Runtime {
                 settings: &agent.settings.claude.settings,
                 creds,
                 hooks,
+                git: &agent.git,
+                relay: &self.tools.hecaton,
                 with_gh,
                 redact_credentials: opts.redact_credentials,
             },
@@ -64,10 +66,17 @@ impl Runtime {
         }
         .write(id, &paths, &system, &agent.settings.tools, with_gh)?;
 
-        let env = agent_env(id, &paths, &self.layout, &hooks.url, &agent.settings.env);
+        let env = agent_env(
+            id,
+            &paths,
+            &self.layout,
+            &hooks.url,
+            &hooks.secret,
+            &agent.settings.env,
+        );
         let profile = render_profile(
             id,
-            &hecaton_grants(&paths, &crew, &self.layout),
+            &hecaton_grants(&paths, &crew, &self.layout, &self.tools.hecaton),
             hooks_port(&hooks.url),
             &env,
             &agent.settings.sandbox,

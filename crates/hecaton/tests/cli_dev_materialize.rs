@@ -71,6 +71,8 @@ fn renders_the_four_files_with_redacted_credentials_by_default() {
         fs::read_to_string(Path::new(&agent_dir).join("home/.claude/settings.json")).unwrap();
     assert!(settings.contains("\"model\": \"opus\""));
     assert!(settings.contains("/v1/agents/payments/backend/bob/events"));
+    assert!(settings.contains("hook-relay"));
+    assert!(Path::new(&agent_dir).join("home/.gitconfig").exists());
     let creds =
         fs::read_to_string(Path::new(&agent_dir).join("home/.claude/.credentials.json")).unwrap();
     assert!(!creds.contains("SECRET") && creds.contains("<redacted>"));

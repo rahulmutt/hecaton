@@ -75,7 +75,7 @@ pub struct MaterializeArgs {
     #[arg(long)]
     pub no_host_defaults: bool,
     /// Where the generated hooks post to.
-    #[arg(long, default_value = "https://127.0.0.1:7643")]
+    #[arg(long, default_value = "http://127.0.0.1:7643")]
     pub hooks_url: String,
     /// Also run `mise install` and `nono profile validate`.
     #[arg(long)]

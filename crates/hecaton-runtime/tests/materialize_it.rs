@@ -121,7 +121,7 @@ fn materialize_then_remove_round_trip() {
     let crew = agent.id.crew_ref();
     let creds = CredentialBundle::default();
     let hooks = HookTarget {
-        url: "https://127.0.0.1:7643".into(),
+        url: "http://127.0.0.1:7643".into(),
         secret: "s".into(),
     };
 

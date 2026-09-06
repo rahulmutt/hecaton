@@ -34,12 +34,13 @@ fn generated_profile_validates_and_enforces_isolation() {
         &id,
         &paths,
         &layout,
-        "https://127.0.0.1:7643",
+        "http://127.0.0.1:7643",
+        "s3",
         &Default::default(),
     );
     let profile = render_profile(
         &id,
-        &hecaton_grants(&paths, &crew, &layout),
+        &hecaton_grants(&paths, &crew, &layout, &tools.hecaton),
         7643,
         &env,
         &serde_json::json!({}),

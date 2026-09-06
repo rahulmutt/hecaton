@@ -118,6 +118,7 @@ mod tests {
             mise: "/opt/mise/bin/mise".into(),
             nono: "/opt/nono".into(),
             tmux: "/opt/tmux".into(),
+            hecaton: "/opt/hecaton".into(),
         }
     }
 

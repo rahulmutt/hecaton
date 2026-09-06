@@ -12,6 +12,7 @@ pub fn agent_env(
     paths: &AgentPaths,
     layout: &StateLayout,
     api_url: &str,
+    hook_secret: &str,
     user_env: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
     let s = |p: &std::path::Path| p.display().to_string();
@@ -33,6 +34,9 @@ pub fn agent_env(
         ("HECATON_AGENT".to_string(), id.agent.to_string()),
         ("HECATON_AGENT_ID".to_string(), id.to_string()),
         ("HECATON_API_URL".to_string(), api_url.to_string()),
+        // What `hecaton hook-relay` presents; the reserved `HECATON_` prefix
+        // keeps user `env` away from it.
+        ("HECATON_HOOK_SECRET".to_string(), hook_secret.to_string()),
     ]);
     // Reserved keys were rejected at config validation; `entry().or_insert`
     // keeps the isolation rows authoritative even so.
@@ -56,7 +60,14 @@ mod tests {
             ("RUST_LOG".to_string(), "info".to_string()),
             ("HOME".to_string(), "/evil".to_string()),
         ]);
-        let env = agent_env(&id, &paths, &layout, "https://127.0.0.1:7643", &user);
+        let env = agent_env(
+            &id,
+            &paths,
+            &layout,
+            "http://127.0.0.1:7643",
+            "hook-s3",
+            &user,
+        );
         assert_eq!(
             env["HOME"],
             "/h/.local/state/hecaton/fleets/payments/crews/backend/agents/alice/home"
@@ -64,7 +75,8 @@ mod tests {
         assert_eq!(env["RUST_LOG"], "info");
         assert_eq!(env["HECATON_AGENT_ID"], "payments/backend/alice");
         assert_eq!(env["MISE_DATA_DIR"], "/h/.local/share/hecaton/mise");
+        assert_eq!(env["HECATON_HOOK_SECRET"], "hook-s3");
         assert!(!env.contains_key("PATH"), "PATH is nono's");
-        assert_eq!(env.len(), 18);
+        assert_eq!(env.len(), 19);
     }
 }

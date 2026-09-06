@@ -15,6 +15,9 @@ pub struct ToolPaths {
     pub mise: PathBuf,
     pub nono: PathBuf,
     pub tmux: PathBuf,
+    /// This binary: the `SessionStart` relay hook runs it inside the
+    /// sandbox (Phase 3 spec P3-3), so the profile grants it read-only.
+    pub hecaton: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -22,8 +25,10 @@ pub struct ToolPaths {
 pub struct MissingTool(pub String);
 
 impl ToolPaths {
-    /// Finds each tool as the first executable file on `path`.
-    pub fn discover_in(path: &OsStr) -> Result<Self, MissingTool> {
+    /// Finds each tool as the first executable file on `path`. `hecaton` is
+    /// this binary's own path (the `SessionStart` relay hook target), not
+    /// discovered on `PATH`.
+    pub fn discover_in(path: &OsStr, hecaton: &Path) -> Result<Self, MissingTool> {
         let find = |name: &str| -> Result<PathBuf, MissingTool> {
             std::env::split_paths(path)
                 .map(|d| d.join(name))
@@ -36,6 +41,7 @@ impl ToolPaths {
             mise: find("mise")?,
             nono: find("nono")?,
             tmux: find("tmux")?,
+            hecaton: hecaton.to_path_buf(),
         })
     }
 }
@@ -199,11 +205,13 @@ mod tests {
         for t in ["git", "gh", "mise", "nono"] {
             std::fs::write(dir.path().join(t), "").unwrap();
         }
-        let err = ToolPaths::discover_in(dir.path().as_os_str()).unwrap_err();
+        let err =
+            ToolPaths::discover_in(dir.path().as_os_str(), Path::new("/opt/hecaton")).unwrap_err();
         assert_eq!(err.to_string(), "required tool not found on PATH: tmux");
         std::fs::write(dir.path().join("tmux"), "").unwrap();
-        let t = ToolPaths::discover_in(dir.path().as_os_str()).unwrap();
+        let t = ToolPaths::discover_in(dir.path().as_os_str(), Path::new("/opt/hecaton")).unwrap();
         assert_eq!(t.tmux, dir.path().join("tmux"));
+        assert_eq!(t.hecaton, PathBuf::from("/opt/hecaton"));
     }
 
     #[test]

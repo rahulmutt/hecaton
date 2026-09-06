@@ -54,8 +54,15 @@ impl StateLayout {
     pub fn system_mise_toml(&self) -> PathBuf {
         self.config_root.join("mise.toml")
     }
+    /// `server/`: token, vault key, endpoint, pid, log (Phase 3 spec §3.3, §5).
+    pub fn server_dir(&self) -> PathBuf {
+        self.state_root.join("server")
+    }
+    pub fn fleets_dir(&self) -> PathBuf {
+        self.state_root.join("fleets")
+    }
     pub fn fleet_dir(&self, f: &FleetName) -> PathBuf {
-        self.state_root.join("fleets").join(f.as_str())
+        self.fleets_dir().join(f.as_str())
     }
     pub fn fleet_gh_dir(&self, f: &FleetName) -> PathBuf {
         self.fleet_dir(f).join("gh")
@@ -175,6 +182,14 @@ mod tests {
         assert_eq!(
             l.mise_data_dir(),
             PathBuf::from("/h/.local/share/hecaton/mise")
+        );
+        assert_eq!(
+            l.server_dir(),
+            PathBuf::from("/h/.local/state/hecaton/server")
+        );
+        assert_eq!(
+            l.fleets_dir(),
+            PathBuf::from("/h/.local/state/hecaton/fleets")
         );
     }
 }

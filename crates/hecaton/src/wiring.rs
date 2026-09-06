@@ -10,7 +10,8 @@ pub fn layout_from_env() -> Result<StateLayout> {
 
 pub fn tool_paths() -> Result<ToolPaths> {
     let path = std::env::var_os("PATH").unwrap_or_default();
-    ToolPaths::discover_in(&path).map_err(|e| {
+    let me = std::env::current_exe().context("cannot determine hecaton's own path")?;
+    ToolPaths::discover_in(&path, &me).map_err(|e| {
         anyhow::anyhow!("{e} (hecaton needs git, gh, mise, nono and tmux on PATH; see mise.toml)")
     })
 }
