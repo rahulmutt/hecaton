@@ -14,6 +14,7 @@ hecaton-api = { path = "crates/hecaton-api" }
 hecaton-core = { path = "crates/hecaton-core" }
 hecaton-config = { path = "crates/hecaton-config" }
 hecaton-runtime = { path = "crates/hecaton-runtime" }
+hecaton-server = { path = "crates/hecaton-server" }
 
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -24,6 +25,14 @@ clap = { version = "4.6.6", features = ["derive"] }
 sha2 = "0.11.0"
 hex = "0.4.3"
 toml = "1.1.5"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
+axum = "0.8.9"
+ureq = { version = "3.4.1", default-features = false, features = ["json"] }
+prometheus = "0.14.0"
+chacha20poly1305 = "0.11.0"
+rand = "0.10.2"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 # dev
 insta = { version = "1.48.0", features = ["yaml", "json"] }

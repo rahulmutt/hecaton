@@ -13,6 +13,31 @@ pub struct FleetRequest {
     pub credentials: CredentialBundle,
 }
 
+/// Query flags of `DELETE /v1/fleets/{name}` (spec D6). Every flag is sent
+/// as `key=true|false`: axum's `Query` rejects a bare key.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DownQuery {
+    pub keep_repos: bool,
+    pub keep_sessions: bool,
+    pub purge: bool,
+}
+
+impl DownQuery {
+    pub fn to_query_string(&self) -> String {
+        format!(
+            "keep_repos={}&keep_sessions={}&purge={}",
+            self.keep_repos, self.keep_sessions, self.purge
+        )
+    }
+}
+
+/// Body of every non-2xx API response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorBody {
+    pub error: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -30,5 +55,23 @@ mod tests {
         let back: FleetRequest = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(back.spec, r.spec);
         assert_eq!(back.credentials.gh_token, None);
+    }
+
+    #[test]
+    fn down_query_defaults_to_false_and_renders_every_flag() {
+        let q: DownQuery = serde_json::from_value(serde_json::json!({ "purge": true })).unwrap();
+        assert!(q.purge && !q.keep_repos && !q.keep_sessions);
+        assert_eq!(
+            DownQuery {
+                keep_repos: true,
+                keep_sessions: false,
+                purge: false
+            }
+            .to_query_string(),
+            "keep_repos=true&keep_sessions=false&purge=false"
+        );
+        assert!(serde_json::from_value::<DownQuery>(serde_json::json!({ "x": 1 })).is_err());
+        let e: ErrorBody = serde_json::from_str(r#"{"error":"fleet exists"}"#).unwrap();
+        assert_eq!(e.error, "fleet exists");
     }
 }

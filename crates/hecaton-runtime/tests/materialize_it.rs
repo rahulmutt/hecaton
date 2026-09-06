@@ -50,6 +50,7 @@ fn fleet(repo_url: &str) -> Fleet {
                 git: GitSettings {
                     push: false,
                     auth: GitAuth::None,
+                    ..GitSettings::default()
                 },
                 agents: BTreeMap::from([("a".to_string(), s)]),
             },

@@ -39,6 +39,10 @@ pub struct GitSettings {
     pub push: bool,
     #[serde(default)]
     pub auth: GitAuth,
+    /// Commit identity written to the agent's `.gitconfig` (Phase 3 spec
+    /// §6.3). Absent → derived from the agent id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<GitIdentity>,
 }
 
 impl Default for GitSettings {
@@ -46,8 +50,17 @@ impl Default for GitSettings {
         Self {
             push: true,
             auth: GitAuth::default(),
+            identity: None,
         }
     }
+}
+
+/// `user.name` / `user.email` for commits made inside the sandbox.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitIdentity {
+    pub name: String,
+    pub email: String,
 }
 
 /// Where the crew's git credentials come from.
@@ -109,5 +122,34 @@ mod tests {
         };
         let back: FleetSpec = serde_json::from_str(&serde_json::to_string(&spec).unwrap()).unwrap();
         assert_eq!(back, spec);
+    }
+
+    #[test]
+    fn identity_is_optional_and_round_trips() {
+        let g: GitSettings =
+            serde_json::from_value(json!({ "push": true, "auth": "none" })).unwrap();
+        assert_eq!(g.identity, None);
+        let back = serde_json::to_value(&g).unwrap();
+        assert!(
+            back.get("identity").is_none(),
+            "absent identity is not serialized"
+        );
+        let g: GitSettings = serde_json::from_value(
+            json!({ "identity": { "name": "Alice Bot", "email": "alice@example.com" } }),
+        )
+        .unwrap();
+        assert_eq!(
+            g.identity,
+            Some(GitIdentity {
+                name: "Alice Bot".into(),
+                email: "alice@example.com".into()
+            })
+        );
+        assert!(
+            serde_json::from_value::<GitSettings>(
+                json!({ "identity": { "name": "x", "nope": 1 } })
+            )
+            .is_err()
+        );
     }
 }
