@@ -190,7 +190,8 @@ python = "3.12.8"
       "/etc",
       "<root>/data/mise",
       "<root>/state/fleets/payments/crews/backend/agents/alice/mise.toml",
-      "/tools/hecaton"
+      "/tools/hecaton",
+      "/tools/mise"
     ]
   },
   "meta": {
@@ -401,7 +402,8 @@ python = "3.12.8"
       "/etc",
       "<root>/data/mise",
       "<root>/state/fleets/payments/crews/backend/agents/bob/mise.toml",
-      "/tools/hecaton"
+      "/tools/hecaton",
+      "/tools/mise"
     ]
   },
   "meta": {

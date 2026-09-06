@@ -86,7 +86,13 @@ impl Runtime {
         );
         let profile = render_profile(
             id,
-            &hecaton_grants(&paths, &crew, &self.layout, &self.tools.hecaton),
+            &hecaton_grants(
+                &paths,
+                &crew,
+                &self.layout,
+                &self.tools.hecaton,
+                &self.tools.mise,
+            ),
             hooks_port(&hooks.url),
             &env,
             &agent.settings.sandbox,

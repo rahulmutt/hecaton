@@ -25,6 +25,7 @@ pub fn hecaton_grants(
     crew: &CrewPaths,
     layout: &StateLayout,
     hecaton: &Path,
+    mise: &Path,
 ) -> Grants {
     let mut read: Vec<PathBuf> = SYSTEM_READ.iter().map(PathBuf::from).collect();
     read.push(layout.mise_data_dir());
@@ -37,6 +38,14 @@ pub fn hecaton_grants(
     // (nono 0.75.0 validates and enforces a single-file `read` entry, and
     // `nono run` inside such a profile executes the granted binary).
     read.push(hecaton.to_path_buf());
+    // `launch.sh` execs `mise exec` inside the sandbox by the path
+    // `ToolPaths` discovered. Locally that is `/usr/local/bin/mise`, inside
+    // the `/usr` grant; on a GitHub runner mise-action installs it under
+    // `$HOME`, which nothing above grants, and every agent died with exit
+    // 127 (command not found). Grant the binary itself; the canonical path
+    // in case PATH found a symlink, since Landlock rules bind to the file
+    // the path resolves to.
+    read.push(std::fs::canonicalize(mise).unwrap_or_else(|_| mise.to_path_buf()));
     Grants {
         read,
         allow: vec![
@@ -255,7 +264,13 @@ mod tests {
         let id: AgentId = "f/c/a".parse().unwrap();
         let paths = layout.agent(&id);
         let crew = layout.crew(&id.crew_ref());
-        let grants = hecaton_grants(&paths, &crew, &layout, Path::new("/opt/hecaton"));
+        let grants = hecaton_grants(
+            &paths,
+            &crew,
+            &layout,
+            Path::new("/opt/hecaton"),
+            Path::new("/opt/mise"),
+        );
         (
             id,
             grants,
@@ -275,6 +290,11 @@ mod tests {
             "/h/.local/state/hecaton/fleets/f/crews/c/agents/a/mise.toml"
         );
         assert_eq!(p["filesystem"]["read"][7], "/opt/hecaton");
+        assert_eq!(
+            p["filesystem"]["read"][8], "/opt/mise",
+            "mise may live outside /usr (CI installs it under $HOME)"
+        );
+        assert_eq!(p["filesystem"]["read"].as_array().unwrap().len(), 9);
         assert_eq!(
             p["filesystem"]["allow"][2],
             "/h/.local/state/hecaton/fleets/f/crews/c/repo/.git"

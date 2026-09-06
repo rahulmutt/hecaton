@@ -50,6 +50,11 @@ credentials, hook input, or sandbox rules.
   changes what agents get.
 - nono's state root follows nono's own `$HOME`; never point that at the agent's
   `home/` (see ARCHITECTURE.md).
+- The sandbox grants read on exactly two binaries outside `/usr`, `/bin`,
+  `/lib`: this `hecaton` (the relay) and the discovered `mise` (`launch.sh`
+  execs it). GitHub's mise-action installs `mise` under `$HOME`, so without
+  that grant every agent in CI died with exit 127 while local runs, where
+  `mise` sits in `/usr/local/bin`, were fine.
 - Never put the daemon port in the profile's `network.connect_port`: on
   Landlock that list is an outbound allowlist and the agent loses DNS and the
   API. The daemon port is an `open_port` (localhost only), and claude's temp

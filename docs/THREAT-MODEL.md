@@ -42,7 +42,7 @@ phases; the rest exist in code today.
 - **Multi-tenant use** — one user per daemon in this iteration.
 - **The per-agent hook secret is readable by its own agent** — it sits in the agent's settings.json; it authenticates only that agent's events.
 - **No TLS on loopback** — an unprivileged local process cannot read loopback traffic; TLS arrives with the remote control plane (Phase 3 spec P3-1).
-- **The hecaton binary is readable inside the sandbox** (it is the `SessionStart` relay); the admin token and the state root are not granted, so an agent cannot drive the fleet API. `hook-relay` lets an agent post events as itself, which it could already do over HTTP.
+- **The hecaton and mise binaries are readable inside the sandbox** (`mise exec` is the launcher; mise-action puts `mise` under `$HOME` on CI runners) (it is the `SessionStart` relay); the admin token and the state root are not granted, so an agent cannot drive the fleet API. `hook-relay` lets an agent post events as itself, which it could already do over HTTP.
 
 ## Mitigations
 | Threat | Control | Where |

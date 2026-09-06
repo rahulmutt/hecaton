@@ -40,7 +40,7 @@ fn generated_profile_validates_and_enforces_isolation() {
     );
     let profile = render_profile(
         &id,
-        &hecaton_grants(&paths, &crew, &layout, &tools.hecaton),
+        &hecaton_grants(&paths, &crew, &layout, &tools.hecaton, &tools.mise),
         7643,
         &env,
         &serde_json::json!({}),
