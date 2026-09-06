@@ -14,15 +14,19 @@ path = "src/main.rs"
 [dependencies]
 hecaton-api = { workspace = true }
 hecaton-config = { workspace = true }
+hecaton-core = { workspace = true }
+hecaton-runtime = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
 serde_norway = { workspace = true }
+tempfile = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
-tempfile = { workspace = true }
 
 [lints]
 workspace = true

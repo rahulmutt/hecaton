@@ -2,12 +2,13 @@
 
 mod cli;
 mod commands;
+mod wiring;
 
 use std::process::ExitCode;
 
 use clap::Parser;
 
-use cli::{Cli, Command, ConfigCommand};
+use cli::{Cli, Command, ConfigCommand, DevCommand};
 
 fn main() -> ExitCode {
     match run() {
@@ -28,5 +29,8 @@ fn run() -> anyhow::Result<String> {
         Command::Config {
             command: ConfigCommand::Resolve(args),
         } => commands::config::resolve_command(&args),
+        Command::Dev {
+            command: DevCommand::Materialize(args),
+        } => commands::dev::materialize_command(&args),
     }
 }

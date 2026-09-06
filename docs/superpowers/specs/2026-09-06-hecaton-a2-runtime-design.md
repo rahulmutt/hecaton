@@ -65,6 +65,12 @@ pub struct Timestamp(/* seconds since epoch, u64 */);
 `SpecHash` is stable under JSON key reordering (canonical form = `serde_json`
 with `BTreeMap`s, which every wire type already uses). `ResolvedAgent::from_fleet(&Fleet) -> Vec<ResolvedAgent>` is the only way the runtime reaches the fleet.
 
+Addendum (Task 18): `Timestamp` and `SpecHash` are defined in
+`hecaton-api::status` and re-exported at the `hecaton-api` crate root;
+`hecaton-core` uses them from `hecaton_api` (`hecaton-runtime` depends on
+`hecaton-api` too but does not yet reference either type directly — that
+arrives with Phase 3's `Clock` adapter).
+
 ### 2.2 Ports
 
 ```rust
@@ -74,7 +80,7 @@ pub trait Materializer: Send + Sync {
     fn materialize(&self, agent: &ResolvedAgent, creds: &CredentialBundle,
                    hooks: &HookTarget) -> Result<LaunchPlan, MaterializeError>;
     fn remove_agent(&self, agent: &AgentId) -> Result<(), MaterializeError>;
-    fn remove_crew(&self, crew: &CrewRef, keep_repo: bool) -> Result<(), MaterializeError>;
+    fn remove_crew(&self, crew: &CrewRef, keep: Keep) -> Result<(), MaterializeError>; // Task 18: keep_repo: bool became Keep { repos, sessions }
 }
 
 pub trait AgentRunner: Send + Sync {
@@ -148,23 +154,33 @@ only stops and removals and `Terminating` is the fleet phase.
 ### 3.2 Plan and steps
 
 `Plan` is `Vec<Step>` in this fixed order: `Stop*`, `RemoveAgent*`,
-`RemoveCrew*`, `EnsureCrew*`, then per agent `Materialize`, `Start`; `MarkDead*`
+`RemoveCrew*`, `EnsureCrew*`, then per agent `Materialize`, `Start`; `NoteExit*`
 last. Within each group, alphabetical by id. Tests compare plans with `==`.
 
 | Step | Emitted when |
 |---|---|
 | `Stop(agent)` | agent observed running and (not desired, or `applied_hash != desired_hash`) |
 | `RemoveAgent(agent)` | agent recorded or observed, not desired |
-| `RemoveCrew(crew, keep_repo)` | crew recorded or observed, not desired |
+| `RemoveCrew(crew, keep)` | crew recorded or observed, not desired — with the caller's `keep`, whether or not the fleet is still desired |
 | `EnsureCrew(crew)` | crew desired |
 | `Materialize(agent)` + `Start(agent, hash)` | agent desired and one of: no window observed; `applied_hash != desired_hash`; `Exited` with `restarts < max_restarts` and `next_restart_at <= now` |
-| `MarkDead(agent)` | `Exited` and `restarts >= max_restarts` and phase not already `Dead` |
+| `NoteExit(agent, code)` | agent observed `Exited`, not yet noted (`next_restart_at.is_none()`) |
+
+Addendum (Task 18): the row that was `MarkDead(agent)` in this draft became
+`NoteExit(agent, code)` — emitted when the window is observed `Exited` (a
+`ProcessState`), the agent is not `Dead`, and `next_restart_at` is `None`;
+`apply` records the exit (`restarts += 1`, `next_restart_at = now + backoff`)
+and moves the agent to `Dead` when `restarts > max_restarts`; otherwise the
+agent's phase is unchanged until the restart is due.
 
 Every step carries the ids it needs and nothing else; `Start` carries the
 `SpecHash` so `apply` can record `applied_hash` without recomputing it.
 
-A fleet that is `Ready` and unchanged yields an empty plan. This is the
-central invariant.
+A fleet that is `Ready` and unchanged yields only `EnsureCrew` steps (one per
+desired crew), nothing else. This is the central invariant; making
+`ensure_crew` a cheap no-op on such a pass (fetch only before creating a
+branch; skip `mise install` when the table is unchanged and nothing is
+missing) is the first Phase 3 runtime item.
 
 ### 3.3 Executor
 
@@ -213,6 +229,9 @@ at the end of a pass in which every step succeeded.
 settable `ObservedState`, and can be told to fail the next call of a named
 method for a named id. `FakeClock` is a `Cell<Timestamp>`.
 
+Implemented always-compiled (`hecaton_core::fakes`), not behind a feature:
+dependency-free and Phase 3's tests need them.
+
 ## 4. `hecaton-runtime`
 
 One module per step; each is a struct over `&StateLayout` and `&ToolPaths`.
@@ -251,7 +270,7 @@ $XDG_STATE_HOME/hecaton/fleets/<fleet>/
 ### 4.2 Steps, in the order `materialize` runs them
 
 **1. Workspace** (`ensure_crew` does the clone; `materialize` does the worktree)
-- `repo/` absent → `git clone --no-checkout <url> repo`; present → `git -C repo fetch origin <ref>`.
+- `repo/` absent → `git clone --no-checkout <url> repo`; present → `git -C repo fetch origin` (all remote-tracking refs, which includes `origin/<ref>`).
 - `workspace/` registered in `git worktree list --porcelain` → nothing. Else
   `git worktree prune`, then: branch exists → `git worktree add workspace <branch>`;
   else `git worktree add -b <branch> workspace origin/<ref>` (P2-6).
@@ -277,6 +296,10 @@ $XDG_STATE_HOME/hecaton/fleets/<fleet>/
   onboarding complete. The exact seed keys are verified at implementation.
 - `.config/gh/hosts.yml` ← `creds.gh_token` (0600) when `git.auth: gh`.
 - All files written via tmp + rename and rewritten every pass.
+- Modes: `settings.json` (it carries the hook bearer secret),
+  `.credentials.json`, `.claude.json`, `hosts.yml` and `nono-profile.json`
+  are `0600`; the agent directory, `home/` (with `home/.claude/`) and `logs/`
+  are `0700`; `launch.sh` is `0755`.
 
 **3. Toolchain**
 - `agents/<agent>/mise.toml` `[tools]` = system table (P2-8) ⊕ `settings.tools`
@@ -286,7 +309,9 @@ $XDG_STATE_HOME/hecaton/fleets/<fleet>/
   `MISE_GLOBAL_CONFIG_FILE=<file> MISE_DATA_DIR=<shared> MISE_CONFIG_DIR=home/.config/mise
   MISE_STATE_DIR=home/.local/state/mise MISE_CACHE_DIR=home/.cache/mise`, run
   unsandboxed by the daemon. Skipped when the file is byte-identical to the
-  previous pass and every tool is already installed (`mise ls --missing` empty).
+  previous pass and every tool is already installed (`mise ls --missing` empty)
+  (deferred to Phase 3; Phase 2 runs `mise install` every pass, an offline
+  no-op when nothing is missing).
 
 **4. SandboxProfile** → `nono-profile.json`
 ```json
@@ -347,7 +372,15 @@ All commands are `tmux -L <socket> …` via argv arrays.
 | `send_text` | `send-keys -t … -l <text>` then, if `submit`, `send-keys -t … Enter` |
 
 Session names contain `/`; verified working on tmux 3.7c. The `=` prefix
-forces exact-match targeting.
+forces exact-match targeting. `hecaton` is a reserved agent name (the anchor
+window); `Fleet::try_from` rejects it.
+
+Addendum (Task 18, refined in Task 16): `ensure_agent` on a fresh window
+actually creates a placeholder window, sets `remain-on-exit`, attaches
+`pipe-pane`, and only then `respawn-window`s into the real script — attaching
+`pipe-pane` after `new-window` loses the script's first output — and
+`send_text`/`ensure_agent` pass `--` before the text/command in every
+`send-keys` call.
 
 ### 4.4 Verified at implementation time
 
@@ -356,10 +389,10 @@ and its fallback.
 
 | Assumption | Fallback |
 |---|---|
-| `CLAUDE_CONFIG_DIR` and `GH_CONFIG_DIR` relocate all state (nothing lands in nono's `$HOME`) | add explicit grants / `set_vars` for what escapes |
-| `mise exec` under `MISE_GLOBAL_CONFIG_FILE` + read-only `MISE_DATA_DIR` resolves without writing there | pin with `MISE_CONFIG_FILE`; grant the specific subdirs mise insists on |
-| `gh auth git-credential` works from a `hosts.yml` holding only `oauth_token` and `git_protocol: https` | resolve `user:` with `gh api user` during `ensure_crew`, or require it in the credential bundle |
-| the `.claude.json` seed keys that suppress first-run prompts | discover by diffing a fresh Claude run; keep the seed in one constant |
+| `CLAUDE_CONFIG_DIR` and `GH_CONFIG_DIR` relocate all state (nothing lands in nono's `$HOME`) | add explicit grants / `set_vars` for what escapes. Verdict (Task 18): partial — hecaton's own files land under `home/` (settings.json, .credentials.json, hosts.yml verified by home.rs tests and generated_golden); nono's `$HOME` (`agents/<a>/nono`, per `sandbox_it::generated_profile_validates_and_enforces_isolation`) held only nono's own bookkeeping — `.config/nono/{profiles,profile-drafts}` and `.local/state/nono/{sessions,audit}` — no Claude or gh state, since that test never runs `claude`/`gh` inside the sandbox; relocation under a live `claude` run is verified in Phase 3's e2e. |
+| `mise exec` under `MISE_GLOBAL_CONFIG_FILE` + read-only `MISE_DATA_DIR` resolves without writing there | pin with `MISE_CONFIG_FILE`; grant the specific subdirs mise insists on. Verdict (Task 11): holds — `toolchain_it::installs_nothing_when_seeded_and_exec_resolves_read_only` seeds `MISE_DATA_DIR` with the host's `gh@2.100.0` install, chmods the whole data dir `a-w`, then runs `mise exec -- gh --version` with `MISE_GLOBAL_CONFIG_FILE`/`MISE_DATA_DIR`/`MISE_CONFIG_DIR`/`MISE_STATE_DIR`/`MISE_CACHE_DIR` all pointed outside it; it resolves and prints the pinned version with no write attempted against the read-only tree. |
+| `gh auth git-credential` works from a `hosts.yml` holding only `oauth_token` and `git_protocol: https` | resolve `user:` with `gh api user` during `ensure_crew`, or require it in the credential bundle. Verdict (Task 14): holds — `oauth_token` + `git_protocol` suffice: with only those two keys in `hosts.yml`, `GH_CONFIG_DIR=… gh auth git-credential get` (given `protocol=https`/`host=github.com` on stdin) printed `username=…` and `password=…`. |
+| the `.claude.json` seed keys that suppress first-run prompts | discover by diffing a fresh Claude run; keep the seed in one constant. Verdict (Task 18): seed is the single constant in `crates/hecaton-runtime/src/home.rs` (`hasCompletedOnboarding: true`, overlaid by `claude_account`); unverified against a fresh Claude run until Phase 3's e2e, and written to both `home/.claude.json` and `home/.claude/.claude.json` because Claude Code reads `$CLAUDE_CONFIG_DIR/.claude.json` when the variable is set; Phase 3's e2e removes the unused copy. |
 
 Already verified (2026-09-05, this machine, nono 0.75.0, tmux 3.7c):
 `environment.deny_vars/set_vars` relocate `HOME` and pass `PATH`; Landlock
@@ -447,7 +480,13 @@ for §4 environment, §6 worktree and pipeline changes, and §3 ports.
 | §4: nono profile lists only explicit paths | built-in groups kept (P2-7) | ordinary tooling needs them |
 | §4: `mise.toml` "hecaton's system tools inherited by every agent" | agents inherit only `claude` (and `gh` when needed); `git`/`tmux`/`nono` are daemon tools | agents never run them |
 
-## 9. Done when
+## 9. Deliberately deferred
+
+- In-sandbox `git push` needs a credential helper: `home/.gitconfig` with
+  `[credential "https://github.com"] helper = !gh auth git-credential` (or
+  `gh auth setup-git` at materialize time). Phase 3.
+
+## 10. Done when
 
 - `mise run check` passes with the new crate, including integration tests, on
   a fresh clone here and in CI.

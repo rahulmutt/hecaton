@@ -11,6 +11,8 @@ a repository.
 3. `mise run check` — lint + tests; the same gate CI runs.
 4. `mise x -- cargo run -q -p hecaton -- config resolve examples/payments.yaml --no-host-defaults`
    — resolves the example fleet and prints every agent's merged settings.
+5. `mise x -- cargo run -q -p hecaton -- dev materialize examples/payments.yaml backend/bob --no-host-defaults`
+   — renders bob's settings.json, mise.toml, nono-profile.json and launch.sh into a temp dir.
 
 ## Where to look
 - `ARCHITECTURE.md` — the map: pieces, flow, non-obvious decisions.
@@ -19,5 +21,6 @@ a repository.
 - `docs/THREAT-MODEL.md` — what is protected, from whom, and what is out of scope.
 
 ## Status
-Phase 1 (configuration) is complete. The daemon, tmux runner and `up`/`down`
-are the next phases; see the spec's §11.
+Phases 1 (configuration) and 2 (runtime: materialization, tmux runner,
+reconciler) are complete. The daemon, hook ingress and `up`/`down` are Phase 3;
+see the spec's §11.

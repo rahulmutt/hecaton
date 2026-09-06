@@ -3,6 +3,7 @@
 //! is passed to git verbatim.
 
 use std::fmt;
+use std::path::PathBuf;
 
 /// Why a string is not a repository reference.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -15,8 +16,13 @@ pub struct RepoError {
 /// Where a crew's code lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepoRef {
-    GitHub { owner: String, name: String },
+    GitHub {
+        owner: String,
+        name: String,
+    },
     Url(String),
+    /// A local repository reached through a file:// URL (tests, offline use).
+    Local(PathBuf),
 }
 
 impl RepoRef {
@@ -39,6 +45,12 @@ impl RepoRef {
             let rest = rest.strip_suffix(".git").unwrap_or(rest);
             return parse_slug(rest).ok_or_else(|| err("expected owner/name or a clone URL"));
         }
+        if let Some(rest) = s.strip_prefix("file://") {
+            if !rest.starts_with('/') {
+                return Err(err("file:// repos must be absolute paths"));
+            }
+            return Ok(Self::Local(PathBuf::from(rest)));
+        }
         if s.contains("://") || (s.contains('@') && s.contains(':')) {
             return Ok(Self::Url(s.to_string()));
         }
@@ -51,6 +63,7 @@ impl RepoRef {
         match self {
             Self::GitHub { owner, name } => format!("https://github.com/{owner}/{name}.git"),
             Self::Url(u) => u.clone(),
+            Self::Local(p) => format!("file://{}", p.display()),
         }
     }
 
@@ -58,7 +71,7 @@ impl RepoRef {
     pub fn github_slug(&self) -> Option<String> {
         match self {
             Self::GitHub { owner, name } => Some(format!("{owner}/{name}")),
-            Self::Url(_) => None,
+            Self::Url(_) | Self::Local(_) => None,
         }
     }
 }
@@ -88,6 +101,7 @@ fn parse_slug(s: &str) -> Option<RepoRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn parses_github_shorthand_and_urls_to_the_same_ref() {
@@ -153,5 +167,19 @@ mod tests {
             assert_eq!(err.value, bad);
             assert_eq!(err.reason, reason, "for {bad:?}");
         }
+    }
+
+    #[test]
+    fn file_urls_parse_to_local_and_round_trip() {
+        let r = RepoRef::parse("file:///srv/git/api.git").unwrap();
+        assert_eq!(r, RepoRef::Local(PathBuf::from("/srv/git/api.git")));
+        assert_eq!(r.clone_url(), "file:///srv/git/api.git");
+        assert_eq!(r.github_slug(), None);
+    }
+
+    #[test]
+    fn relative_file_urls_are_rejected() {
+        let err = RepoRef::parse("file://relative/path").unwrap_err();
+        assert_eq!(err.reason, "file:// repos must be absolute paths");
     }
 }

@@ -7,12 +7,17 @@ credentials, hook input, or sandbox rules.
 
 ## Tasks (`mise run <task>`)
 - `check` — lint + test; run before every commit.
+- `test-it` — the `hecaton-runtime` integration tests against real
+  git/mise/nono/tmux, with `HECATON_REQUIRE_TOOLS=1` so a missing tool fails
+  instead of skipping.
+- `mutants` — nightly tier: mutation-tests `hecaton-core` (the reconciler).
 - `lint`, `test`, `fmt`, `precommit`, `audit` — defined in `mise.toml`.
 
 ## Conventions
-- Ports (`AgentRunner`, `FleetStore`, `EventHandler`) will live in (Phase 2)
-  `hecaton-core`; adapter crates implement them and never depend on each
-  other. Only the `hecaton` binary wires adapters to ports.
+- Ports (`Materializer`, `AgentRunner`, `Clock`; later `FleetStore`,
+  `EventHandler`) live in `hecaton-core`; adapter crates implement them and
+  never depend on each other. Only the `hecaton` binary wires adapters to
+  ports.
 - Library crates return `thiserror` errors whose messages start with the config
   path (`crews.backend.agents.bob.tools.node: …`); only the binary uses `anyhow`.
 - Every tool version — `mise.toml` and fleet `tools:` — is exact.
@@ -30,3 +35,18 @@ credentials, hook input, or sandbox rules.
 - Edition 2024 makes `std::env::set_var` unsafe and the workspace forbids
   `unsafe`; inject environment through parameters (see `HostPaths::from_env`).
 - The merge is a left fold — don't "fix" its non-associativity.
+- `hecaton-runtime` integration tests skip with a printed reason when a tool or
+  Landlock is missing; `mise run test-it` (and CI) sets `HECATON_REQUIRE_TOOLS=1`
+  so they fail instead. Their temp roots live under `target/tmp`, never `/tmp`
+  (nono grants `/tmp` by default, which would make escape assertions vacuous).
+- The embedded default tool table is `include_str!("../../../mise.toml")` in
+  `hecaton-runtime/src/toolchain.rs`; bumping `claude` or `gh` in `mise.toml`
+  changes what agents get.
+- nono's state root follows nono's own `$HOME`; never point that at the agent's
+  `home/` (see ARCHITECTURE.md).
+- `Workspace::git` (`crates/hecaton-runtime/src/workspace.rs`) scrubs
+  `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_PREFIX`/`GIT_COMMON_DIR` from
+  every git call via `Cmd::env_remove`, and the integration-test `git`
+  fixtures do the same — the pre-commit hook exports them, and a git
+  subprocess that inherits them operates on this repository instead of the
+  test's.

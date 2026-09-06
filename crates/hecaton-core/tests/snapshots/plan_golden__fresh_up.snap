@@ -1,0 +1,9 @@
+---
+source: crates/hecaton-core/tests/plan_golden.rs
+expression: "go(Some(&f), Keep::default(), &FleetStatus::default(),\n&ObservedState::default())"
+---
+ensure-crew payments/backend
+materialize payments/backend/alice
+start payments/backend/alice 4946b12f
+materialize payments/backend/bob
+start payments/backend/bob 1f4c366e
