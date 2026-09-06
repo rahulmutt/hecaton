@@ -1,9 +1,4 @@
 //! Atomic file writes with explicit modes.
-//!
-//! Consumed by the materialization steps added in Tasks 10-16; until then
-//! these functions are only exercised by this module's own tests, so the
-//! plain (non-test) build sees them as dead code.
-#![allow(dead_code)]
 
 use std::fs;
 use std::fs::OpenOptions;
