@@ -22,7 +22,8 @@ pub(crate) fn ensure_dir(path: &Path) -> io::Result<()> {
 /// mode is fixed up after the fact. `set_permissions` is still applied
 /// afterwards: `mode()` only governs permissions at creation time, and an
 /// umask can only remove bits, so a restrictive umask (e.g. `0o077`) could
-/// otherwise leave the file narrower than the caller asked for.
+/// otherwise leave the file narrower than the caller asked for. A stale
+/// temp file from a crashed run is removed first.
 pub(crate) fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
     let dir = path
         .parent()
@@ -33,6 +34,7 @@ pub(crate) fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> io::Resul
         .ok_or_else(|| io::Error::other("path has no file name"))?
         .to_string_lossy();
     let tmp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
+    let _ = fs::remove_file(&tmp);
     let mut f = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -70,5 +72,16 @@ mod tests {
             1,
             "no temp file left"
         );
+    }
+
+    #[test]
+    fn removes_a_stale_temp_file_from_a_crashed_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f");
+        let tmp = dir.path().join(format!(".f.tmp-{}", std::process::id()));
+        fs::write(&tmp, b"junk from a crashed run").unwrap();
+        write_atomic(&p, b"fresh", 0o600).unwrap();
+        assert_eq!(fs::read_to_string(&p).unwrap(), "fresh");
+        assert!(!tmp.exists(), "stale temp file should be gone");
     }
 }
