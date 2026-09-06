@@ -1,6 +1,7 @@
 //! Domain model and ports (spec §3). No I/O lives here.
 
 pub mod agent;
+pub mod fakes;
 pub mod fleet;
 pub mod name;
 pub mod ports;
