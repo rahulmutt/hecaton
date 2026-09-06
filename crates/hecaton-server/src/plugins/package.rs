@@ -56,11 +56,22 @@ fn relative_inside(path: &Path) -> bool {
             .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }
 
-/// Unpacks a `.tar.gz` into `dest` (created; must not exist). Rejects
-/// absolute paths, `..`, links and special files; files end up 0444 (0555
-/// when executable), directories 0755. On any error `dest` is removed.
+/// Unpacks a `.tar.gz` into `dest`, which this creates and which must not
+/// already exist. Rejects absolute paths, `..`, links and special files;
+/// files end up 0444 (0555 when executable), directories 0755. On any
+/// error `dest` is removed again — and only ever `dest` as created here,
+/// never a directory the caller already had.
 pub fn unpack(tarball: &[u8], dest: &Path) -> Result<(), PluginError> {
-    let result = unpack_inner(tarball, dest);
+    if let Some(parent) = dest.parent() {
+        ensure_dir(parent)?;
+    }
+    // `create_dir` is the existence check: it fails for a `dest` of any
+    // kind that is already there, so the cleanup below can only ever
+    // remove the tree this call unpacked.
+    std::fs::create_dir(dest).map_err(|e| PluginError::io(dest, e))?;
+    let result = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| PluginError::io(dest, e))
+        .and_then(|()| unpack_inner(tarball, dest));
     if result.is_err() {
         let _ = std::fs::remove_dir_all(dest);
     }
@@ -91,7 +102,6 @@ fn ensure_dir(path: &Path) -> Result<(), PluginError> {
 
 fn unpack_inner(tarball: &[u8], dest: &Path) -> Result<(), PluginError> {
     let bad = PluginError::Package;
-    ensure_dir(dest)?;
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(tarball));
     for entry in archive.entries().map_err(|e| bad(e.to_string()))? {
         let mut entry = entry.map_err(|e| bad(e.to_string()))?;
@@ -229,19 +239,50 @@ pub fn install(
             got: digest,
         });
     }
-    let dest = install_root.join(name).join(digest_prefix(&digest));
+    let dir = install_root.join(name);
+    let dest = dir.join(digest_prefix(&digest));
     if dest.is_dir() {
         return Ok((dest, Some(digest)));
     }
-    let tmp = install_root.join(name).join(format!(
-        ".tmp-{}-{}",
-        digest_prefix(&digest),
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let prefix = format!(".tmp-{}-", digest_prefix(&digest));
+    reclaim_temps(&dir, &prefix);
+    let tmp = dir.join(format!("{prefix}{}", std::process::id()));
     unpack(&bytes, &tmp)?;
-    std::fs::rename(&tmp, &dest).map_err(|e| PluginError::io(&dest, e))?;
+    commit_unpacked(&tmp, &dest)?;
     Ok((dest, Some(digest)))
+}
+
+/// Removes temp trees for this digest left under `<install_root>/<name>/`.
+/// The daemon serialises plugin installs through one actor, so a sibling
+/// temp tree is by construction the debris of a crashed run, whatever pid
+/// wrote it; a second daemon over one state root is not supported.
+fn reclaim_temps(dir: &Path, prefix: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        if e.file_name().to_string_lossy().starts_with(prefix) {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+/// Moves a freshly unpacked `tmp` into place. Another install that won the
+/// race has already put exactly these bytes at `dest` — the digest is the
+/// name — so a rename that fails onto an existing `dest` is a reuse, not a
+/// failure. `tmp` is removed either way.
+fn commit_unpacked(tmp: &Path, dest: &Path) -> Result<(), PluginError> {
+    match std::fs::rename(tmp, dest) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(tmp);
+            if dest.is_dir() {
+                Ok(())
+            } else {
+                Err(PluginError::io(dest, e))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -401,6 +442,102 @@ mod tests {
     }
 
     #[test]
+    fn unpack_refuses_a_destination_that_already_exists() {
+        let src = package_dir();
+        let out = tempfile::tempdir().unwrap();
+        let tarball = out.path().join("p.tar.gz");
+        create(src.path(), &tarball).unwrap();
+        let bytes = std::fs::read(&tarball).unwrap();
+
+        let dest = out.path().join("dest");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("keep.txt"), "keep\n").unwrap();
+        let e = unpack(&bytes, &dest).unwrap_err().to_string();
+        assert!(e.starts_with(&format!("{}: ", dest.display())), "{e}");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("keep.txt")).unwrap(),
+            "keep\n",
+            "the caller's directory is neither extracted into nor deleted"
+        );
+        assert!(!dest.join("mise.toml").exists());
+
+        // a plain file in the way is refused the same way
+        let file = out.path().join("file");
+        std::fs::write(&file, "x").unwrap();
+        assert!(unpack(&bytes, &file).is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "x");
+    }
+
+    #[test]
+    fn a_lost_rename_race_reuses_the_winners_directory() {
+        let out = tempfile::tempdir().unwrap();
+        let tmp = out.path().join(".tmp-abcdef012345-1");
+        std::fs::create_dir(&tmp).unwrap();
+        std::fs::write(tmp.join("mine.txt"), "mine\n").unwrap();
+        let dest = out.path().join("abcdef012345");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("theirs.txt"), "theirs\n").unwrap();
+
+        commit_unpacked(&tmp, &dest).unwrap();
+        assert!(!tmp.exists(), "the loser's temp tree is removed");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("theirs.txt")).unwrap(),
+            "theirs\n",
+            "the winner's tree is left alone"
+        );
+
+        // a rename that fails with no destination at all is still an error
+        let tmp = out.path().join(".tmp-fedcba543210-1");
+        std::fs::create_dir(&tmp).unwrap();
+        let missing = out.path().join("no/such/parent/fedcba543210");
+        let e = commit_unpacked(&tmp, &missing).unwrap_err().to_string();
+        assert!(e.starts_with(&format!("{}: ", missing.display())), "{e}");
+        assert!(!tmp.exists(), "the temp tree is removed on any failure");
+    }
+
+    #[test]
+    fn install_leaves_no_temp_tree_behind_and_reclaims_a_stale_one() {
+        let src = package_dir();
+        let out = tempfile::tempdir().unwrap();
+        let root = out.path().join("install");
+
+        // digest-matching bytes that are not a tarball: unpack fails late,
+        // after the temp tree exists
+        let corrupt = out.path().join("bad.tar.gz");
+        std::fs::write(&corrupt, b"not a tarball").unwrap();
+        let bad = sha256_hex(b"not a tarball");
+        let e = install("p", &Source::Tarball(corrupt), Some(&bad), &root).unwrap_err();
+        assert!(matches!(e, PluginError::Package(_)), "{e}");
+        assert_eq!(
+            std::fs::read_dir(root.join("p")).unwrap().count(),
+            0,
+            "a failed unpack leaves no temp tree"
+        );
+
+        // debris of a crashed earlier install, under someone else's pid
+        let tarball = out.path().join("p.tar.gz");
+        let digest = create(src.path(), &tarball).unwrap();
+        let stale = root
+            .join("p")
+            .join(format!(".tmp-{}-1", digest_prefix(&digest)));
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("junk"), "junk").unwrap();
+
+        let (dir, _) = install("p", &Source::Tarball(tarball), Some(&digest), &root).unwrap();
+        assert!(dir.join("mise.toml").exists());
+        let mut left: Vec<_> = std::fs::read_dir(root.join("p"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![std::ffi::OsString::from(digest_prefix(&digest))],
+            "the stale temp tree is reclaimed"
+        );
+    }
+
+    #[test]
     fn install_verifies_digests_and_reuses_an_existing_unpack() {
         let src = package_dir();
         let out = tempfile::tempdir().unwrap();
@@ -427,7 +564,7 @@ mod tests {
         assert_eq!(
             std::fs::read_dir(root.join("p")).unwrap().count(),
             1,
-            "no temp dir left"
+            "the digest is checked before anything is created"
         );
         let (d, none) = install(
             "p",
