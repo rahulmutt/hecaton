@@ -181,12 +181,13 @@ impl Materializer for Runtime {
             let agents_dir = paths.root.join("agents");
             if let Ok(entries) = std::fs::read_dir(&agents_dir) {
                 for e in entries.flatten() {
+                    let agent_id = format!("{id}/{}", e.file_name().to_string_lossy());
                     Workspace {
                         tools: &self.tools,
                         gh_config_dir: None,
                     }
                     .remove_worktree(
-                        &id,
+                        &agent_id,
                         &paths,
                         &e.path().join("workspace"),
                     )?;

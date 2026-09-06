@@ -9,8 +9,8 @@ use hecaton_api::{AgentSettings, CredentialBundle, CrewSpec, FleetSpec, GitAuth,
 use hecaton_core::{Fleet, HookTarget, Keep, Materializer, ResolvedAgent};
 use hecaton_runtime::{Runtime, embedded_system_tools};
 
-fn git(dir: &Path, args: &[&str]) {
-    let st = Command::new("git")
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
         .args(args)
         .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "t")
@@ -26,9 +26,14 @@ fn git(dir: &Path, args: &[&str]) {
         .env_remove("GIT_INDEX_FILE")
         .env_remove("GIT_PREFIX")
         .env_remove("GIT_COMMON_DIR")
-        .status()
+        .output()
         .unwrap();
-    assert!(st.success());
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 fn fleet(repo_url: &str) -> Fleet {
@@ -136,8 +141,10 @@ fn materialize_then_remove_round_trip() {
         .unwrap();
     rt.materialize(&agent, &creds, &hooks).unwrap();
 
-    rt.remove_agent(&agent.id).unwrap();
-    assert!(!paths.root.exists());
+    // Exercise remove_crew's per-agent worktree-removal loop while the
+    // agent's worktree still exists: removing the agent first would empty
+    // `agents/` and this loop would never run.
+    let crew_paths = layout.crew(&crew);
     rt.remove_crew(
         &crew,
         Keep {
@@ -146,7 +153,17 @@ fn materialize_then_remove_round_trip() {
         },
     )
     .unwrap();
-    assert!(layout.crew(&crew).repo.exists());
+    assert!(!paths.root.exists());
+    assert!(crew_paths.repo.exists());
+    let worktrees = git(&crew_paths.repo, &["worktree", "list", "--porcelain"]);
+    assert!(
+        !worktrees
+            .lines()
+            .any(|l| l.strip_prefix("worktree ").map(Path::new) == Some(paths.workspace.as_path())),
+        "worktree still registered: {worktrees}"
+    );
+
+    rt.remove_agent(&agent.id).unwrap(); // already gone: must be a no-op
     rt.remove_crew(&crew, Keep::default()).unwrap();
     assert!(!layout.crew(&crew).root.exists());
 }
@@ -154,6 +171,7 @@ fn materialize_then_remove_round_trip() {
 #[test]
 fn gh_auth_without_a_token_is_a_clear_error() {
     let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git+mise+nono", false));
         return;
     };
     let root = support::temp_root("materialize-noauth");
