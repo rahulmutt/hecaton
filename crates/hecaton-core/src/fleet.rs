@@ -36,6 +36,8 @@ pub enum FleetError {
     EmptyRef { path: String },
     #[error("{path}: reserved name (tmux anchor window)")]
     ReservedAgentName { path: String },
+    #[error("{path}: must not be empty")]
+    EmptyIdentity { path: String },
 }
 
 /// The tmux anchor window that keeps a crew's session alive is named
@@ -73,6 +75,15 @@ fn convert_crew(path: &str, crew: CrewSpec) -> Result<Crew, FleetError> {
         return Err(FleetError::EmptyRef {
             path: format!("{path}.ref"),
         });
+    }
+    if let Some(identity) = &crew.git.identity {
+        for (field, value) in [("name", &identity.name), ("email", &identity.email)] {
+            if value.trim().is_empty() {
+                return Err(FleetError::EmptyIdentity {
+                    path: format!("{path}.git.identity.{field}"),
+                });
+            }
+        }
     }
     let mut agents = BTreeMap::new();
     for (agent_name, settings) in crew.agents {
@@ -237,6 +248,27 @@ mod tests {
         assert_eq!(
             back.crews["backend"].agents,
             original.crews["backend"].agents
+        );
+    }
+
+    #[test]
+    fn an_empty_identity_field_reports_its_path() {
+        let mut s = spec("f", "c", "acme/x", "main", &["a"]);
+        s.crews.get_mut("c").unwrap().git.identity = Some(hecaton_api::GitIdentity {
+            name: "".into(),
+            email: "a@b.c".into(),
+        });
+        assert_eq!(
+            Fleet::try_from(s.clone()).unwrap_err().to_string(),
+            "crews.c.git.identity.name: must not be empty"
+        );
+        s.crews.get_mut("c").unwrap().git.identity = Some(hecaton_api::GitIdentity {
+            name: "A".into(),
+            email: " ".into(),
+        });
+        assert_eq!(
+            Fleet::try_from(s).unwrap_err().to_string(),
+            "crews.c.git.identity.email: must not be empty"
         );
     }
 }

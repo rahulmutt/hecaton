@@ -93,7 +93,7 @@ pub fn agent_ready(status: &mut FleetStatus, agent: &AgentId, now: Timestamp) {
     a.next_restart_at = None;
     a.last_event_at = Some(now);
     a.message.clear();
-    let terminating = status.phase == FleetPhase::Terminating;
+    let terminating = matches!(status.phase, FleetPhase::Terminating | FleetPhase::Down);
     status.phase = derive_fleet_phase(status, terminating, true);
 }
 
@@ -110,7 +110,14 @@ pub fn finish_pass(status: &mut FleetStatus, terminating: bool, all_ok: bool) {
 
 fn derive_fleet_phase(status: &FleetStatus, terminating: bool, all_ok: bool) -> FleetPhase {
     if terminating {
-        return FleetPhase::Terminating;
+        // Down only once a terminating pass ran clean and nothing is left
+        // recorded; `agent_ready` (all_ok = true, agents non-empty) cannot
+        // get here.
+        return if all_ok && status.agents.is_empty() {
+            FleetPhase::Down
+        } else {
+            FleetPhase::Terminating
+        };
     }
     let phases = || status.agents.values().map(|a| a.phase);
     if !all_ok || phases().any(|p| p == AgentPhase::Dead) {
@@ -358,6 +365,15 @@ mod tests {
         finish_pass(&mut s, false, true);
         assert_eq!(s.phase, FleetPhase::Degraded);
         finish_pass(&mut s, true, true);
-        assert_eq!(s.phase, FleetPhase::Terminating);
+        assert_eq!(
+            s.phase,
+            FleetPhase::Terminating,
+            "agents still recorded: not done"
+        );
+        s.agents.clear();
+        finish_pass(&mut s, true, false);
+        assert_eq!(s.phase, FleetPhase::Terminating, "a failed step keeps it");
+        finish_pass(&mut s, true, true);
+        assert_eq!(s.phase, FleetPhase::Down);
     }
 }
