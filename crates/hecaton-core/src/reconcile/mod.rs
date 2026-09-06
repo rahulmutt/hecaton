@@ -1,7 +1,7 @@
 //! The reconciler (Phase 2 spec §3): `plan` decides, `execute` acts,
 //! `apply` folds each outcome into the status. Nothing here does I/O.
 
-// mod execute; // Task 7
+mod execute;
 mod status;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,7 +14,7 @@ use crate::fleet::Fleet;
 use crate::name::{AgentId, FleetName};
 use crate::ports::{Keep, ObservedState, ProcessState};
 
-// pub use execute::{ExecuteReport, ReconcileContext, execute, reconcile_pass}; // Task 7
+pub use execute::{ExecuteReport, ReconcileContext, execute, reconcile_pass};
 pub use status::{StepOutcome, agent_ready, apply, finish_pass, set_desired};
 
 /// Restart limits (spec §7 "bounded exponential backoff").
