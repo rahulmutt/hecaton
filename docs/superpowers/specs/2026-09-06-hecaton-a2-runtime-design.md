@@ -251,7 +251,7 @@ $XDG_STATE_HOME/hecaton/fleets/<fleet>/
 ### 4.2 Steps, in the order `materialize` runs them
 
 **1. Workspace** (`ensure_crew` does the clone; `materialize` does the worktree)
-- `repo/` absent → `git clone --no-checkout <url> repo`; present → `git -C repo fetch origin <ref>`.
+- `repo/` absent → `git clone --no-checkout <url> repo`; present → `git -C repo fetch origin` (all remote-tracking refs, which includes `origin/<ref>`).
 - `workspace/` registered in `git worktree list --porcelain` → nothing. Else
   `git worktree prune`, then: branch exists → `git worktree add workspace <branch>`;
   else `git worktree add -b <branch> workspace origin/<ref>` (P2-6).

@@ -45,6 +45,7 @@ pub(crate) struct Cmd {
     program: PathBuf,
     args: Vec<String>,
     env: BTreeMap<String, String>,
+    env_removals: Vec<String>,
     cwd: Option<PathBuf>,
     log: Option<PathBuf>,
 }
@@ -80,6 +81,7 @@ impl Cmd {
             program: program.to_path_buf(),
             args: Vec::new(),
             env: BTreeMap::new(),
+            env_removals: Vec::new(),
             cwd: None,
             log: None,
         }
@@ -95,6 +97,14 @@ impl Cmd {
     pub(crate) fn envs(mut self, vars: &BTreeMap<String, String>) -> Self {
         self.env
             .extend(vars.iter().map(|(k, v)| (k.clone(), v.clone())));
+        self
+    }
+    /// Removes `k` from the child's environment, clearing any value this
+    /// process inherited for it. Removals are applied in `run` after every
+    /// `env`/`envs` call on this `Cmd`, so a removed key stays removed even
+    /// if `env`/`envs` for it was called first.
+    pub(crate) fn env_remove(mut self, k: impl Into<String>) -> Self {
+        self.env_removals.push(k.into());
         self
     }
     pub(crate) fn cwd(mut self, d: &Path) -> Self {
@@ -137,6 +147,9 @@ impl Cmd {
     pub(crate) fn run(&self) -> Result<CmdOutput, CmdFailure> {
         let mut c = Command::new(&self.program);
         c.args(&self.args).envs(&self.env);
+        for k in &self.env_removals {
+            c.env_remove(k);
+        }
         if let Some(d) = &self.cwd {
             c.current_dir(d);
         }
@@ -228,6 +241,17 @@ mod tests {
         assert!(logged.contains("$ sh -c echo out"));
         assert!(logged.contains("err\n"), "stderr is logged even on success");
         assert!(logged.contains("[exit exit status: 3]"));
+    }
+
+    #[test]
+    fn env_remove_clears_an_inherited_or_just_set_variable() {
+        let out = Cmd::new(Path::new("/bin/sh"))
+            .args(["-c", "echo \"${GIT_DIR:-unset}\""])
+            .env("GIT_DIR", "/x")
+            .env_remove("GIT_DIR")
+            .run()
+            .unwrap();
+        assert_eq!(out.stdout, "unset\n");
     }
 
     #[test]

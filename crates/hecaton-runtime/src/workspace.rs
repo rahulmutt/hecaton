@@ -31,8 +31,23 @@ impl Workspace<'_> {
         })
     }
 
+    /// `git` honours `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_PREFIX`
+    /// and `GIT_COMMON_DIR` from the environment over an explicit `-C`: if any
+    /// of these leak in (e.g. from a pre-commit hook, which git sets for a
+    /// linked worktree, or from a daemon started under one), every `-C` call
+    /// below would silently operate on whatever repository those variables
+    /// name instead of `crew.repo`. Scrub them from every invocation.
     fn git(&self, id: &str, crew: &CrewPaths, args: &[&str]) -> Result<String, MaterializeError> {
         let mut cmd = Cmd::new(&self.tools.git).log(&crew.root.join("logs").join("git.log"));
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_PREFIX",
+            "GIT_COMMON_DIR",
+        ] {
+            cmd = cmd.env_remove(var);
+        }
         if let Some(dir) = &self.gh_config_dir {
             cmd = cmd.env("GH_CONFIG_DIR", dir.display().to_string()).args([
                 "-c",

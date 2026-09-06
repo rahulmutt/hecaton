@@ -15,6 +15,15 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .env("GIT_AUTHOR_EMAIL", "t@t")
         .env("GIT_COMMITTER_NAME", "t")
         .env("GIT_COMMITTER_EMAIL", "t@t")
+        // A pre-commit hook (this crate's own, if the test suite runs from
+        // one) leaks these into the environment for a linked worktree; left
+        // in place they would make this fixture's `-C`-less git calls
+        // operate on the real repository instead of `dir`.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_PREFIX")
+        .env_remove("GIT_COMMON_DIR")
         .output()
         .unwrap();
     assert!(
@@ -110,6 +119,7 @@ fn clone_worktree_reuse_and_remove() {
 #[test]
 fn errors_name_the_id_tool_and_first_stderr_line() {
     let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("git", false));
         return;
     };
     let root = support::temp_root("workspace-err");
