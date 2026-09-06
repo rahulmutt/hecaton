@@ -208,10 +208,31 @@ async fn the_fleet_api_and_hook_ingress_end_to_end() {
         Some(json!({ "spec": { "name": "f", "bogus": 1 } })),
     )
     .await;
-    // an unknown field is a data-level JSON error (axum's `JsonDataError`,
-    // 422), not a syntax error (400) — `body()` now reports the
-    // extractor's real status instead of hardcoding 400.
-    assert_eq!(st, 422, "{v}");
+    assert_eq!(st, 400, "{v}");
+    // a request without a JSON content type is a 415, not a 400 — the
+    // status carries information the client needs (fix it by asking for
+    // `application/json`), unlike a malformed or badly-shaped body.
+    let (st, v) = tokio::task::spawn_blocking({
+        let api = api.clone();
+        move || {
+            let url = format!("{}/v1/fleets", api.base);
+            let mut resp = api
+                .agent
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", api.token))
+                .header("Content-Type", "text/plain")
+                .send("{}")
+                .unwrap();
+            let status = resp.status().as_u16();
+            let text = resp.body_mut().read_to_string().unwrap();
+            let v = serde_json::from_str(&text).unwrap_or(Value::String(text));
+            (status, v)
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(st, 415);
+    assert!(v["error"].is_string(), "{v}");
 
     // hooks
     let a: AgentId = "f/c/a".parse().unwrap();

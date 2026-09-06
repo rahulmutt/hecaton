@@ -132,9 +132,22 @@ fn fleet_name(s: &str) -> Result<FleetName, ApiError> {
         .map_err(|e: hecaton_core::NameError| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))
 }
 
+/// Malformed JSON and a body that doesn't match `FleetRequest` (including
+/// an unknown field: `deny_unknown_fields`) are both a plain 400 — the
+/// spec's error table only names 400 for a bad request body. Only the
+/// rejections whose status carries information the client actually needs
+/// pass through axum's own: a missing/wrong `Content-Type` (415) and a
+/// body over the limit (413, via `BytesRejection`).
 fn body(b: Result<Json<FleetRequest>, JsonRejection>) -> Result<FleetRequest, ApiError> {
-    b.map(|Json(r)| r)
-        .map_err(|e| ApiError::new(e.status(), e.body_text()))
+    b.map(|Json(r)| r).map_err(|e| {
+        let status = match &e {
+            JsonRejection::JsonDataError(_) | JsonRejection::JsonSyntaxError(_) => {
+                StatusCode::BAD_REQUEST
+            }
+            _ => e.status(),
+        };
+        ApiError::new(status, e.body_text())
+    })
 }
 
 fn path_name(p: Result<Path<String>, PathRejection>) -> Result<String, ApiError> {
