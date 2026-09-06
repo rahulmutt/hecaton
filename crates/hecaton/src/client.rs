@@ -14,6 +14,10 @@ use crate::wiring::{layout_from_env, server_paths};
 
 pub const NOT_RUNNING: &str = "daemon not running; run `hecaton serve -d`";
 
+/// Per-request timeout: long enough for one reconcile pass to answer a
+/// `GET`, short enough that a genuinely dead daemon fails fast.
+const TIMEOUT: Duration = Duration::from_secs(30);
+
 /// `--api-url`, then `$HECATON_API_URL`, then the running daemon's endpoint file.
 pub fn resolve_endpoint(
     flag: Option<&str>,
@@ -32,6 +36,7 @@ pub struct Client {
     base: String,
     token: String,
     agent: ureq::Agent,
+    timeout: Duration,
 }
 
 impl Client {
@@ -47,14 +52,36 @@ impl Client {
     }
 
     pub fn new(base: String, token: String) -> Self {
+        Self::with_timeout(base, token, TIMEOUT)
+    }
+
+    /// As `new`, but with an explicit per-request timeout (tests use a
+    /// short one to exercise the timeout path without waiting 30s).
+    pub fn with_timeout(base: String, token: String, timeout: Duration) -> Self {
         Self {
             base: base.trim_end_matches('/').to_string(),
             token,
             agent: ureq::Agent::config_builder()
-                .timeout_global(Some(Duration::from_secs(30)))
+                .timeout_global(Some(timeout))
                 .http_status_as_error(false)
                 .build()
                 .into(),
+            timeout,
+        }
+    }
+
+    /// A timeout means the daemon is up but slow (spec §5: don't tell the
+    /// operator to restart something that's running); every other
+    /// transport-level failure means it could not be reached at all.
+    fn transport_error(&self, e: ureq::Error) -> anyhow::Error {
+        match e {
+            ureq::Error::Timeout(_) => {
+                anyhow!(
+                    "daemon did not answer within {}s ({e})",
+                    self.timeout.as_secs()
+                )
+            }
+            _ => anyhow!("{NOT_RUNNING} ({e})"),
         }
     }
 
@@ -85,7 +112,7 @@ impl Client {
                 .send_json(b),
             _ => bail!("unsupported request {method} without a body"),
         };
-        let mut resp = sent.map_err(|e| anyhow!("{NOT_RUNNING} ({e})"))?;
+        let mut resp = sent.map_err(|e| self.transport_error(e))?;
         let status = resp.status().as_u16();
         let text = resp
             .body_mut()
@@ -179,5 +206,27 @@ mod tests {
         let c = Client::new("http://127.0.0.1:1".into(), "t".into());
         let e = c.list().unwrap_err().to_string();
         assert!(e.starts_with(NOT_RUNNING), "{e}");
+    }
+
+    #[test]
+    fn a_slow_but_running_daemon_is_not_reported_as_not_running() {
+        // Accepts the connection but never writes a response, so the
+        // client's read times out instead of the connection failing.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(2));
+                drop(stream);
+            }
+        });
+        let c = Client::with_timeout(
+            format!("http://{addr}"),
+            "t".into(),
+            Duration::from_millis(200),
+        );
+        let e = c.list().unwrap_err().to_string();
+        assert!(e.contains("did not answer"), "{e}");
+        assert!(!e.starts_with(NOT_RUNNING), "{e}");
     }
 }
