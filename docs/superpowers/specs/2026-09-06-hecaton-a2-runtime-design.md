@@ -65,6 +65,10 @@ pub struct Timestamp(/* seconds since epoch, u64 */);
 `SpecHash` is stable under JSON key reordering (canonical form = `serde_json`
 with `BTreeMap`s, which every wire type already uses). `ResolvedAgent::from_fleet(&Fleet) -> Vec<ResolvedAgent>` is the only way the runtime reaches the fleet.
 
+Addendum (Task 18): `Timestamp` and `SpecHash` are defined in
+`hecaton-api::status` and re-exported from `hecaton-core`, not defined there
+directly.
+
 ### 2.2 Ports
 
 ```rust
@@ -74,7 +78,7 @@ pub trait Materializer: Send + Sync {
     fn materialize(&self, agent: &ResolvedAgent, creds: &CredentialBundle,
                    hooks: &HookTarget) -> Result<LaunchPlan, MaterializeError>;
     fn remove_agent(&self, agent: &AgentId) -> Result<(), MaterializeError>;
-    fn remove_crew(&self, crew: &CrewRef, keep_repo: bool) -> Result<(), MaterializeError>;
+    fn remove_crew(&self, crew: &CrewRef, keep: Keep) -> Result<(), MaterializeError>; // Task 18: keep_repo: bool became Keep { repos, sessions }
 }
 
 pub trait AgentRunner: Send + Sync {
@@ -148,17 +152,23 @@ only stops and removals and `Terminating` is the fleet phase.
 ### 3.2 Plan and steps
 
 `Plan` is `Vec<Step>` in this fixed order: `Stop*`, `RemoveAgent*`,
-`RemoveCrew*`, `EnsureCrew*`, then per agent `Materialize`, `Start`; `MarkDead*`
+`RemoveCrew*`, `EnsureCrew*`, then per agent `Materialize`, `Start`; `NoteExit*`
 last. Within each group, alphabetical by id. Tests compare plans with `==`.
 
 | Step | Emitted when |
 |---|---|
 | `Stop(agent)` | agent observed running and (not desired, or `applied_hash != desired_hash`) |
 | `RemoveAgent(agent)` | agent recorded or observed, not desired |
-| `RemoveCrew(crew, keep_repo)` | crew recorded or observed, not desired |
+| `RemoveCrew(crew, keep)` | crew recorded or observed, not desired |
 | `EnsureCrew(crew)` | crew desired |
 | `Materialize(agent)` + `Start(agent, hash)` | agent desired and one of: no window observed; `applied_hash != desired_hash`; `Exited` with `restarts < max_restarts` and `next_restart_at <= now` |
-| `MarkDead(agent)` | `Exited` and `restarts >= max_restarts` and phase not already `Dead` |
+| `NoteExit(agent, code)` | agent observed `Exited`, not yet noted (`next_restart_at.is_none()`) |
+
+Addendum (Task 18): the row that was `MarkDead(agent)` in this draft became
+`NoteExit(agent, code)` — every observed exit is noted, moving the agent to
+`Exited`, not `Dead`, with `next_restart_at` set (or left `None` when the exit
+is not yet noted). `apply` moves the agent to `Dead` only when the resulting
+`restarts` exceeds `max_restarts`.
 
 Every step carries the ids it needs and nothing else; `Start` carries the
 `SpecHash` so `apply` can record `applied_hash` without recomputing it.
@@ -349,6 +359,13 @@ All commands are `tmux -L <socket> …` via argv arrays.
 Session names contain `/`; verified working on tmux 3.7c. The `=` prefix
 forces exact-match targeting.
 
+Addendum (Task 18, refined in Task 16): `ensure_agent` on a fresh window
+actually creates a placeholder window, sets `remain-on-exit`, attaches
+`pipe-pane`, and only then `respawn-window`s into the real script — attaching
+`pipe-pane` after `new-window` loses the script's first output — and
+`send_text`/`ensure_agent` pass `--` before the text/command in every
+`send-keys` call.
+
 ### 4.4 Verified at implementation time
 
 Carried from architecture spec §12; each is an early plan task with a probe
@@ -356,10 +373,10 @@ and its fallback.
 
 | Assumption | Fallback |
 |---|---|
-| `CLAUDE_CONFIG_DIR` and `GH_CONFIG_DIR` relocate all state (nothing lands in nono's `$HOME`) | add explicit grants / `set_vars` for what escapes |
+| `CLAUDE_CONFIG_DIR` and `GH_CONFIG_DIR` relocate all state (nothing lands in nono's `$HOME`) | add explicit grants / `set_vars` for what escapes. Verdict (Task 18): partial — hecaton's own files land under `home/` (settings.json, .credentials.json, hosts.yml verified by home.rs tests and generated_golden); nono's `$HOME` (`agents/<a>/nono`, per `sandbox_it::generated_profile_validates_and_enforces_isolation`) held only nono's own bookkeeping — `.config/nono/{profiles,profile-drafts}` and `.local/state/nono/{sessions,audit}` — no Claude or gh state, since that test never runs `claude`/`gh` inside the sandbox; relocation under a live `claude` run is verified in Phase 3's e2e. |
 | `mise exec` under `MISE_GLOBAL_CONFIG_FILE` + read-only `MISE_DATA_DIR` resolves without writing there | pin with `MISE_CONFIG_FILE`; grant the specific subdirs mise insists on. Verdict (Task 11): holds — `toolchain_it::installs_nothing_when_seeded_and_exec_resolves_read_only` seeds `MISE_DATA_DIR` with the host's `gh@2.100.0` install, chmods the whole data dir `a-w`, then runs `mise exec -- gh --version` with `MISE_GLOBAL_CONFIG_FILE`/`MISE_DATA_DIR`/`MISE_CONFIG_DIR`/`MISE_STATE_DIR`/`MISE_CACHE_DIR` all pointed outside it; it resolves and prints the pinned version with no write attempted against the read-only tree. |
 | `gh auth git-credential` works from a `hosts.yml` holding only `oauth_token` and `git_protocol: https` | resolve `user:` with `gh api user` during `ensure_crew`, or require it in the credential bundle. Verdict (Task 14): holds — `oauth_token` + `git_protocol` suffice: with only those two keys in `hosts.yml`, `GH_CONFIG_DIR=… gh auth git-credential get` (given `protocol=https`/`host=github.com` on stdin) printed `username=…` and `password=…`. |
-| the `.claude.json` seed keys that suppress first-run prompts | discover by diffing a fresh Claude run; keep the seed in one constant |
+| the `.claude.json` seed keys that suppress first-run prompts | discover by diffing a fresh Claude run; keep the seed in one constant. Verdict (Task 18): seed is the single constant in `crates/hecaton-runtime/src/home.rs` (`hasCompletedOnboarding: true`, overlaid by `claude_account`); unverified against a fresh Claude run until Phase 3's e2e. |
 
 Already verified (2026-09-05, this machine, nono 0.75.0, tmux 3.7c):
 `environment.deny_vars/set_vars` relocate `HOME` and pass `PATH`; Landlock

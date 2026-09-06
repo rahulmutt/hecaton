@@ -400,3 +400,9 @@ Facts assumed here that Spec A must confirm early, with the fallback if they fai
 | `CLAUDE_CONFIG_DIR` and `GH_CONFIG_DIR` fully relocate their tools' state | additionally bind the paths inside the nono profile |
 | `nono run` preserves the environment passed by `env -i` | set the environment through the profile's `environment` block instead |
 | `MISE_GLOBAL_CONFIG_FILE` + `MISE_DATA_DIR` give a read-only resolve inside the sandbox | grant read-only access to the shared install dir explicitly and pin with `MISE_CONFIG_FILE` |
+
+## Addendum 2026-09-06 (Phase 2)
+`docs/superpowers/specs/2026-09-06-hecaton-a2-runtime-design.md` §8 lists the
+corrections Phase 2 made to §3 (ports), §4 (agent environment via the nono
+profile; nono's own `$HOME`), and §6 (worktree branch reuse, pipeline split
+into `Materializer`). Where they differ, the Phase 2 spec wins.

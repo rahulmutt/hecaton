@@ -40,6 +40,7 @@ phases; the rest exist in code today.
 - **Daemon down ⇒ Claude's HTTP hooks fail open for most events** — recorded in spec §10; the fleet is degraded, not compromised.
 - **A user who runs `hecaton` with real credentials on a host they do not trust** — same trust as running `claude` itself.
 - **Multi-tenant use** — one user per daemon in this iteration.
+- **The per-agent hook secret is readable by its own agent** — it sits in the agent's settings.json; it authenticates only that agent's events.
 
 ## Mitigations
 | Threat | Control | Where |
@@ -47,11 +48,11 @@ phases; the rest exist in code today.
 | Secrets in debug output / logs | `CredentialBundle` hand-implements `Debug` → `<redacted>`; hook payloads logged at `debug` only | `crates/hecaton-api/src/credentials.rs`; *(planned §8)* |
 | Secrets printed by `config resolve` | the credential bundle is loaded and discarded; the host settings.json is rendered verbatim as part of the resolved spec, so treat config resolve output as sensitive (use --no-host-defaults for shareable output) | `crates/hecaton/src/commands/config.rs` |
 | Repo/user config overriding hook wiring | `claude.settings.hooks` rejected at validation; daemon re-owns the key when writing `settings.json` | `crates/hecaton-config/src/validate.rs`; *(planned §6)* |
-| User `env` clobbering isolation variables | reserved `HOME`, `XDG_*`, `CLAUDE_CONFIG_DIR`, `GH_CONFIG_DIR`, `MISE_*`, `HECATON_*`, `PATH` rejected | `crates/hecaton-config/src/validate.rs` |
+| User `env` clobbering isolation variables | reserved `HOME`, `XDG_*`, `CLAUDE_CONFIG_DIR`, `GH_CONFIG_DIR`, `MISE_*`, `HECATON_*`, `PATH` rejected; the agent environment is set through the nono profile's set_vars (deny_vars ["*"]), so nothing but PATH crosses from the outer process | `crates/hecaton-config/src/validate.rs`; `crates/hecaton-runtime/src/env.rs`, `sandbox.rs` |
 | Malformed names reaching tmux/branch/paths | DNS-label validation on fleet/crew/agent names before anything is created | `crates/hecaton-core/src/name.rs` |
 | Credentials at rest | vault key 0600, XChaCha20-Poly1305, plaintext only while writing an agent's `.credentials.json` | *(planned §7)* |
 | Forged hook events | per-agent secret, body size limit, timeout, per-agent rate limit, validation at the edge | *(planned §7–§8)* |
 | Local process reaching the API | loopback bind, TLS, bearer token 0600 | *(planned §7)* |
-| Sandbox mis-grants | generated nono profile with explicit read-only system paths and read-write `home/`+`workspace/`; `nono profile validate` before launch; user grants that conflict are rejected, not overridden | *(planned §4, §6)* |
-| Secrets in argv / env / `launch.sh` | gh token only in `hosts.yml` 0600; Claude creds only in `.credentials.json`; argv arrays, shell-quoted `launch.sh` | *(planned §6, §10)* |
+| Sandbox mis-grants | generated nono profile with explicit read-only system paths and read-write `home/`+`workspace/`; `nono profile validate` before launch; user grants that conflict are rejected, not overridden | `crates/hecaton-runtime/src/sandbox.rs` (conflicts rejected with a path; `nono profile validate` before launch) |
+| Secrets in argv / env / `launch.sh` | gh token only in `hosts.yml` 0600; Claude creds only in `.credentials.json`; argv arrays, shell-quoted `launch.sh` | `crates/hecaton-runtime/src/launch.rs` (no credential is an input), `home.rs`, `workspace.rs` (gh token only in two 0600 `hosts.yml` files) |
 | Supply chain | exact-pinned `mise.toml`; committed `Cargo.lock`; `cargo audit` + `cargo deny` (`mise run audit`); `gitleaks` in `mise run precommit` | `mise.toml`, `deny.toml` |

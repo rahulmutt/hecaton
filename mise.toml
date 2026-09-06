@@ -45,3 +45,12 @@ run = [
   "cargo audit",
   "cargo deny check advisories bans sources licenses",
 ]
+
+[tasks.mutants]
+description = "Nightly tier: mutation-test the reconciler"
+run = "cargo mutants -p hecaton-core --in-place"
+
+[tasks.test-it]
+description = "Integration tests against real git/mise/nono/tmux, failing (not skipping) when a tool is missing"
+env = { HECATON_REQUIRE_TOOLS = "1" }
+run = "cargo nextest run -p hecaton-runtime"
