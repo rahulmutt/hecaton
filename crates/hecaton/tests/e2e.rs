@@ -148,7 +148,12 @@ impl Drop for World {
             while pid_file.exists() && start.elapsed() < Duration::from_secs(5) {
                 std::thread::sleep(Duration::from_millis(100));
             }
-            let _ = Command::new("kill").args(["-KILL", &pid]).status();
+            // Only escalate if the TERM wait timed out with the daemon
+            // still up; a clean shutdown removes the pid file and there is
+            // nothing left to kill.
+            if pid_file.exists() {
+                let _ = Command::new("kill").args(["-KILL", &pid]).status();
+            }
         }
         let _ = Command::new(&self.tmux)
             .args(["-L", &self.socket, "kill-server"])
@@ -283,30 +288,35 @@ fn serve_up_update_down_journey() {
     );
     assert!(w.agent_dir("alice").join("home/.gitconfig").exists());
 
-    // metrics saw the relay (SessionStart) and the HTTP hook (Notification)
+    // metrics saw the relay (SessionStart) and the HTTP hook (Notification).
+    // `up` returns as soon as `Ready` is set by the SessionStart relay; the
+    // fake posts `Notification` just after, so poll rather than scrape once.
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .build()
         .into();
-    let metrics = agent
-        .get(format!("{url}/metrics"))
-        .call()
-        .unwrap()
-        .body_mut()
-        .read_to_string()
-        .unwrap();
-    assert!(
-        metrics.contains(
-            "hecaton_hook_events_total{agent=\"alice\",crew=\"c\",event=\"SessionStart\",fleet=\"e2e\"} 1"
-        ),
-        "{metrics}"
-    );
-    assert!(
-        metrics.contains(
-            "hecaton_hook_events_total{agent=\"alice\",crew=\"c\",event=\"Notification\",fleet=\"e2e\"} 1"
-        ),
-        "{metrics}"
-    );
+    let session_start = "hecaton_hook_events_total{agent=\"alice\",crew=\"c\",event=\"SessionStart\",fleet=\"e2e\"} 1";
+    let notification = "hecaton_hook_events_total{agent=\"alice\",crew=\"c\",event=\"Notification\",fleet=\"e2e\"} 1";
+    let start = Instant::now();
+    let metrics = loop {
+        let metrics = agent
+            .get(format!("{url}/metrics"))
+            .call()
+            .unwrap()
+            .body_mut()
+            .read_to_string()
+            .unwrap();
+        if metrics.contains(session_start) && metrics.contains(notification) {
+            break metrics;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "metrics never showed both hooks within 10s; last scrape:\n{metrics}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(metrics.contains(session_start), "{metrics}");
+    assert!(metrics.contains(notification), "{metrics}");
 
     // update bob only
     let out = w.ok(&[

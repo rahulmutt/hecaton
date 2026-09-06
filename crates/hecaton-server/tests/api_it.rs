@@ -315,22 +315,35 @@ async fn the_fleet_api_and_hook_ingress_end_to_end() {
     // render it as `ApiError`'s `{ "error": "<message>" }` JSON instead.
     let _: ErrorBody = serde_json::from_value(v.clone()).unwrap_or_else(|e| panic!("{e}: {v}"));
     assert!(v["error"].is_string(), "{v}");
-    let mut saw_429 = false;
+    // The bucket refills at 20/s; issued one at a time, a slow test runner
+    // can drain the burst as fast as it refills and never see a 429. Fire
+    // all 80 requests concurrently so the burst actually lands together,
+    // regardless of scheduling delay between requests.
+    let mut burst = tokio::task::JoinSet::new();
     for _ in 0..80 {
-        let (st, _) = call(
-            api.clone(),
-            "POST",
-            events.clone(),
-            Some(secret.clone()),
-            Some(json!({ "hook_event_name": "PreToolUse" })),
-        )
-        .await;
+        let api = api.clone();
+        let events = events.clone();
+        let secret = secret.clone();
+        burst.spawn_blocking(move || {
+            api.call(
+                "POST",
+                &events,
+                Some(&secret),
+                Some(&json!({ "hook_event_name": "PreToolUse" })),
+            )
+        });
+    }
+    let mut saw_429 = false;
+    while let Some(res) = burst.join_next().await {
+        let (st, _) = res.unwrap();
         if st == 429 {
             saw_429 = true;
-            break;
         }
     }
-    assert!(saw_429, "burst of 50 must trip the limiter");
+    assert!(
+        saw_429,
+        "burst of 80 concurrent requests must trip the limiter"
+    );
 
     // metrics
     let (st, v) = call(api.clone(), "GET", "/metrics".into(), None, None).await;
