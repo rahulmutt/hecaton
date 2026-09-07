@@ -6,8 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hecaton_api::{
-    ActivateRequest, CredentialBundle, DeactivateRequest, Desired, FleetSpec, FleetSummary,
-    HelloRequest, HelloResponse, HookEvent, PluginAction, PluginActivation, SyncReport,
+    ActivateRequest, ActivationState, CredentialBundle, DeactivateRequest, Desired, FleetSpec,
+    FleetSummary, HelloRequest, HelloResponse, HookEvent, PluginAction, PluginActivation,
+    SyncReport,
 };
 use hecaton_core::{
     AgentId, AgentName, EventHandler, Fleet, FleetName, FleetRecord, FleetSecrets, Keep, Outcome,
@@ -57,9 +58,11 @@ pub struct Daemon {
     registry: Arc<PluginRegistry>,
     client: PluginClient,
     kv: Arc<PluginKv>,
-    /// One apply at a time per daemon: activation and the actor message
-    /// must not interleave with another apply of the same fleet.
-    applying: tokio::sync::Mutex<()>,
+    /// One `apply` or `down` at a time *per fleet*: activation and the
+    /// actor message must not interleave with another apply of the same
+    /// fleet. Every other fleet runs on its own lock — an apply waits for
+    /// the actor's pass, and one fleet's pass must not hold up the rest.
+    applying: std::sync::Mutex<BTreeMap<FleetName, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -147,7 +150,7 @@ impl Daemon {
             registry,
             client,
             kv,
-            applying: tokio::sync::Mutex::new(()),
+            applying: std::sync::Mutex::new(BTreeMap::new()),
         });
         tokio::spawn(Self::forget_purged(Arc::downgrade(&daemon), purged));
         tokio::spawn(Self::health_loop(Arc::downgrade(&daemon)));
@@ -272,6 +275,12 @@ impl Daemon {
         }
     }
 
+    /// This fleet's apply/down lock, created on first use.
+    fn fleet_lock(&self, name: &FleetName) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.applying.lock().unwrap_or_else(|e| e.into_inner());
+        map.entry(name.clone()).or_default().clone()
+    }
+
     /// Best effort: a plugin that cannot be told is logged, not an error.
     async fn deactivate_pair(&self, agent: &AgentId, plugin: &AgentName) {
         let Some(listen) = self.registry.ready_listen(plugin) else {
@@ -282,6 +291,30 @@ impl Daemon {
         };
         if let Err(e) = self.client.deactivate(&listen, &req).await {
             tracing::warn!(plugin = %plugin, agent = %agent, "deactivate failed: {e}");
+        }
+    }
+
+    /// Puts back the pairs a rejected apply had deactivated on the way in:
+    /// their rows still say `Active`, so the plugin must be told to hold
+    /// them again, with the config the row carries. A refusal now is the
+    /// row's new state — the pair really is not active any more.
+    async fn restore_pairs(&self, pairs: &[Pair]) {
+        for p in pairs {
+            let Some(listen) = self.registry.ready_listen(&p.plugin) else {
+                continue;
+            };
+            let req = ActivateRequest {
+                agent: p.agent.to_string(),
+                config: p.config.clone(),
+            };
+            if let Err(e) = self.client.activate(&listen, &req).await {
+                tracing::warn!(plugin = %p.plugin, agent = %p.agent, "restoring the previous activation failed: {e}");
+                self.registry.set_state(
+                    &p.agent,
+                    &p.plugin,
+                    PluginActivation::rejected(Self::activation_message(&e)),
+                );
+            }
         }
     }
 
@@ -317,18 +350,21 @@ impl Daemon {
         // Activation runs before the actor sees the spec (§16.2): a
         // rejection is a 400 and nothing lands. Held for the whole method
         // so two applies of the same fleet cannot interleave.
-        let _guard = self.applying.lock().await;
-        let previous: Option<FleetSpec> = {
-            let fleets = self.fleets.read().await;
-            fleets.get(name).and_then(|h| {
-                let r = h.status.borrow();
-                (!r.is_down()).then(|| r.spec.clone())
+        let lock = self.fleet_lock(name);
+        let _guard = lock.lock().await;
+        // What the fleet has activated *now*, not what its spec says: a
+        // `down` answers before its teardown pass and has already dropped
+        // every row, so the record's spec would name pairs that are gone.
+        let old: Vec<Pair> = self
+            .registry
+            .rows_for_fleet(name)
+            .into_iter()
+            .map(|(agent, plugin, row)| Pair {
+                agent,
+                plugin,
+                config: row.config,
             })
-        };
-        let old = match &previous {
-            Some(s) => activation::pairs(name, s).unwrap_or_default(),
-            None => Vec::new(),
-        };
+            .collect();
         let new =
             activation::pairs(name, &spec).map_err(|e| DaemonError::Invalid(e.to_string()))?;
         for p in &new {
@@ -344,11 +380,23 @@ impl Daemon {
         // deactivate changed pairs first (§16.2), then activate every new or
         // changed pair on a ready plugin; the first rejection rolls back the
         // ones already accepted and nothing reaches the actor
+        let mut restore: Vec<Pair> = Vec::new();
         for (agent, plugin) in &d.deactivate {
             if d.activate
                 .iter()
                 .any(|p| &p.agent == agent && &p.plugin == plugin)
             {
+                if let Some(row) = self
+                    .registry
+                    .row(agent, plugin)
+                    .filter(|r| r.activation.state == ActivationState::Active)
+                {
+                    restore.push(Pair {
+                        agent: agent.clone(),
+                        plugin: plugin.clone(),
+                        config: row.config,
+                    });
+                }
                 self.deactivate_pair(agent, plugin).await;
             }
         }
@@ -370,6 +418,7 @@ impl Daemon {
                             for a in &accepted {
                                 self.deactivate_pair(&a.agent, &a.plugin).await;
                             }
+                            self.restore_pairs(&restore).await;
                             return Err(DaemonError::Invalid(format!(
                                 "{}: {}",
                                 activation::config_path(&p.agent, &p.plugin),
@@ -450,6 +499,8 @@ impl Daemon {
         purge: bool,
     ) -> Result<FleetRecord, DaemonError> {
         Self::reject_reserved(name)?;
+        let lock = self.fleet_lock(name);
+        let _guard = lock.lock().await;
         let handle = self
             .fleets
             .read()
@@ -957,6 +1008,59 @@ mod tests {
             after,
             vec!["deactivate f/c/a", "activate f/c/a", "deactivate f/c/c"]
         );
+
+        // a rejection after a *changed* pair was already deactivated puts
+        // that pair back with the config its row still carries
+        let before = stub.calls().len();
+        let e = w
+            .daemon
+            .apply(
+                &name,
+                spec(&[
+                    ("a", &[("flow", json!({ "v": 3 }))]),
+                    ("bad", &[("flow", json!({}))]),
+                ]),
+                Default::default(),
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e,
+            DaemonError::Invalid("crews.c.agents.bad.plugins.flow: no".into())
+        );
+        let after: Vec<String> = stub.calls()[before..]
+            .iter()
+            .map(|(r, v)| {
+                format!(
+                    "{r} {} {}",
+                    v["agent"].as_str().unwrap_or_default(),
+                    v["config"]
+                )
+            })
+            .collect();
+        assert_eq!(
+            after,
+            vec![
+                "deactivate f/c/a null",
+                "activate f/c/a {\"v\":3}",
+                "activate f/c/bad {}",
+                "deactivate f/c/a null",
+                "activate f/c/a {\"v\":2}",
+            ],
+            "the changed pair is restored with its old config"
+        );
+        let row = w
+            .daemon
+            .registry()
+            .row(&"f/c/a".parse().unwrap(), &"flow".parse().unwrap())
+            .unwrap();
+        assert_eq!(
+            (row.activation.state, row.config),
+            (ActivationState::Active, json!({ "v": 2 })),
+            "the row never moved"
+        );
+
         w.daemon.down(&name, Keep::default(), false).await.unwrap();
         let last = stub.calls().last().unwrap().clone();
         assert_eq!(
@@ -968,6 +1072,54 @@ mod tests {
                 .registry()
                 .rows_for_plugin(&"flow".parse().unwrap())
                 .is_empty()
+        );
+    }
+
+    /// `down` answers before the actor's teardown pass, so an update
+    /// landing in that window still sees the old spec in the record —
+    /// the rows, which `down` cleared, are what an apply diffs against.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_right_after_down_activates_the_pairs_again() {
+        let w = world().await;
+        let stub = stub_plugin(StubScript {
+            health_ok: true,
+            ..StubScript::default()
+        })
+        .await;
+        hello(&w, &stub.listen).await;
+        let name: FleetName = "f".parse().unwrap();
+        let s = spec(&[("a", &[("flow", json!({ "v": 1 }))])]);
+        w.daemon
+            .apply(&name, s.clone(), Default::default(), false)
+            .await
+            .unwrap();
+        // the teardown pass fails, so the record never settles `Down` and
+        // still names the old spec — the window the finding describes
+        wait_gen(&w.daemon, 1).await;
+        w.h.runner.fail_next("stop_agent", "f/c/a", "tmux is busy");
+        w.daemon.down(&name, Keep::default(), false).await.unwrap();
+        assert!(
+            !w.daemon.get(&name).await.unwrap().is_down(),
+            "the fleet has not settled down"
+        );
+        assert!(
+            w.daemon.registry().rows_for_fleet(&name).is_empty(),
+            "down dropped the rows"
+        );
+        let before = stub.calls_named("activate").len();
+        w.daemon
+            .apply(&name, s, Default::default(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            stub.calls_named("activate").len(),
+            before + 1,
+            "the pair is activated again, not diffed away"
+        );
+        wait_gen(&w.daemon, 2).await;
+        assert_eq!(
+            w.daemon.get(&name).await.unwrap().status.agents["f/c/a"].plugins["flow"].state,
+            ActivationState::Active
         );
     }
 

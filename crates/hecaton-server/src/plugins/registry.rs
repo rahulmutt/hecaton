@@ -171,6 +171,18 @@ impl PluginRegistry {
             .cloned()
     }
 
+    /// Every row of one fleet, sorted by agent then plugin: what a fleet
+    /// currently has activated, which is what an `apply` diffs against —
+    /// the stored spec would still name pairs a `down` has just dropped.
+    pub fn rows_for_fleet(&self, fleet: &FleetName) -> Vec<(AgentId, AgentName, ActivationRow)> {
+        self.read()
+            .rows
+            .iter()
+            .filter(|((a, _), _)| &a.fleet == fleet)
+            .map(|((a, p), row)| (a.clone(), p.clone(), row.clone()))
+            .collect()
+    }
+
     pub fn rows_for_plugin(&self, name: &AgentName) -> Vec<(AgentId, ActivationRow)> {
         self.read()
             .rows
@@ -396,6 +408,23 @@ mod tests {
         assert_eq!(r.active_agents(&name("web")), 2);
         assert_eq!(r.rows_for_plugin(&name("web")).len(), 2);
         assert_eq!(r.row(&a, &name("flow")).unwrap().config["k"], 1);
+        let fleet: FleetName = "f".parse().unwrap();
+        assert_eq!(
+            r.rows_for_fleet(&fleet)
+                .iter()
+                .map(|(a, p, row)| format!("{a} {p} {}", row.config))
+                .collect::<Vec<_>>(),
+            vec![
+                "f/c/a flow {\"k\":1}",
+                "f/c/a web {\"k\":1}",
+                "f/c/b web {\"k\":1}"
+            ],
+            "one fleet's rows, sorted, with their configs"
+        );
+        assert!(
+            r.rows_for_fleet(&"g".parse().unwrap()).is_empty(),
+            "another fleet has none"
+        );
 
         let mut record = FleetRecord::new(FleetSpec {
             name: "f".into(),
