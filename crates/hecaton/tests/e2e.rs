@@ -1148,3 +1148,327 @@ fn flow_journey() {
     }
     drop(w);
 }
+
+/// Where `mise run package-plugins` left the web package; `None` when it
+/// has not been run.
+fn web_package() -> Option<PathBuf> {
+    let dir = Path::new(HECATON).parent()?.parent()?.join("plugins/web");
+    dir.join("bin/hecaton-plugin-web").exists().then_some(dir)
+}
+
+/// `GET` with explicit headers, no redirects followed: status, headers, body.
+fn raw_get(url: &str, headers: &[(&str, &str)]) -> (u16, Vec<(String, String)>, String) {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .build()
+        .into();
+    let mut req = agent.get(url);
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let mut resp = req.call().unwrap();
+    let status = resp.status().as_u16();
+    let headers = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+    let text = resp.body_mut().read_to_string().unwrap();
+    (status, headers, text)
+}
+
+/// Plugins spec §14 and §18.6, "done when": through a real daemon, nono
+/// and tmux, `plugin open` mints a login URL, the browser's cookie opens
+/// the mount from the daemon's origin only, the index lists alice from
+/// the watch-fed cache, a WebSocket through the proxy shows fake-claude's
+/// pane and types into it, and `down` empties the index.
+#[test]
+fn web_journey() {
+    let Some(nono) = tool("nono") else {
+        assert!(!require_or_skip("nono", false));
+        return;
+    };
+    for t in ["git", "gh", "mise", "tmux"] {
+        if !require_or_skip(t, tool(t).is_some()) {
+            return;
+        }
+    }
+    let (Some(flow_pkg), Some(web_pkg)) = (flow_package(), web_package()) else {
+        assert!(!require_or_skip(
+            "target/plugins/{flow,web} (run `mise run package-plugins`)",
+            false
+        ));
+        return;
+    };
+    reap_earlier_runs();
+    let root = TempRoot::new(Path::new(env!("CARGO_TARGET_TMPDIR")), "e2e-web");
+    if !require_or_skip("landlock", landlock_works(&nono, &root)) {
+        return;
+    }
+    let w = World {
+        home: root.join("home"),
+        socket: format!("hecaton-e2e-web-{}", std::process::id()),
+        tmux: tool("tmux").unwrap(),
+    };
+    fs::create_dir_all(&w.home).unwrap();
+    let cfg = w.home.join(".config/hecaton");
+    fs::create_dir_all(&cfg).unwrap();
+    fs::write(cfg.join("mise.toml"), "[tools]\n").unwrap();
+    fs::write(
+        cfg.join("plugins.yaml"),
+        format!(
+            "plugins:\n  - name: flow\n    source: \"{}\"\n  - name: web\n    source: \"{}\"\n",
+            flow_pkg.display(),
+            web_pkg.display()
+        ),
+    )
+    .unwrap();
+
+    let work = root.join("work");
+    fs::create_dir_all(&work).unwrap();
+    git(&work, &["init", "-q", "-b", "main"]);
+    fs::write(work.join("README"), "hi\n").unwrap();
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-q", "-m", "init"]);
+    let bare = root.join("repo.git");
+    git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            &work.display().to_string(),
+            &bare.display().to_string(),
+        ],
+    );
+    let fleet = root.join("fleet.yaml");
+    fs::write(&fleet, fleet_yaml(&bare, None, Some("{ web: {} }"))).unwrap();
+
+    let out = w.ok(&[
+        "serve",
+        "-d",
+        "--bind",
+        "127.0.0.1:0",
+        "--tmux-socket",
+        &w.socket,
+    ]);
+    assert!(out.contains("http://127.0.0.1:"), "{out}");
+    let url = fs::read_to_string(w.state().join("server/endpoint"))
+        .unwrap()
+        .trim()
+        .to_string();
+    wait_plugin_ready(&w, "flow", &w.state().join("plugins/flow"));
+    let list = wait_plugin_ready(&w, "web", &w.state().join("plugins/web"));
+    assert!(
+        list.lines()
+            .any(|l| l.starts_with("web") && l.contains("yes")),
+        "ROUTES column: {list}"
+    );
+
+    let out = w.ok(&[
+        "up",
+        &fleet.display().to_string(),
+        "--no-host-defaults",
+        "--timeout",
+        "180s",
+    ]);
+    assert!(out.contains("e2e  ready"), "{out}");
+    assert!(out.contains("web=active"), "{out}");
+
+    // plugin open → a login URL on the daemon's origin; the browser's GET
+    // becomes a cookie, once
+    let login = w.ok(&["plugin", "open", "web"]).trim().to_string();
+    assert!(login.starts_with(&format!("{url}/v1/login/")), "{login}");
+    assert!(login.ends_with("?to=/v1/plugins/web/"), "{login}");
+    let (status, headers, _) = raw_get(&login, &[]);
+    assert_eq!(status, 303);
+    let cookie = headers
+        .iter()
+        .find(|(k, _)| k == "set-cookie")
+        .map(|(_, v)| v.split(';').next().unwrap().to_string())
+        .expect("a session cookie");
+    assert!(cookie.starts_with("hecaton_session="), "{cookie}");
+    let (status, _, _) = raw_get(&login, &[]);
+    assert_eq!(status, 404, "single use");
+
+    // the mount: cookie from the daemon's origin only; no cookie, no entry
+    let mount = format!("{url}/v1/plugins/web/");
+    let (status, _, _) = raw_get(&mount, &[]);
+    assert_eq!(status, 401);
+    let (status, _, body) = raw_get(
+        &mount,
+        &[("Cookie", &cookie), ("Sec-Fetch-Site", "same-origin")],
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("e2e/c/alice"), "{body}");
+    assert!(!body.contains("e2e/c/bob"), "bob has no web block: {body}");
+    let (status, _, _) = raw_get(
+        &mount,
+        &[("Cookie", &cookie), ("Origin", "http://evil.example")],
+    );
+    assert_eq!(status, 403);
+    // the index's rows come from fleets/watch: alice is ready there
+    let start = Instant::now();
+    let rows = loop {
+        let (_, _, body) = raw_get(&format!("{mount}agents.json"), &[("Cookie", &cookie)]);
+        let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if rows[0]["phase"] == "ready" {
+            break rows;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "agents.json never showed alice ready: {body}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    assert_eq!(rows[0]["id"], "e2e/c/alice");
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    let (status, _, page) = raw_get(
+        &format!("{mount}agents/e2e/c/alice"),
+        &[("Cookie", &cookie)],
+    );
+    assert_eq!(status, 200);
+    assert!(page.contains("/v1/plugins/web/assets/xterm.js"), "{page}");
+    let (status, _, js) = raw_get(&format!("{mount}assets/xterm.js"), &[("Cookie", &cookie)]);
+    assert_eq!((status, js.len()), (200, 488663));
+
+    // the terminal: through the proxy, the plugin and the daemon's attach
+    // to alice's tmux window — fake-claude's pane appears, typed bytes
+    // reach its stdin
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let ws_url = format!(
+            "{}/v1/plugins/web/agents/e2e/c/alice/ws",
+            url.replacen("http://", "ws://", 1)
+        );
+        let mut req = ws_url.clone().into_client_request().unwrap();
+        req.headers_mut().insert("cookie", cookie.parse().unwrap());
+        req.headers_mut().insert("origin", url.parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("the browser's socket through the proxy");
+        ws.send(Message::Text(r#"{"resize":{"cols":120,"rows":40}}"#.into()))
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match ws.next().await.expect("open").unwrap() {
+                    Message::Binary(b) => {
+                        seen.extend_from_slice(&b);
+                        if String::from_utf8_lossy(&seen).contains("fake-claude") {
+                            return;
+                        }
+                    }
+                    Message::Close(f) => panic!(
+                        "closed early: {f:?}; saw {:?}",
+                        String::from_utf8_lossy(&seen)
+                    ),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("fake-claude's pane over the terminal");
+        ws.send(Message::Binary(b"hello-from-browser\n".to_vec().into()))
+            .await
+            .unwrap();
+        let stdin = tokio::task::spawn_blocking({
+            let path = w.agent_dir("alice").join("home/fake-claude.stdin");
+            move || wait_file_until(&path, |s| s.contains("hello-from-browser"))
+        })
+        .await
+        .unwrap();
+        assert!(stdin.contains("hello-from-browser"), "{stdin}");
+        ws.close(None).await.unwrap();
+        // a cross-origin socket is refused at the handshake
+        let mut req = ws_url.into_client_request().unwrap();
+        req.headers_mut().insert("cookie", cookie.parse().unwrap());
+        req.headers_mut()
+            .insert("origin", "http://evil.example".parse().unwrap());
+        let e = tokio_tungstenite::connect_async(req).await.unwrap_err();
+        assert!(
+            matches!(e, tokio_tungstenite::tungstenite::Error::Http(ref r) if r.status() == 403),
+            "{e}"
+        );
+    });
+
+    // metrics: the proxy counted, the plugin's gauge rose and fell
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let start = Instant::now();
+    loop {
+        let m = agent
+            .get(format!("{url}/metrics"))
+            .call()
+            .unwrap()
+            .body_mut()
+            .read_to_string()
+            .unwrap();
+        if m.contains("hecaton_plugin_proxy_requests_total{plugin=\"web\",status=\"200\"}")
+            && m.contains("hecaton_plugin_web_terminals_total 1")
+            && m.contains("hecaton_plugin_web_terminals_open 0")
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "metrics never settled:\n{m}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // no attach session survives the socket; the crew session does
+    let sessions = String::from_utf8_lossy(
+        &Command::new(&w.tmux)
+            .args(["-L", &w.socket, "list-sessions", "-F", "#{session_name}"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .into_owned();
+    assert!(!sessions.contains("hecaton-attach-"), "{sessions}");
+    assert!(sessions.contains("e2e/c"), "{sessions}");
+
+    // no secret leaks: the admin token, the session cookie and the web token
+    let token = fs::read_to_string(w.state().join("server/token")).unwrap();
+    let log = fs::read_to_string(w.state().join("server/server.log")).unwrap();
+    assert!(!log.contains(token.trim()));
+    assert!(!log.contains(cookie.trim_start_matches("hecaton_session=")));
+    let profile = fs::read_to_string(w.state().join("plugins/web/nono-profile.json")).unwrap();
+    let web_token = profile
+        .split("\"HECATON_PLUGIN_TOKEN\": \"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(!log.contains(&web_token));
+
+    // down: alice is deactivated and leaves the index; the tmux group is gone
+    let out = w.ok(&["down", "e2e", "--keep", "--timeout", "60s"]);
+    assert!(out.contains("e2e  down"), "{out}");
+    let start = Instant::now();
+    loop {
+        let (_, _, body) = raw_get(&format!("{mount}agents.json"), &[("Cookie", &cookie)]);
+        if body.trim() == "[]" {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "alice still listed: {body}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    drop(w);
+}

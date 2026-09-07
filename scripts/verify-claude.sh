@@ -72,6 +72,10 @@ hr "build"
 target="${CARGO_TARGET_DIR:-target}"
 case "$target" in /*) ;; *) target="$REPO/$target" ;; esac
 HECATON="$target/debug/hecaton"
+# The web plugin, when `mise run package-plugins` has assembled it: the
+# by-hand check of plugins spec §14 ("a browser shows a live terminal").
+WEB_PKG="$target/plugins/web"
+if [ -x "$WEB_PKG/bin/hecaton-plugin-web" ]; then WEB=1; else WEB=0; say "web plugin not packaged (mise run package-plugins); skipping the browser step"; fi
 
 hr "scratch root"
 # A previous run (interrupted, or still parked at the prompt) leaves its
@@ -90,6 +94,9 @@ for sock in /tmp/tmux-"$(id -u)"/hecaton-verify-*; do
 done
 rm -rf "$ROOT"
 mkdir -p "$ROOT/xdg/config/hecaton" "$XDG_STATE_HOME" "$XDG_DATA_HOME"
+if [ "$WEB" = 1 ]; then
+  printf 'plugins:\n  - name: web\n    source: "%s"\n' "$WEB_PKG" > "$ROOT/xdg/config/hecaton/plugins.yaml"
+fi
 if [ "$FAKE" = 1 ]; then
   printf '[tools]\n' > "$ROOT/xdg/config/hecaton/mise.toml"   # nothing to download in the self-test
 fi
@@ -123,7 +130,7 @@ crews:
     ref: main
     git: { push: false, auth: none }
     agents:
-      $AGENT: {}
+      $AGENT: { plugins: { $( [ "$WEB" = 1 ] && printf 'web: {}' ) } }
 EOF
 say "fleet file: $ROOT/fleet.yaml (repo: file://$BARE)"
 
@@ -140,11 +147,22 @@ else
   UP=failed
 fi
 
+if [ "$WEB" = 1 ] && [ "$UP" = ok ]; then
+  hr "browser terminal (plugins spec §14)"
+  LOGIN="$("$HECATON" plugin open web 2>/dev/null || true)"
+  if [ -n "$LOGIN" ]; then
+    say ">>> Open this once in a browser (valid 60 s; it becomes a session cookie):"
+    say ">>>     $LOGIN"
+  else
+    say "plugin open web failed; see $SERVER/server.log"
+  fi
+fi
+
 metrics() { curl -sf "$URL/metrics" 2>/dev/null | grep '^hecaton_hook_events_total' || say "(no hook events counted yet)"; }
 
 say
 say "=============================== REPORT (paste everything from here) ==============================="
-say "date: $(date -u +%FT%TZ)   branch: $(git -C "$REPO" rev-parse --short HEAD)   fake: $FAKE   up: $UP"
+say "date: $(date -u +%FT%TZ)   branch: $(git -C "$REPO" rev-parse --short HEAD)   fake: $FAKE   web: $WEB   up: $UP"
 hr "A. SessionStart command hook with the profile environment (relay → Ready)"
 "$HECATON" status "$FLEET" || true
 metrics
@@ -163,6 +181,7 @@ else
   say
   say ">>> Now attach in another terminal:"
   say ">>>     tmux -L $SOCKET attach -t $FLEET/$CREW"
+  say ">>> or click $AGENT on the browser page above and type there."
   say ">>> Wait for Claude's prompt, type one message (e.g. \"say hi\"), wait for the reply,"
   say ">>> detach with Ctrl-b then d, and come back here."
   ONBOARD=""
