@@ -222,6 +222,41 @@ fn hooks_of(settings: &Value, event: &str) -> Vec<Value> {
         .collect()
 }
 
+/// `hecaton dev fake-plugin`: the e2e's plugin. Binds a loopback listener
+/// (plugins spec §11.1 row 1: can a sandboxed plugin bind at all?), says
+/// hello with that address, records the reply, sleeps until killed. If the
+/// bind is refused it still says hello with `127.0.0.1:0` and leaves
+/// `fake-plugin.bind-failed` in scratch, so the e2e reports the verdict
+/// instead of hanging.
+pub fn fake_plugin_command() -> Result<String> {
+    use hecaton_plugin_sdk::{Env, Host};
+    let env = Env::from_process()?;
+    let scratch = env.scratch.clone();
+    std::fs::create_dir_all(&scratch)?;
+    let (listener, listen) = match std::net::TcpListener::bind("127.0.0.1:0") {
+        Ok(l) => {
+            let addr = l.local_addr()?.to_string();
+            (Some(l), addr)
+        }
+        Err(e) => {
+            eprintln!("fake-plugin: cannot bind a loopback listener: {e}");
+            std::fs::write(scratch.join("fake-plugin.bind-failed"), e.to_string())?;
+            (None, "127.0.0.1:0".to_string())
+        }
+    };
+    let host = Host::new(env);
+    let resp = host.hello(env!("CARGO_PKG_VERSION"), &listen)?;
+    std::fs::write(
+        scratch.join("fake-plugin.hello"),
+        serde_json::to_string_pretty(&resp.config)?,
+    )?;
+    eprintln!("fake-plugin: hello acknowledged; listening on {listen}; sleeping until killed");
+    let _keep = listener;
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

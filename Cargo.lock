@@ -587,6 +587,7 @@ dependencies = [
  "hecaton-api",
  "hecaton-config",
  "hecaton-core",
+ "hecaton-plugin-sdk",
  "hecaton-runtime",
  "hecaton-server",
  "hex",
