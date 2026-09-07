@@ -39,6 +39,14 @@ pub enum Msg {
         purge: bool,
         reply: oneshot::Sender<FleetRecord>,
     },
+    /// Hold (or release) one agent in the record's `stopped` set (plugins
+    /// spec §16.4). Replied to after the pass, so `restart` (stop, then
+    /// resume) is two ordered round trips.
+    SetStopped {
+        agent: AgentId,
+        stopped: bool,
+        reply: oneshot::Sender<FleetRecord>,
+    },
     Event {
         agent: AgentId,
         name: String,
@@ -161,6 +169,22 @@ impl Actor {
                     let _ = reply.send(self.record.clone());
                     self.pass().await;
                 }
+                Some(Msg::SetStopped {
+                    agent,
+                    stopped,
+                    reply,
+                }) => {
+                    let key = agent.to_string();
+                    if stopped {
+                        self.record.stopped.insert(key);
+                    } else {
+                        self.record.stopped.remove(&key);
+                    }
+                    self.persist().await;
+                    self.publish();
+                    self.pass().await;
+                    let _ = reply.send(self.record.clone());
+                }
                 Some(Msg::Event { agent, name, at }) => self.event(agent, name, at).await,
                 None => self.pass().await,
             }
@@ -225,6 +249,10 @@ impl Actor {
         set_desired(&mut self.record.status, self.record.generation);
         self.secrets.credentials = credentials;
         let wanted = self.wanted_agents();
+        // an Apply always wins over a plugin's stop (plugins spec §16.4)
+        self.record
+            .stopped
+            .retain(|k| !wanted.iter().any(|id| id.to_string() == *k));
         let mut next = BTreeMap::new();
         for id in &wanted {
             let key = id.to_string();
@@ -392,7 +420,7 @@ mod tests {
     use crate::testing::Harness;
     use hecaton_api::{AgentPhase, AgentSettings, AgentStatus, CrewSpec, FleetPhase, GitSettings};
     use hecaton_core::ProcessState;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn spec(agents: &[&str]) -> FleetSpec {
         FleetSpec {
@@ -449,6 +477,18 @@ mod tests {
         h.tx.send(Msg::Down {
             keep: Keep::default(),
             purge,
+            reply: tx,
+        })
+        .await
+        .unwrap();
+        rx.await.unwrap()
+    }
+
+    async fn set_stopped(h: &FleetHandle, agent: &str, stopped: bool) -> FleetRecord {
+        let (tx, rx) = oneshot::channel();
+        h.tx.send(Msg::SetStopped {
+            agent: id(agent),
+            stopped,
             reply: tx,
         })
         .await
@@ -777,6 +817,52 @@ mod tests {
         assert!(
             encoded.contains("hecaton_reconcile_errors_total{fleet=\"f\"} 1"),
             "{encoded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_stopped_stops_resumes_and_apply_clears_it() {
+        let h = Harness::new(Duration::from_secs(3600));
+        let (handle, _shared, _purged) = start(&h);
+        apply(&handle, spec(&["a", "b"])).await;
+        let mut rx = handle.status.clone();
+        wait(&mut rx, |r| r.status.observed_generation == 1).await;
+
+        let rec = set_stopped(&handle, "f/c/a", true).await;
+        assert_eq!(rec.stopped, BTreeSet::from(["f/c/a".to_string()]));
+        assert_eq!(rec.status.agents["f/c/a"].phase, AgentPhase::Stopped);
+        assert_eq!(rec.status.agents["f/c/b"].phase, AgentPhase::Starting);
+        assert!(h.runner.calls().contains(&"stop_agent f/c/a".to_string()));
+        assert_eq!(h.store.get("f").unwrap().0.stopped.len(), 1, "persisted");
+        let ensure_a = || {
+            h.runner
+                .calls()
+                .iter()
+                .filter(|c| *c == "ensure_agent f/c/a")
+                .count()
+        };
+        assert_eq!(ensure_a(), 1);
+
+        let rec = set_stopped(&handle, "f/c/a", false).await;
+        assert!(rec.stopped.is_empty());
+        assert_eq!(rec.status.agents["f/c/a"].phase, AgentPhase::Starting);
+        assert_eq!(rec.status.agents["f/c/a"].restarts, 0);
+        assert_eq!(ensure_a(), 2, "resumed in the same message's pass");
+
+        set_stopped(&handle, "f/c/b", true).await;
+        let rec = apply(&handle, spec(&["a", "b"])).await;
+        assert!(
+            rec.stopped.is_empty(),
+            "an Apply clears every declared agent"
+        );
+        wait(&mut rx, |r| r.status.observed_generation == 2).await;
+        assert!(
+            h.runner
+                .calls()
+                .iter()
+                .filter(|c| *c == "ensure_agent f/c/b")
+                .count()
+                >= 2
         );
     }
 }

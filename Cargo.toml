@@ -31,6 +31,9 @@ flate2 = "1.1.10"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
 axum = "0.8.9"
 ureq = { version = "3.4.1", default-features = false, features = ["json"] }
+# Async loopback HTTP for the daemon → plugin calls and the plugin SDK
+# (plugins spec §16.1). No TLS provider, no HTTP/2, no proxy discovery.
+reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
 prometheus = "0.14.0"
 chacha20poly1305 = "0.11.0"
 rand = "0.10.2"

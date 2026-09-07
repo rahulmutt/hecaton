@@ -26,6 +26,6 @@ pub use lifecycle::{
     write_endpoint, write_pid,
 };
 pub use metrics::Metrics;
-pub use plugins::{PluginError, PluginHost, PluginHostConfig};
+pub use plugins::{PluginClient, PluginError, PluginHost, PluginHostConfig};
 pub use store::FileFleetStore;
 pub use vault::{Vault, VaultError, random_hex};

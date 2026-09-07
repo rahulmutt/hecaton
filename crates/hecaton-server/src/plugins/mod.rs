@@ -1,6 +1,7 @@
 //! Plugins in the daemon (plugins spec §2.1, §5.2): the declarative file,
 //! package install, and the host that drives them as the `hecaton` fleet.
 
+pub mod client;
 pub mod config;
 pub mod host;
 pub mod manifest;
@@ -9,6 +10,7 @@ pub mod package;
 
 use std::path::PathBuf;
 
+pub use client::{CallFailure, PluginClient};
 pub use config::{Source, load_plugins_file, resolve_source};
 pub use host::{PluginHost, PluginHostConfig};
 pub use manifest::read_manifest;
