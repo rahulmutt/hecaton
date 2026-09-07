@@ -335,6 +335,17 @@ impl Attach {
     }
 }
 
+/// What one read of the watch socket produced.
+enum Frame {
+    /// A complete fleets list.
+    List(Vec<FleetRecord>),
+    /// A frame that is not a list (a pong, a ping, an unparsable body):
+    /// keep reading the same socket.
+    Skipped,
+    /// The socket is finished; a new one has to be opened.
+    Closed,
+}
+
 /// `fleets/watch` as a stream of complete lists (§18.4). Every frame is
 /// the whole list, so a reconnect simply yields it again.
 pub struct FleetWatch {
@@ -344,39 +355,65 @@ pub struct FleetWatch {
 }
 
 impl FleetWatch {
-    /// The next complete list. Never ends: a dropped socket is reconnected
-    /// with a 1–10 s backoff; drop the watch to stop.
+    /// The next complete list. Never ends: a refused handshake and a lost
+    /// socket are both retried behind the same 1–10 s backoff — a daemon
+    /// that accepts the handshake and then ends the stream at once must
+    /// not turn into a connect/close storm — and only a frame that
+    /// actually arrives resets it. Drop the watch to stop.
     pub async fn next(&mut self) -> Vec<FleetRecord> {
         loop {
             if self.socket.is_none() {
                 match self.host.connect("fleets/watch").await {
-                    Ok(s) => {
-                        self.socket = Some(s);
-                        self.backoff = BACKOFF_MIN;
-                    }
+                    Ok(s) => self.socket = Some(s),
                     Err(e) => {
                         eprintln!(
                             "{}: fleets/watch: {e}; retrying in {:?}",
                             self.host.env.name, self.backoff
                         );
-                        tokio::time::sleep(self.backoff).await;
-                        self.backoff = (self.backoff * 2).min(BACKOFF_MAX);
+                        self.wait().await;
                         continue;
                     }
                 }
             }
-            let Some(socket) = self.socket.as_mut() else {
-                continue;
-            };
-            match socket.next().await {
-                Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
-                    Ok(list) => return list,
-                    Err(e) => eprintln!("{}: fleets/watch: bad frame: {e}", self.host.env.name),
-                },
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => self.socket = None,
-                Some(Ok(_)) => {}
+            match self.frame().await {
+                Frame::List(list) => {
+                    self.backoff = BACKOFF_MIN;
+                    return list;
+                }
+                Frame::Skipped => {}
+                Frame::Closed => {
+                    self.socket = None;
+                    self.wait().await;
+                }
             }
         }
+    }
+
+    /// One frame from the open socket. `Closed` for a socket that is
+    /// gone — including the `None` the loop above has just ruled out, so
+    /// an impossible state waits like any other loss instead of spinning.
+    async fn frame(&mut self) -> Frame {
+        let name = self.host.env.name.clone();
+        let Some(socket) = self.socket.as_mut() else {
+            return Frame::Closed;
+        };
+        match socket.next().await {
+            Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
+                Ok(list) => Frame::List(list),
+                Err(e) => {
+                    eprintln!("{name}: fleets/watch: bad frame: {e}");
+                    Frame::Skipped
+                }
+            },
+            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => Frame::Closed,
+            Some(Ok(_)) => Frame::Skipped,
+        }
+    }
+
+    /// Waits out the current backoff, then doubles it up to `BACKOFF_MAX`.
+    async fn wait(&mut self) {
+        tokio::time::sleep(self.backoff).await;
+        self.backoff = (self.backoff * 2).min(BACKOFF_MAX);
     }
 }
 
@@ -527,6 +564,45 @@ mod tests {
             .await
             .expect("reconnected");
         assert_eq!(after[0].name(), "again");
+    }
+
+    /// A daemon that accepts the handshake and then ends the stream at
+    /// once — `watch.rs` returns without a frame when a list will not
+    /// serialize — must not be reconnected in a tight loop: the backoff
+    /// is the throttle for a lost socket, not only for a refused one.
+    #[tokio::test]
+    async fn a_socket_lost_after_the_handshake_waits_out_the_backoff() {
+        let fake =
+            std::sync::Arc::new(FakeHost::start("tok", json!({}), vec![record("payments")]).await);
+        let host = Host::new(fake.env("web", std::path::Path::new("/s"))).unwrap();
+        let mut watch = host.watch_fleets();
+        assert_eq!(
+            watch.next().await.len(),
+            1,
+            "the first frame arrives at once"
+        );
+        // Close every watch socket as fast as they open: without the
+        // backoff this is an unthrottled connect/close storm, and each
+        // reconnect would hand `next` the list again within milliseconds.
+        let closing = tokio::spawn({
+            let fake = std::sync::Arc::clone(&fake);
+            async move {
+                loop {
+                    fake.drop_watchers();
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            }
+        });
+        let quick = tokio::time::timeout(BACKOFF_MIN / 2, watch.next()).await;
+        assert!(
+            quick.is_err(),
+            "a lost socket was reconnected inside the {BACKOFF_MIN:?} floor: {quick:?}"
+        );
+        closing.abort();
+        let after = tokio::time::timeout(std::time::Duration::from_secs(5), watch.next())
+            .await
+            .expect("reconnected once the daemon stopped closing");
+        assert_eq!(after.len(), 1);
     }
 
     #[tokio::test]
