@@ -29,12 +29,15 @@ against what was declared.
   deep-merges settings layers as JSON values, types and validates each agent.
 - `hecaton-server` — the daemon: one actor task per fleet over the reconciler,
   `FileFleetStore` with an encrypted `secrets.enc`, axum routes, hook ingress,
-  `/metrics`. Depends on `core` + `api` only; the binary hands it the runtime.
+  `/metrics`, `plugins/`: `plugins.yaml` sync, package install, `PluginHost`.
+  Depends on `core` + `api` only; the binary hands it the runtime.
 - `hecaton` — the binary, and the only crate allowed to see both ports and
   adapters; it does the wiring.
 - `hecaton-runtime` — driven adapters over git, gh, mise, nono, tmux. One
   module per materialization step; every path from StateLayout, every binary
   from ToolPaths; never reads the process environment.
+- `hecaton-plugin-sdk` — the plugin side of the host protocol; depends on
+  `api` only. Phase 1 ships `Env` and `hello`.
 
 ## How it flows
 **Config (Phase 1):** `read` (file.rs) → `resolve` (resolve.rs): for each agent fold
@@ -60,6 +63,16 @@ that `GET` reads. Agents post hook events to `/v1/agents/{f}/{c}/{a}/events` wit
 their secret; `SessionStart` arrives via `hecaton hook-relay` (a command hook) and
 turns the agent `Ready`, which is what `up` waits for. `down` sets `desired: Down`;
 a clean terminating pass settles in `Down`, `--purge` deletes the directory.
+
+**Plugins (Spec B, phase 1):** `serve` syncs `$XDG_CONFIG_HOME/hecaton/plugins.yaml`
+— installs tarballs under `$XDG_DATA_HOME/hecaton/plugins/<name>/<digest12>/`,
+validates manifests — and renders the list as a synthetic fleet
+`hecaton`/`plugins`/`<name>` that an ordinary fleet actor reconciles.
+`PluginMaterializer` maps each synthetic agent back to its plugin and the
+runtime materializes it like an agent under `plugins/<name>/` (`home/`,
+profile, `launch.sh` running `nono run → mise run <start>` from the package
+root). The actor's per-agent hook secret is the plugin's token;
+`POST /v1/plugin-host/hello` verifies it and is the plugin's `SessionStart`.
 
 ## Non-obvious decisions
 - **Merge is a left fold, not associative.** `null` means "delete relative to the
@@ -107,3 +120,20 @@ a clean terminating pass settles in `Down`, `--purge` deletes the directory.
 - **The sandbox pins mise's config walk** (`MISE_CEILING_PATHS` = the agent
   workspace) because mise applies an untrusted repo `mise.toml`'s `[tools]`; a
   repo's own mise config is therefore invisible to agents, by design.
+- **Plugins ride the reconciler as a synthetic fleet.** `plugin_fleet()`
+  renders plugins as agents whose only setting is the plugin hash;
+  `plan`/`execute`/`apply` were not touched, and `cargo mutants` still covers
+  them for plugins too (PB-5).
+- **The plugin token is the hook secret.** One minting path, one index, one
+  constant-time check; `hello` is authenticated exactly like a hook event.
+- **`hecaton` is a reserved fleet name.** Rejected client-side (`config
+  resolve`) and by `POST`/`DELETE /v1/fleets`; readable through `GET
+  /v1/fleets/hecaton` and `hecaton status hecaton`; never a fleet-list row.
+- **`plugins.yaml` is the record.** The plugin actor persists nothing
+  (`NullStore`); state survives removal under `plugins/<name>/` until
+  `--purge`.
+- **The package's `mise.toml` is used in place.** Never copied: the sandboxed
+  `mise run` finds it as the local config from the package cwd (no
+  `MISE_GLOBAL_CONFIG_FILE` inside the sandbox; `MISE_CEILING_PATHS` =
+  package parent + plugin home), while the daemon-side `mise trust`/`mise
+  install` name it through `MISE_GLOBAL_CONFIG_FILE`.

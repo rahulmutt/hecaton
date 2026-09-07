@@ -16,7 +16,13 @@ a repository.
 6. `mise x -- cargo run -q -p hecaton -- up my-fleet.yaml` — point `repo:` at a repository you
    can clone; waits until every agent's Claude has started. Then `status <fleet>`, `list`,
    and `down <fleet> --keep` (repos and homes survive; `--purge` removes everything).
-7. `mise x -- cargo run -q -p hecaton -- dev materialize examples/payments.yaml backend/bob --no-host-defaults`
+7. `mise x -- cargo run -q -p hecaton -- plugin install ./my-plugin` — declares a
+   plugin package (a directory with `mise.toml` and `hecaton-plugin.yaml`) in
+   `$XDG_CONFIG_HOME/hecaton/plugins.yaml` and syncs the daemon; `plugin list`
+   shows its phase, `plugin remove <name> [--purge]` takes it out. `plugin
+   package <dir>` builds the tarball and prints the `sha256` a `plugins.yaml`
+   entry needs.
+8. `mise x -- cargo run -q -p hecaton -- dev materialize examples/payments.yaml backend/bob --no-host-defaults`
    — renders bob's generated files into a temp dir without launching anything.
 
 ## Where to look
@@ -26,6 +32,6 @@ a repository.
 - `docs/THREAT-MODEL.md` — what is protected, from whom, and what is out of scope.
 
 ## Status
-Spec A is complete: configuration (Phase 1), runtime (Phase 2) and the control
-plane (Phase 3: daemon, API, hook ingress, CLI). Next is Spec B, the `flow`
-state machine over hook events.
+Spec A is complete. Spec B (plugins) is in progress: phase 1, plugin
+workloads, is done — packages, `plugins.yaml`, the sandboxed plugin fleet and
+`hello`; the event protocol and the `flow` plugin are next.

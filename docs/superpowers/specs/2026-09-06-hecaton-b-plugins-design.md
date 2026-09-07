@@ -245,18 +245,20 @@ plugins/<name>/
   home/            HOME, XDG_CONFIG_HOME…, TMPDIR=home/tmp (0700)
   nono/            nono's own $HOME (its state root), as for agents
   kv/  scratch/    §4.1
-  mise.toml        copy of the package's, MISE_GLOBAL_CONFIG_FILE
+  (no mise.toml copy — the package's own is used in place, see §15)
   nono-profile.json  0600; carries HECATON_PLUGIN_TOKEN
   launch.sh        cd <package>; exec nono run --profile … -- mise run <start>
   logs/
 ```
 
 `mise install` runs with the shared `MISE_DATA_DIR` so tools are shared with
-agents when versions match; `MISE_CEILING_PATHS` is the package directory. The
-base profile grants: read on `/usr`, `/lib`, `/lib64`, `/bin`, `/etc`, the mise
-data dir, the package directory, the hecaton binary and the plugin's own
-`mise.toml`; read-write on `home/` and `scratch/`, and **no** grant on `kv/`
-(KV goes through the API); `network.open_port: [<daemon port>]`;
+agents when versions match; `MISE_CEILING_PATHS` is the package's parent
+directory plus the plugin's home, so mise's upward config walk sees neither
+above the package nor above the plugin's own `$HOME` (see §15). The base
+profile grants: read on `/usr`, `/lib`, `/lib64`, `/bin`, `/etc`, the mise
+data dir, the package directory (which holds its own `mise.toml`), and the
+hecaton and mise binaries; read-write on `home/` and `scratch/`, and **no**
+grant on `kv/` (KV goes through the API); `network.open_port: [<daemon port>]`;
 `environment.set_vars` = `HOME`, `XDG_*`, `TMPDIR`, `PATH`,
 `HECATON_API_URL`, `HECATON_PLUGIN_NAME`, `HECATON_PLUGIN_TOKEN`,
 `HECATON_PLUGIN_SCRATCH`, with `deny_vars: ["*"]`. The manifest's `sandbox`
@@ -454,7 +456,7 @@ brainstorm" line is left as history.
 
 | Assumption | Fallback |
 |---|---|
-| a nono profile can let the plugin bind a loopback listener (`network.open_port` or a listen-side equivalent) | the plugin listens on a Unix socket in `scratch/` and reports its path in `hello`; the daemon, unsandboxed, connects to it |
+| a nono profile can let the plugin bind a loopback listener (`network.open_port` or a listen-side equivalent) | **Verified 2026-09-06** (nono 0.75.0, e2e plugin_hello_journey): dev fake-plugin binds 127.0.0.1:0 inside the profile and reports it in hello; the Unix-socket fallback is not needed. |
 | `ttyd --base-path` works behind two WebSocket proxies | `web` embeds xterm.js and a WS bridge and drops `ttyd` |
 | tmux `attach-session` on the private socket gives a clean PTY for `attach` (via `portable-pty` or `openpty`) | `pipe-pane` for output and `send-keys` for input, no resize |
 | hecaton's `hyper`/`hyper-util` WebSocket upgrade passthrough works for `axum`'s upgrade path | `tokio-tungstenite` on both sides with frame-level copying |
@@ -499,3 +501,17 @@ Three mergeable phases, each fully tested before the next:
 - Every row of §11.1 has a recorded verdict.
 - `cargo mutants -p hecaton-core` still reports no surviving mutants in
   `reconcile`.
+
+## 15. Refinements from the phase 1 plan (2026-09-06)
+
+- Plugins are driven through a synthetic `Fleet` (`hecaton_core::plugin_fleet`); the reconciler is unchanged and `PluginMaterializer` maps the ids back.
+- The plugin token is the actor's per-agent hook secret, delivered through the `HookTarget` the executor already passes; `hello` authenticates with `Daemon::verify_secret`.
+- The package's `mise.toml` is used in place, never copied: the sandboxed `mise run` finds it as the local config from the package cwd (no `MISE_GLOBAL_CONFIG_FILE` inside the sandbox; `MISE_CEILING_PATHS` = package parent + plugin home), while the daemon-side `mise trust`/`mise install` name it through `MISE_GLOBAL_CONFIG_FILE`.
+- The tmux session is `hecaton/plugins`.
+- The reserved name is enforced at the API and in `hecaton_config::resolve`, not in `FleetName`.
+- `Materializer` gains `materialize_plugin` and `purge_plugin`.
+- `PluginStatus` has no `active_agents` until Phase 2.
+- `plugin install` syncs only when a daemon is running; `plugin remove --purge` requires one.
+- Unpacked package directories are 0755 (files 0444/0555) so `--purge` is a plain `remove_dir_all`.
+- `plugins.yaml` is written atomically by `plugin install|remove` (temp file + rename).
+- `PluginError::Fetch` carries `url`, not `source`.
