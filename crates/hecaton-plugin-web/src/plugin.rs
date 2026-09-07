@@ -1,6 +1,6 @@
 //! The `Plugin` impl (plugins spec §18.5): a per-agent `enabled` flag, the
 //! cache `fleets/watch` feeds, and the two terminal metrics. The routes
-//! (Task 8) share `Shared` with it.
+//! (`crate::routes`) share `Shared` with it.
 
 use std::sync::Arc;
 
@@ -86,16 +86,7 @@ impl Plugin for WebPlugin {
         Some(&self.metrics)
     }
 
-    // Minimal placeholder: Task 8 replaces this with the real router
-    // (pages, assets, `/agents.json`, the terminal bridge).
     fn routes(&self) -> Option<axum::Router> {
-        let shared = self.shared.clone();
-        Some(axum::Router::new().route(
-            "/agents.json",
-            axum::routing::get(move || {
-                let shared = shared.clone();
-                async move { axum::Json(shared.cache.rows()) }
-            }),
-        ))
+        Some(crate::routes::router(self.shared.clone()))
     }
 }

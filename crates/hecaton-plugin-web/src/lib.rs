@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod plugin;
+pub mod routes;
 pub mod state;
 
 pub use config::{ConfigError, WebConfig, parse};
