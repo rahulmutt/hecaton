@@ -132,7 +132,11 @@ degraded. Never causes a restart.
 **`metrics`**: Prometheus text. Every family name — `# TYPE`/`# HELP` lines
 and samples alike — must start with `hecaton_plugin_<name>_`
 (`metrics.json`'s `hecaton_plugin_flow_state`); the daemon drops a body
-that breaks this rule instead of re-exposing it.
+that breaks this rule instead of re-exposing it. The Rust SDK's
+`hecaton_plugin_sdk::Metrics` registers every family under that prefix and
+`Plugin::metrics` returns it for the router to render, so an SDK plugin
+cannot break the rule; a plugin in another language formats the text
+itself and must apply the prefix.
 
 ## 5. Activation lifecycle
 

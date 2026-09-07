@@ -662,6 +662,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "hecaton-api",
+ "prometheus",
  "reqwest",
  "serde",
  "serde_json",
