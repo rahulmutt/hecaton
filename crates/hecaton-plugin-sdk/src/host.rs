@@ -267,10 +267,12 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(e, SdkError::Transport(_)), "{e}");
-        let dbg = format!(
-            "{:?}",
-            Host::new(fake.env("flow", std::path::Path::new("/s"))).unwrap()
+        let mut env = fake.env("flow", std::path::Path::new("/s"));
+        env.token = "s3cret-value".into();
+        let dbg = format!("{:?}", Host::new(env).unwrap());
+        assert!(
+            !dbg.contains("s3cret-value") && dbg.contains("<redacted>"),
+            "{dbg}"
         );
-        assert!(!dbg.contains("tok"), "{dbg}");
     }
 }

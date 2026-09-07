@@ -31,7 +31,7 @@ impl fmt::Debug for Env {
         f.debug_struct("Env")
             .field("api_url", &self.api_url)
             .field("name", &self.name)
-            .field("auth", &"<redacted>")
+            .field("token", &"<redacted>")
             .field("scratch", &self.scratch)
             .finish()
     }

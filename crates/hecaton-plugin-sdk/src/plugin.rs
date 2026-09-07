@@ -176,9 +176,28 @@ pub async fn run<P: Plugin>(
 /// when the server stops.
 pub async fn serve<P: Plugin>(host: &Host, version: &str, plugin: P) -> Result<(), SdkError> {
     let (listener, listen) = bind().await?;
+    serve_on(host, version, plugin, listener, listen).await
+}
+
+/// `serve`'s body, taking an already-bound listener so tests can observe
+/// its address. If `hello` fails, the spawned server is aborted (and
+/// awaited, so the port is free again) before the error is returned — a
+/// dropped `JoinHandle` alone would only detach the task, leaking the
+/// listener and leaving `axum::serve` running forever.
+async fn serve_on<P: Plugin>(
+    host: &Host,
+    version: &str,
+    plugin: P,
+    listener: tokio::net::TcpListener,
+    listen: String,
+) -> Result<(), SdkError> {
     let plugin = Arc::new(plugin);
     let server = tokio::spawn(run(listener, plugin));
-    host.hello(version, &listen).await?;
+    if let Err(e) = host.hello(version, &listen).await {
+        server.abort();
+        let _ = server.await;
+        return Err(e);
+    }
     server.await.map_err(|e| SdkError::Bind(e.to_string()))?
 }
 
@@ -404,5 +423,46 @@ mod tests {
             200
         );
         handle.abort();
+    }
+
+    /// serve() must not leak the spawned server (and its listener) when
+    /// `hello` fails: dropping a `JoinHandle` only detaches the task, it
+    /// does not cancel it.
+    #[tokio::test]
+    async fn a_failed_hello_stops_the_server_and_frees_the_port() {
+        let fake = crate::testing::FakeHost::start("tok", json!({}), vec![]).await;
+        let mut env = fake.env("rec", std::path::Path::new("/s"));
+        env.token = "wrong".into();
+        let host = Host::new(env).unwrap();
+        let (listener, listen) = bind().await.unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            serve_on(&host, "0.1.0", Silent, listener, listen.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&result, Err(SdkError::Status { status: 401, .. })),
+            "{result:?}"
+        );
+        assert!(fake.hellos().is_empty(), "the daemon never saw a hello");
+
+        // The abort is asynchronous: the aborted task's future (and the
+        // listener it owns) is dropped on the runtime's next poll, not
+        // synchronously inside `abort()`. Retry briefly rather than
+        // asserting on the first attempt.
+        let freed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if tokio::net::TcpListener::bind(&listen).await.is_ok() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            freed.is_ok(),
+            "port {listen} not freed after the failed hello"
+        );
     }
 }
