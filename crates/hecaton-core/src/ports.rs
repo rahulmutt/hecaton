@@ -83,13 +83,7 @@ impl fmt::Debug for HookTarget {
     }
 }
 
-/// What `down` leaves behind (spec D6).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
-pub struct Keep {
-    pub repos: bool,
-    pub sessions: bool,
-}
+pub use hecaton_api::Keep;
 
 /// First line of a tool's stderr, for one-line error displays.
 pub fn first_line(s: &str) -> &str {

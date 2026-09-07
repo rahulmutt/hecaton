@@ -106,6 +106,9 @@ pub struct PluginStatus {
     pub routes: bool,
     #[serde(default)]
     pub message: String,
+    /// Agents this plugin is currently `Active` for.
+    #[serde(default)]
+    pub active_agents: u32,
 }
 
 /// What `POST /v1/plugins/sync` did, by plugin name.
@@ -219,9 +222,16 @@ mod tests {
             listen: Some("127.0.0.1:4321".into()),
             routes: true,
             message: String::new(),
+            active_agents: 0,
         };
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["phase"], "ready");
+        assert_eq!(v["active_agents"], 0);
+        let older: PluginStatus = serde_json::from_value(json!({
+            "name": "web", "version": "0.1.0", "phase": "ready", "routes": false
+        }))
+        .unwrap();
+        assert_eq!(older.active_agents, 0, "a phase 1 row still loads");
         let rep = SyncReport::default();
         assert!(rep.installed.is_empty() && rep.stopped.is_empty() && rep.unchanged.is_empty());
         assert_eq!(PLUGIN_KIND, "Plugin");

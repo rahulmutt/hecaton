@@ -10,6 +10,8 @@ pub mod credentials;
 pub mod fleet;
 pub mod hook;
 pub mod plugin;
+pub mod protocol;
+pub mod record;
 pub mod request;
 pub mod settings;
 pub mod status;
@@ -21,10 +23,16 @@ pub use plugin::{
     Capability, HelloRequest, HelloResponse, HookSubscriptions, PLUGIN_KIND, PLUGIN_PROTOCOL,
     PluginEntry, PluginManifest, PluginStatus, PluginsFile, SyncReport,
 };
+pub use protocol::{
+    ActivateRequest, CHAIN_BUDGET_MS, DeactivateRequest, EventBatch, InterceptRequest,
+    InterceptResponse, KvKeys, OBSERVER_BATCH, OBSERVER_QUEUE, PluginAction,
+};
+pub use record::{Desired, FleetRecord, Keep};
 pub use request::{DownQuery, ErrorBody, FleetRequest};
 pub use settings::{AgentSettings, ClaudeSettings, RunnerSettings};
 pub use status::{
-    AgentPhase, AgentStatus, FleetPhase, FleetStatus, FleetSummary, SpecHash, Timestamp,
+    ActivationState, AgentPhase, AgentStatus, FleetPhase, FleetStatus, FleetSummary,
+    PluginActivation, SpecHash, Timestamp,
 };
 
 #[cfg(test)]

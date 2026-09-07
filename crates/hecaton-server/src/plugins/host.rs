@@ -280,6 +280,7 @@ impl PluginHost {
                     listen: listen.get(&p.name).cloned(),
                     routes: p.manifest.routes,
                     message: st.map(|s| s.message.clone()).unwrap_or_default(),
+                    active_agents: 0,
                 }
             })
             .collect()

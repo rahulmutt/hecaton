@@ -257,6 +257,7 @@ mod tests {
                 listen: Some("127.0.0.1:4000".into()),
                 routes: false,
                 message: String::new(),
+                active_agents: 0,
             },
             PluginStatus {
                 name: "web".into(),
@@ -265,6 +266,7 @@ mod tests {
                 listen: None,
                 routes: true,
                 message: "exited with status 1".into(),
+                active_agents: 0,
             },
         ];
         assert_eq!(
