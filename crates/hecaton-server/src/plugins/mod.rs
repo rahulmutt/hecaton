@@ -2,6 +2,7 @@
 //! package install, and the host that drives them as the `hecaton` fleet.
 
 pub mod activation;
+pub mod chain;
 pub mod client;
 pub mod config;
 pub mod host;
@@ -13,6 +14,7 @@ pub mod registry;
 
 use std::path::PathBuf;
 
+pub use chain::{ObserverQueue, PluginEventHandler};
 pub use client::{CallFailure, PluginClient};
 pub use config::{Source, load_plugins_file, resolve_source};
 pub use host::{PluginHost, PluginHostConfig};
