@@ -696,6 +696,7 @@ dependencies = [
  "flate2",
  "hecaton-api",
  "hecaton-core",
+ "hecaton-plugin-sdk",
  "hex",
  "prometheus",
  "proptest",
