@@ -103,8 +103,9 @@ credentials, hook input, or sandbox rules.
   of the sandbox (`plugin.rs::plugin_env` explains).
 - `hecaton dev fake-plugin` is what the plugin e2e runs; it binds a loopback
   listener under nono and says hello through the SDK.
-- `plugin remove --purge` (and `down --purge`, same `Runtime::rm_rf`) can
-  answer 500 `Directory not empty`: `tmux kill-window` returns before nono
-  finishes writing its ledger under `plugins/<name>/nono/`, so
-  `remove_dir_all` races it (~1 in 20 runs). The plugin e2e retries its final
-  purge for that reason; the fix belongs in `rm_rf`.
+- `plugin remove --purge` (and `down --purge`) used to answer 500 `Directory
+  not empty` about one run in twenty: `tmux kill-window` returns before nono
+  finishes writing its ledger under `plugins/<name>/nono/`. Fixed on both
+  sides — `PluginHost::purge` waits (30 s) for the actor to take the plugin
+  out of the record before deleting anything, and `Runtime::rm_rf` retries
+  `remove_dir_all` for 5 s while the error is `DirectoryNotEmpty`.

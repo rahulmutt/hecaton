@@ -305,24 +305,32 @@ async fn plugins_sync_hello_list_and_purge() {
     let (s, report) = api.call("POST", "/v1/plugins/sync", admin, None);
     assert_eq!(s, 200);
     assert_eq!(report["stopped"], json!(["hello"]));
-    {
-        let r = h.runner.clone();
-        tokio::task::spawn_blocking(move || {
-            wait(|| {
-                r.calls()
-                    .contains(&"stop_agent hecaton/plugins/hello".to_string())
-            })
-        })
-        .await
-        .unwrap();
-    }
     assert!(daemon.plugins().list().await.is_empty());
     assert!(
         daemon.hook_secret(&id).await.is_none(),
         "a removed plugin's token is revoked"
     );
+    // The actor answers `Apply` before the pass that stops the plugin, so
+    // the sync above can return while the plugin is still running: purge
+    // must wait for the pass rather than delete under it. Nothing here
+    // waits for `stop_agent` — the DELETE does.
     let (s, _) = api.call("DELETE", "/v1/plugins/hello", admin, None);
     assert_eq!(s, 200);
+    assert!(
+        h.runner
+            .calls()
+            .contains(&"stop_agent hecaton/plugins/hello".to_string()),
+        "purge waited until the plugin was stopped"
+    );
+    assert!(
+        !daemon
+            .plugins()
+            .record()
+            .status
+            .agents
+            .contains_key("hecaton/plugins/hello"),
+        "and until the actor took it out of the record"
+    );
     assert!(
         h.materializer
             .calls()

@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use hecaton_api::{
     AgentPhase, CredentialBundle, FleetSpec, HelloRequest, HelloResponse, PLUGIN_PROTOCOL,
@@ -14,9 +15,9 @@ use hecaton_api::{
 };
 use hecaton_core::{
     AgentName, Clock, FleetRecord, FleetSecrets, Materializer, RESERVED_FLEET, ResolvedPlugin,
-    plugin_fleet,
+    plugin_fleet, plugin_id,
 };
-use tokio::sync::{Mutex, RwLock, oneshot};
+use tokio::sync::{Mutex, RwLock, oneshot, watch};
 
 use super::PluginError;
 use super::config::{load_plugins_file, resolve_source};
@@ -32,6 +33,31 @@ pub struct PluginHostConfig {
     pub plugins_file: PathBuf,
     /// `$XDG_DATA_HOME/hecaton/plugins`: unpacked packages.
     pub install_root: PathBuf,
+}
+
+/// How long `purge` waits for the actor to finish stopping the plugin
+/// before refusing to delete its state.
+const PURGE_WAIT: Duration = Duration::from_secs(30);
+
+/// Waits until `id` is absent from the published record. `Err(())` on
+/// timeout; a closed channel means the actor is gone and nothing of it is
+/// running, which is `Ok`.
+async fn wait_until_stopped(
+    status: &mut watch::Receiver<FleetRecord>,
+    id: &str,
+    timeout: Duration,
+) -> Result<(), ()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !status.borrow_and_update().status.agents.contains_key(id) {
+            return Ok(());
+        }
+        match tokio::time::timeout_at(deadline, status.changed()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Ok(()),
+            Err(_) => return Err(()),
+        }
+    }
 }
 
 pub struct PluginHost {
@@ -262,10 +288,24 @@ impl PluginHost {
     /// `plugin remove --purge`: only for a plugin no longer declared.
     /// Deletes `plugins/<name>/` through the materializer and the installed
     /// packages under `install_root/<name>/`.
+    ///
+    /// Holds the sync lock and waits for the actor to have taken the agent
+    /// out of the record before deleting: the actor answers `Apply` before
+    /// running the pass that stops the plugin, so a `sync` + `purge` pair
+    /// would otherwise delete `plugins/<name>/` out from under a process
+    /// that is still running.
     pub async fn purge(&self, name: &AgentName) -> Result<(), PluginError> {
+        let _guard = self.syncing.lock().await;
         if self.materializer.get(name).is_some() {
             return Err(PluginError::StillDeclared(name.to_string()));
         }
+        wait_until_stopped(
+            &mut self.handle.status.clone(),
+            &plugin_id(name).to_string(),
+            PURGE_WAIT,
+        )
+        .await
+        .map_err(|()| PluginError::Internal(format!("plugin {name} is still stopping")))?;
         let materializer = self.materializer.clone();
         let packages = self.config.install_root.join(name.as_str());
         let name = name.clone();
@@ -281,5 +321,60 @@ impl PluginHost {
         })
         .await
         .map_err(|e| PluginError::Internal(format!("purge task panicked: {e}")))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record_with(agent: Option<&str>) -> FleetRecord {
+        let mut record = FleetRecord::new(plugin_fleet(&[]).into());
+        if let Some(id) = agent {
+            record.status.entry(id);
+        }
+        record
+    }
+
+    /// `purge` may only delete once the actor's pass has taken the agent
+    /// out of the record — the `Apply` reply lands before that pass.
+    #[tokio::test]
+    async fn the_purge_wait_returns_when_the_agent_leaves_the_record() {
+        let id = "hecaton/plugins/hello";
+        let (tx, rx) = watch::channel(record_with(Some(id)));
+        let mut rx2 = rx.clone();
+        let waiter =
+            tokio::spawn(async move { wait_until_stopped(&mut rx2, id, PURGE_WAIT).await });
+        // still there: the wait is pending
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished());
+        tx.send_replace(record_with(Some(id)));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished(), "an unrelated update is not enough");
+        tx.send_replace(record_with(None));
+        assert_eq!(waiter.await.unwrap_or_else(|e| panic!("{e}")), Ok(()));
+
+        // an actor that is gone entirely is not something to wait for
+        let (tx, mut rx) = watch::channel(record_with(Some(id)));
+        drop(tx);
+        assert_eq!(wait_until_stopped(&mut rx, id, PURGE_WAIT).await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn the_purge_wait_times_out_while_the_agent_is_still_there() {
+        let id = "hecaton/plugins/hello";
+        let (_tx, mut rx) = watch::channel(record_with(Some(id)));
+        let start = std::time::Instant::now();
+        assert_eq!(
+            wait_until_stopped(&mut rx, id, Duration::from_millis(50)).await,
+            Err(())
+        );
+        assert!(start.elapsed() >= Duration::from_millis(50));
+        // a record that never held it does not wait at all
+        let (_tx, mut rx) = watch::channel(record_with(None));
+        assert_eq!(
+            wait_until_stopped(&mut rx, id, Duration::from_millis(50)).await,
+            Ok(())
+        );
     }
 }

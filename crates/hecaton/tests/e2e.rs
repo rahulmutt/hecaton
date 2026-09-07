@@ -4,6 +4,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
@@ -512,7 +513,13 @@ fn plugin_hello_journey() {
     );
 
     // the token is in the profile (0600) and nowhere else
-    let profile = fs::read_to_string(plugin_dir.join("nono-profile.json")).unwrap();
+    let profile_path = plugin_dir.join("nono-profile.json");
+    assert_eq!(
+        fs::metadata(&profile_path).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "the profile carries the plugin token"
+    );
+    let profile = fs::read_to_string(&profile_path).unwrap();
     let token = profile
         .split("\"HECATON_PLUGIN_TOKEN\": \"")
         .nth(1)
@@ -599,27 +606,12 @@ fn plugin_hello_journey() {
         "state survives removal"
     );
 
-    // Purge on an undeclared plugin deletes the state. nono flushes its
-    // audit ledger and session file into `plugins/hello/nono` while it
-    // exits, which is after tmux has already dropped the window, so a
-    // purge that lands inside that window loses a race with the daemon's
-    // `remove_dir_all` and answers "Directory not empty (os error 39)".
-    // Closing that race is the daemon's job (reported with this task);
-    // until then the journey retries rather than flaking, and every
-    // attempt after the first is the already-undeclared path.
-    let start = Instant::now();
-    let out = loop {
-        let out = w.run(&["plugin", "remove", "hello", "--purge"]);
-        if out.status.success() {
-            break String::from_utf8_lossy(&out.stdout).into_owned();
-        }
-        assert!(
-            start.elapsed() < Duration::from_secs(30),
-            "purge never succeeded: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        std::thread::sleep(Duration::from_millis(250));
-    };
+    // Purge on an undeclared plugin deletes the state, first time. nono
+    // flushes its audit ledger and session file into `plugins/hello/nono`
+    // while it exits, which is after tmux has already dropped the window:
+    // the daemon waits for the plugin to leave the record and retries
+    // `remove_dir_all` on `Directory not empty`, so one attempt is enough.
+    let out = w.ok(&["plugin", "remove", "hello", "--purge"]);
     assert!(out.contains("purged"), "{out}");
     assert!(!plugin_dir.exists(), "purge deletes plugins/hello");
     drop(w);
