@@ -111,7 +111,11 @@ acknowledges, anything else is logged and counted, and there is no
 catch-up for what was missed while the plugin was not `Ready`. A
 `HookEvent` is `{ agent, name, session_id?, received_at, payload }`
 (`events.json`; `session_id` is omitted when absent, present in
-`intercept.json`'s event).
+`intercept.json`'s event). `hecaton_plugin_events_dropped_total{plugin}`
+counts every event that never reached the plugin: those dropped on queue
+overflow, and — a whole batch at a time — those whose batch was ready to
+send while the plugin was not, and those whose batch the plugin did not
+acknowledge.
 
 **`intercept`**: `response_so_far` is the chain's response before this
 plugin (`{}` for the first); `deadline_ms` is what remains of the chain's
@@ -137,10 +141,14 @@ An agent's `(agent, plugin)` pair is one of three states, visible in
 yet sent because the plugin was not `Ready`), **active** (the plugin
 answered 2xx), or **rejected** (the plugin's non-2xx, with its message).
 
-Every `hello` re-sends `activate` for every pair the daemon still
-considers active or pending, pending or active alike, so a restarted
-plugin recovers its activations without the daemon persisting anything
-about them. A pair is deactivated when its fleet goes `down`, when an `up`
+Every `hello` re-sends `activate` for every row the daemon holds for that
+plugin — pending, active and **rejected** alike, since re-offering a
+rejected pair is how it recovers — so a restarted plugin gets its
+activations back without the daemon persisting anything about them. The
+answer to each is the pair's new state: a pair rejected before can become
+active, and one active before can be rejected. An `up` or `update` also
+re-offers every pair whose row is not `active`, even when its config did
+not change. A pair is deactivated when its fleet goes `down`, when an `up`
 or `update` drops the plugin from the agent's spec, or on a config change
 for that pair (immediately followed by the new `activate`). A `rejected`
 pair does not stop the agent — the fleet keeps running, and a plugin that
@@ -161,11 +169,13 @@ Two tests replay every fixture:
   `daemon-to-plugin` fixture through the SDK's `router` (a real HTTP round
   trip to a `Reference` plugin), and every `plugin-to-daemon` fixture
   through the SDK's `Host` against `hecaton_plugin_sdk::testing::FakeHost`.
-- `crates/hecaton-server/tests/protocol_it.rs` — the daemon's own
-  `PluginClient` sends the `activate`, `activate-rejected`, `events` and
-  `intercept` fixtures' `request` bodies to
-  `hecaton_server::testing::stub_plugin` and checks the bytes it recorded,
-  and that the parsed verdict matches the fixture's `response`.
+- `crates/hecaton-server/tests/protocol_it.rs` — every `daemon-to-plugin`
+  fixture through the daemon's own `PluginClient` against
+  `hecaton_server::testing::stub_plugin`: the `activate`,
+  `activate-rejected`, `events` and `intercept` `request` bodies are
+  checked against the bytes the stub recorded (and the parsed verdict
+  against the fixture's `response`), and `health`/`metrics`, which carry a
+  `raw` body and no request, against what the client makes of it.
 
 Two statuses no fixture carries because `hecaton_plugin_sdk::testing::FakeHost`
 does not gate capabilities or activation the way the real daemon does — the

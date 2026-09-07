@@ -1,5 +1,9 @@
 //! Model-based test (Phase 2 spec §3, §6): the reconciler against a reference
-//! model over random up / update / down / exit / ready / tick sequences.
+//! model over random up / update / down / stop / resume / exit / ready / tick
+//! sequences. `stop` and `resume` are the per-agent desired state a plugin
+//! action sets (plugins spec §16.4): a stopped agent is stopped if observed,
+//! never restarted, and its restart counter is untouched; an `up` releases
+//! every agent it declares and an `update` releases the whole set.
 #![allow(clippy::unwrap_used)]
 
 use std::collections::{BTreeMap, BTreeSet};

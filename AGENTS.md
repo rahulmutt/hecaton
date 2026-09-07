@@ -116,7 +116,10 @@ credentials, hook input, or sandbox rules.
 - `up` waits for plugin activations as well as `Ready`; a `fake=pending` in
   the timeout table means the plugin never said `hello` (look at
   `plugins/<name>/logs/`), a `rejected` row fails `up` at once with the
-  plugin's message.
+  plugin's message. Re-running `update` after fixing the plugin does
+  re-attempt it: `Daemon::apply` diffs against the fleet's *active* rows
+  only, so a pending or rejected pair is offered again even though its
+  config did not change (R24).
 - The activation table is not persisted: after a daemon restart every pair
   is `pending` until the plugin's next `hello`, which re-activates all of
   them.

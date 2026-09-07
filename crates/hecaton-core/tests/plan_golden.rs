@@ -1,4 +1,4 @@
-//! Plans for four canned situations, rendered one step per line. Review a
+//! Plans for five canned situations, rendered one step per line. Review a
 //! `.snap.new` against the expected step lists in the Phase 2 plan, Task 7.
 #![allow(clippy::unwrap_used)]
 

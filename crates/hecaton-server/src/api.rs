@@ -73,6 +73,13 @@ impl From<DaemonError> for ApiError {
 
 impl From<PluginError> for ApiError {
     fn from(e: PluginError) -> Self {
+        // A KV failure names the daemon's own on-disk path; the body goes
+        // to a sandboxed plugin, which has no business learning it. The
+        // operator gets the real one in the log.
+        if let PluginError::Kv { path, message } = &e {
+            tracing::warn!(path = %path.display(), "plugin kv storage error: {message}");
+            return Self::new(StatusCode::INTERNAL_SERVER_ERROR, "kv: storage error");
+        }
         let status = match &e {
             PluginError::Config { .. }
             | PluginError::Manifest(_)
@@ -336,4 +343,23 @@ async fn purge_plugin(
         .map_err(|e: NameError| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
     state.daemon.plugins().purge(&name).await?;
     Ok(Json(json!({})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A KV failure must not render the daemon's on-disk path into a body
+    /// a sandboxed plugin reads.
+    #[test]
+    fn a_kv_storage_error_is_a_fixed_500() {
+        let e = ApiError::from(PluginError::Kv {
+            path: "/home/op/.local/share/hecaton/plugins/flow/kv/k".into(),
+            message: "permission denied".into(),
+        });
+        assert_eq!(
+            (e.status, e.message.as_str()),
+            (StatusCode::INTERNAL_SERVER_ERROR, "kv: storage error")
+        );
+    }
 }

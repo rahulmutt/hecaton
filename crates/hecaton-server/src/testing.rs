@@ -119,6 +119,7 @@ impl Harness {
             plugin_dir,
             token,
             Metrics::new().unwrap_or_else(|e| panic!("metrics: {e}")),
+            Vec::new(),
         )
     }
 
@@ -131,7 +132,24 @@ impl Harness {
         plugin_dir: &Path,
         metrics: Metrics,
     ) -> Arc<Daemon> {
-        self.daemon_full(handler, plugin_dir, "admin-tok", metrics)
+        self.daemon_full(handler, plugin_dir, "admin-tok", metrics, Vec::new())
+    }
+
+    /// The same, starting from stored records — what a daemon restart
+    /// hands `Daemon::start`.
+    pub fn daemon_with_existing(
+        &self,
+        handler: Arc<dyn DaemonHandler>,
+        plugin_dir: &Path,
+        existing: Vec<(FleetRecord, FleetSecrets)>,
+    ) -> Arc<Daemon> {
+        self.daemon_full(
+            handler,
+            plugin_dir,
+            "admin-tok",
+            Metrics::new().unwrap_or_else(|e| panic!("metrics: {e}")),
+            existing,
+        )
     }
 
     fn daemon_full(
@@ -140,6 +158,7 @@ impl Harness {
         plugin_dir: &Path,
         token: &str,
         metrics: Metrics,
+        existing: Vec<(FleetRecord, FleetSecrets)>,
     ) -> Arc<Daemon> {
         let ports = Ports {
             materializer: self.materializer.clone(),
@@ -155,7 +174,7 @@ impl Harness {
             handler,
             metrics,
             token.to_string(),
-            Vec::new(),
+            existing,
             plugin_config_in(plugin_dir),
             self.registry.clone(),
             self.client.clone(),

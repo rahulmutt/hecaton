@@ -640,7 +640,7 @@ Execution is one path, `Daemon::execute_action`, for chain verdicts and for
   versioned contract; fixtures under `docs/plugin-protocol/` are replayed
   through the SDK router and the server's client by the conformance test.
 
-## Refinements from the phase 2a plan (2026-09-07)
+### 16.6 Refinements from the phase 2a plan (2026-09-07)
 
 Where the phase 2a implementation plan refined this section:
 
@@ -671,3 +671,9 @@ Where the phase 2a implementation plan refined this section:
   by `hecaton-core`) so the SDK's `fleets()` is typed.
 - **The `hecaton` binary depends on `reqwest` only through the SDK**: no
   direct dependency in `crates/hecaton/Cargo.toml`.
+- **An unchanged pair whose row is not `Active` is re-activated by the next
+  apply** (R24): `Daemon::apply` diffs the new spec against the fleet's
+  `Active` rows only, so a `pending` or `rejected` pair is offered to the
+  plugin again by the next `up`/`update` even when its config did not
+  change — a ready plugin gets the `activate` (a rejection fails the apply
+  like any other), a plugin that is not ready leaves the row pending.

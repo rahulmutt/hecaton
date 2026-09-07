@@ -43,6 +43,11 @@ impl fmt::Display for CallFailure {
         match self {
             CallFailure::Timeout => f.write_str("timeout"),
             CallFailure::Connect => f.write_str("connection refused"),
+            // A body-less non-2xx (a bare 503 health check) reads as
+            // `HTTP 503`, not `HTTP 503: `.
+            CallFailure::Status { status, message } if message.is_empty() => {
+                write!(f, "HTTP {status}")
+            }
             CallFailure::Status { status, message } => write!(f, "HTTP {status}: {message}"),
             CallFailure::Body(m) => write!(f, "bad response body: {m}"),
         }
@@ -299,6 +304,15 @@ mod tests {
         );
         assert_eq!(e.reason(), "status");
         assert_eq!(e.to_string(), "HTTP 400: states.working: unknown event");
+        assert_eq!(
+            CallFailure::Status {
+                status: 503,
+                message: String::new()
+            }
+            .to_string(),
+            "HTTP 503",
+            "an empty body renders without the trailing colon"
+        );
         c.deactivate(
             &listen,
             &DeactivateRequest {

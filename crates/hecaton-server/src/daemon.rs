@@ -331,7 +331,15 @@ impl Daemon {
     }
 
     /// `POST` (`replace == false`): 409 unless the fleet is absent or
-    /// settled `Down`. `PUT` (`replace == true`): 404 when absent.
+    /// settled `Down`. `PUT` (`replace == true`): 404 when absent. Both
+    /// are answered before any plugin is called, so a refused apply leaves
+    /// no plugin holding a config the fleet never took.
+    ///
+    /// The activation diff's old side is the fleet's `Active` rows only
+    /// (R24): a pair whose row is `Pending` or `Rejected` is offered to the
+    /// plugin again by the next `apply`, even when its config is unchanged
+    /// — a ready plugin gets an `activate` (and a rejection fails the
+    /// apply like any other), a plugin that is not ready leaves it pending.
     pub async fn apply(
         &self,
         name: &FleetName,
@@ -352,17 +360,20 @@ impl Daemon {
         // so two applies of the same fleet cannot interleave.
         let lock = self.fleet_lock(name);
         let _guard = lock.lock().await;
-        // What the fleet has activated *now*, not what its spec says: a
-        // `down` answers before its teardown pass and has already dropped
-        // every row, so the record's spec would name pairs that are gone.
-        let old: Vec<Pair> = self
-            .registry
-            .rows_for_fleet(name)
-            .into_iter()
+        // The fleet's rows *now*, not what its spec says: a `down` answers
+        // before its teardown pass and has already dropped every row, so
+        // the record's spec would name pairs that are gone.
+        let rows_now = self.registry.rows_for_fleet(name);
+        // Only the `Active` rows are the diff's old side (R24): a pending
+        // or rejected pair is offered to the plugin again by the next
+        // apply even when its config did not change.
+        let old: Vec<Pair> = rows_now
+            .iter()
+            .filter(|(_, _, row)| row.activation.state == ActivationState::Active)
             .map(|(agent, plugin, row)| Pair {
-                agent,
-                plugin,
-                config: row.config,
+                agent: agent.clone(),
+                plugin: plugin.clone(),
+                config: row.config.clone(),
             })
             .collect();
         let new =
@@ -376,7 +387,33 @@ impl Daemon {
                 )));
             }
         }
-        let d = activation::diff(&old, &new);
+        // Whether this is a 409 (POST on a live fleet) or a 404 (PUT on an
+        // absent one) is decided *before* any plugin is told anything: a
+        // rejected apply must not leave a plugin holding a config the
+        // fleet never took. The per-fleet lock is held, and it excludes
+        // the only other mutators of this entry, so the write lock below
+        // sees the same answer.
+        {
+            let fleets = self.fleets.read().await;
+            match fleets.get(name) {
+                Some(h) if !replace && !h.status.borrow().is_down() => {
+                    return Err(DaemonError::Conflict);
+                }
+                None if replace => return Err(DaemonError::NotFound),
+                _ => {}
+            }
+        }
+        let mut d = activation::diff(&old, &new);
+        // A row the new spec no longer names goes, whatever its state; the
+        // diff only saw the active ones.
+        for (agent, plugin, _) in &rows_now {
+            let named = new.iter().any(|p| &p.agent == agent && &p.plugin == plugin);
+            let already = d.deactivate.iter().any(|(a, p)| a == agent && p == plugin);
+            if !named && !already {
+                d.deactivate.push((agent.clone(), plugin.clone()));
+            }
+        }
+        d.deactivate.sort();
         // deactivate changed pairs first (§16.2), then activate every new or
         // changed pair on a ready plugin; the first rejection rolls back the
         // ones already accepted and nothing reaches the actor
@@ -758,6 +795,11 @@ mod tests {
     /// (intercepts PreToolUse and Stop, observes Stop, needs actions+kv)
     /// that has not said hello yet.
     async fn world() -> World {
+        world_with(Vec::new()).await
+    }
+
+    /// The same, over stored records: what a daemon restart loads.
+    async fn world_with(existing: Vec<(FleetRecord, FleetSecrets)>) -> World {
         let h = Harness::new(Duration::from_secs(3600));
         let dir = tempfile::tempdir().unwrap();
         write_plugin_package(
@@ -775,7 +817,7 @@ mod tests {
             h.client.clone(),
             Metrics::new().unwrap(),
         );
-        let daemon = h.daemon(handler, dir.path());
+        let daemon = h.daemon_with_existing(handler, dir.path(), existing);
         daemon.sync_plugins().await.unwrap();
         World {
             h,
@@ -1224,6 +1266,202 @@ mod tests {
         assert_eq!(stub.calls_named("events")[0]["events"][0]["name"], "Stop");
     }
 
+    /// A refused apply must not have told a plugin anything: the 409 and
+    /// the 404 are decided before the activation block.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_conflict_or_a_missing_fleet_is_answered_before_any_plugin_call() {
+        let w = world().await;
+        let stub = stub_plugin(StubScript {
+            health_ok: true,
+            ..StubScript::default()
+        })
+        .await;
+        hello(&w, &stub.listen).await;
+        let name: FleetName = "f".parse().unwrap();
+        w.daemon
+            .apply(
+                &name,
+                spec(&[("a", &[("flow", json!({ "v": 1 }))])]),
+                Default::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        wait_gen(&w.daemon, 1).await;
+        let before = stub.calls().len();
+
+        // POST on a live fleet, with a *changed* config: 409, and the
+        // plugin still holds the config the fleet is running.
+        let e = w
+            .daemon
+            .apply(
+                &name,
+                spec(&[("a", &[("flow", json!({ "v": 2 }))])]),
+                Default::default(),
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(e, DaemonError::Conflict);
+        assert_eq!(
+            stub.calls()[before..].len(),
+            0,
+            "no deactivate and no activate: {:?}",
+            stub.calls()[before..].to_vec()
+        );
+        let row = w
+            .daemon
+            .registry()
+            .row(&"f/c/a".parse().unwrap(), &"flow".parse().unwrap())
+            .unwrap();
+        assert_eq!(
+            (row.activation.state, row.config),
+            (ActivationState::Active, json!({ "v": 1 })),
+            "the row still carries the config the plugin was given"
+        );
+
+        // PUT on an absent fleet: 404, and nothing was said either.
+        let mut absent = spec(&[("a", &[("flow", json!({ "v": 9 }))])]);
+        absent.name = "g".into();
+        let e = w
+            .daemon
+            .apply(&"g".parse().unwrap(), absent, Default::default(), true)
+            .await
+            .unwrap_err();
+        assert_eq!(e, DaemonError::NotFound);
+        assert_eq!(stub.calls()[before..].len(), 0);
+    }
+
+    /// R24: an unchanged pair whose row is not `Active` is offered to the
+    /// plugin again by the next apply — the fix for a plugin that was
+    /// broken when the pair was first activated.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rejected_row_is_re_attempted_by_the_next_apply() {
+        let w = world().await;
+        let name: FleetName = "f".parse().unwrap();
+        let flow: AgentName = "flow".parse().unwrap();
+        let agent: AgentId = "f/c/a".parse().unwrap();
+        let s = spec(&[("a", &[("flow", json!({ "v": 1 }))])]);
+        w.daemon
+            .apply(&name, s.clone(), Default::default(), false)
+            .await
+            .unwrap();
+        wait_gen(&w.daemon, 1).await;
+        assert_eq!(
+            w.daemon
+                .registry()
+                .row(&agent, &flow)
+                .unwrap()
+                .activation
+                .state,
+            ActivationState::Pending,
+            "the plugin was not ready"
+        );
+
+        let bad = stub_plugin(StubScript {
+            reject: BTreeMap::from([("f/c/a".to_string(), "states.x: unknown".to_string())]),
+            health_ok: true,
+            ..StubScript::default()
+        })
+        .await;
+        hello(&w, &bad.listen).await;
+        assert_eq!(
+            w.daemon
+                .registry()
+                .row(&agent, &flow)
+                .unwrap()
+                .activation
+                .state,
+            ActivationState::Rejected
+        );
+
+        // The plugin is fixed and listening again. No `hello` here: the
+        // apply itself must re-attempt the row, whose config is unchanged.
+        let good = stub_plugin(StubScript {
+            health_ok: true,
+            ..StubScript::default()
+        })
+        .await;
+        w.daemon.registry().set_listen(&flow, good.listen.clone());
+        w.daemon
+            .apply(&name, s, Default::default(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            good.calls_named("activate").len(),
+            1,
+            "the unchanged pair was activated again"
+        );
+        assert_eq!(good.calls_named("activate")[0]["agent"], "f/c/a");
+        assert!(
+            good.calls_named("deactivate").is_empty(),
+            "a re-attempt is not a config change"
+        );
+        assert_eq!(
+            w.daemon
+                .registry()
+                .row(&agent, &flow)
+                .unwrap()
+                .activation
+                .state,
+            ActivationState::Active
+        );
+    }
+
+    /// `Daemon::start` rebuilds the pending rows of every stored `Up`
+    /// record; a stored `Down` record has none (§16.2).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stored_up_record_starts_its_pairs_pending() {
+        let up = FleetRecord::new(spec(&[("a", &[("flow", json!({ "v": 1 }))])]));
+        let mut down_spec = spec(&[("a", &[("flow", json!({ "v": 2 }))])]);
+        down_spec.name = "g".into();
+        let mut down = FleetRecord::new(down_spec);
+        down.desired = Desired::Down {
+            keep: Keep::default(),
+            purge: false,
+        };
+        let w = world_with(vec![
+            (up, FleetSecrets::default()),
+            (down, FleetSecrets::default()),
+        ])
+        .await;
+        let flow: AgentName = "flow".parse().unwrap();
+        let agent: AgentId = "f/c/a".parse().unwrap();
+        let row = w.daemon.registry().row(&agent, &flow).unwrap();
+        assert_eq!(
+            (row.activation.state, row.config),
+            (ActivationState::Pending, json!({ "v": 1 })),
+            "the stored fleet's pair is pending: nothing about activation is persisted"
+        );
+        assert!(
+            w.daemon
+                .registry()
+                .rows_for_fleet(&"g".parse().unwrap())
+                .is_empty(),
+            "a stored `Down` record gets no rows"
+        );
+
+        let stub = stub_plugin(StubScript {
+            health_ok: true,
+            ..StubScript::default()
+        })
+        .await;
+        hello(&w, &stub.listen).await;
+        assert_eq!(
+            w.daemon
+                .registry()
+                .row(&agent, &flow)
+                .unwrap()
+                .activation
+                .state,
+            ActivationState::Active
+        );
+        let activates = stub.calls_named("activate");
+        assert_eq!(activates.len(), 1);
+        assert_eq!(activates[0]["agent"], "f/c/a");
+        assert_eq!(activates[0]["config"]["v"], 1);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tokens_identify_plugins_and_the_health_poller_marks_degraded() {
         let w = world().await;
@@ -1240,7 +1478,7 @@ mod tests {
         wait_plugin_ready(&w).await;
         w.daemon.poll_health().await;
         let rows = w.daemon.plugins().list().await;
-        assert_eq!(rows[0].message, "degraded: HTTP 503: ");
+        assert_eq!(rows[0].message, "degraded: HTTP 503");
         assert_eq!(rows[0].phase, AgentPhase::Ready, "never restarted for it");
         hello(&w, &stub.listen).await;
         assert_eq!(
