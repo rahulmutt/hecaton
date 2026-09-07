@@ -24,20 +24,37 @@ impl fmt::Debug for Host {
     }
 }
 
-/// Percent-encodes everything outside `[A-Za-z0-9._~/-]`, for building
-/// query strings by hand (`reqwest`'s `query` feature is not enabled —
-/// plugins spec §16.1: no extra dependency weight for it).
-fn urlencode(s: &str) -> String {
+/// Percent-encodes everything the predicate does not call safe
+/// (`reqwest`'s `query` feature is not enabled — plugins spec §16.1: no
+/// extra dependency weight for it).
+fn encode(s: &str, safe: impl Fn(u8) -> bool) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'~' | b'/' | b'-' => {
-                out.push(b as char);
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
+        if safe(b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
         }
     }
     out
+}
+
+fn unreserved(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'~' | b'-')
+}
+
+/// Everything outside `[A-Za-z0-9._~/-]`, for building query strings.
+fn urlencode(s: &str) -> String {
+    encode(s, |b| unreserved(b) || matches!(b, b'.' | b'/'))
+}
+
+/// A kv key as one path segment: `.` and `/` are escaped too. The URL
+/// parser resolves `.` and `..` segments (their `%2e` spellings
+/// included) while it builds the request, so an unescaped `../x` would
+/// leave for a different route instead of collecting the daemon's
+/// `kv: invalid key` (plugins spec §4.1).
+fn path_encode(s: &str) -> String {
+    encode(s, unreserved)
 }
 
 impl Host {
@@ -133,7 +150,7 @@ impl Host {
 
     pub async fn kv_get(&self, key: &str) -> Result<Option<Vec<u8>>, SdkError> {
         let (status, bytes) = self
-            .send(self.http.get(self.url(&format!("kv/{key}"))))
+            .send(self.http.get(self.url(&format!("kv/{}", path_encode(key)))))
             .await?;
         match status {
             200..=299 => Ok(Some(bytes)),
@@ -145,16 +162,19 @@ impl Host {
     pub async fn kv_put(&self, key: &str, bytes: &[u8], secret: bool) -> Result<(), SdkError> {
         let req = self
             .http
-            .put(self.url(&format!("kv/{key}?secret={secret}")))
+            .put(self.url(&format!("kv/{}?secret={secret}", path_encode(key))))
             .header("content-type", "application/octet-stream")
             .body(bytes.to_vec());
         self.json::<serde_json::Value>(req).await.map(|_| ())
     }
 
     pub async fn kv_delete(&self, key: &str) -> Result<(), SdkError> {
-        self.json::<serde_json::Value>(self.http.delete(self.url(&format!("kv/{key}"))))
-            .await
-            .map(|_| ())
+        self.json::<serde_json::Value>(
+            self.http
+                .delete(self.url(&format!("kv/{}", path_encode(key)))),
+        )
+        .await
+        .map(|_| ())
     }
 
     pub async fn kv_list(&self, prefix: &str) -> Result<Vec<String>, SdkError> {
@@ -186,6 +206,15 @@ mod tests {
     #[test]
     fn urlencode_escapes_everything_outside_the_safe_set() {
         assert_eq!(urlencode("a b/c"), "a%20b/c");
+    }
+
+    #[test]
+    fn a_kv_key_travels_as_one_segment_so_dots_reach_the_daemon() {
+        assert_eq!(path_encode("state/f/c/a"), "state%2Ff%2Fc%2Fa");
+        let url: reqwest::Url = format!("http://h/v1/plugin-host/kv/{}", path_encode("../x"))
+            .parse()
+            .unwrap();
+        assert_eq!(url.path(), "/v1/plugin-host/kv/%2E%2E%2Fx");
     }
 
     #[tokio::test]

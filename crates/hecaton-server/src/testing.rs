@@ -114,6 +114,33 @@ impl Harness {
         plugin_dir: &Path,
         token: &str,
     ) -> Arc<Daemon> {
+        self.daemon_full(
+            handler,
+            plugin_dir,
+            token,
+            Metrics::new().unwrap_or_else(|e| panic!("metrics: {e}")),
+        )
+    }
+
+    /// The same, over a `Metrics` the caller also gave the event handler:
+    /// `/metrics` encodes the daemon's registry, so the chain's counters
+    /// only show up there when the two share one.
+    pub fn daemon_with(
+        &self,
+        handler: Arc<dyn DaemonHandler>,
+        plugin_dir: &Path,
+        metrics: Metrics,
+    ) -> Arc<Daemon> {
+        self.daemon_full(handler, plugin_dir, "admin-tok", metrics)
+    }
+
+    fn daemon_full(
+        &self,
+        handler: Arc<dyn DaemonHandler>,
+        plugin_dir: &Path,
+        token: &str,
+        metrics: Metrics,
+    ) -> Arc<Daemon> {
         let ports = Ports {
             materializer: self.materializer.clone(),
             runner: self.runner.clone(),
@@ -126,7 +153,7 @@ impl Harness {
         Daemon::start(
             ports,
             handler,
-            Metrics::new().unwrap_or_else(|e| panic!("metrics: {e}")),
+            metrics,
             token.to_string(),
             Vec::new(),
             plugin_config_in(plugin_dir),
