@@ -25,8 +25,10 @@ pub struct AgentSettings {
     #[serde(default)]
     pub runner: RunnerSettings,
     /// Plugin name → that plugin's per-agent config (plugins spec §2.2);
-    /// passthrough objects, merged like every other map.
-    #[serde(default)]
+    /// passthrough objects, merged like every other map. Reads `flow` too:
+    /// that is what this block was called before Spec B, and a `fleet.json`
+    /// stored by an older daemon must still load after the upgrade.
+    #[serde(default, alias = "flow")]
     pub plugins: BTreeMap<String, Value>,
 }
 
@@ -136,7 +138,21 @@ mod tests {
         .unwrap();
         assert_eq!(s.plugins.len(), 2);
         assert_eq!(s.plugins["flow"]["initial"], "working");
-        assert!(serde_json::from_value::<AgentSettings>(json!({ "flow": {} })).is_err());
+    }
+
+    /// A `fleet.json` written before Spec B carries the reserved `flow: {}`
+    /// block; the daemon must still load its record after the upgrade.
+    #[test]
+    fn the_pre_spec_b_flow_block_is_read_as_plugins() {
+        let s: AgentSettings = serde_json::from_value(json!({ "flow": {} })).unwrap();
+        assert!(s.plugins.is_empty());
+        assert_eq!(s, AgentSettings::default());
+        let s: AgentSettings =
+            serde_json::from_value(json!({ "flow": { "web": { "enabled": true } } })).unwrap();
+        assert_eq!(s.plugins["web"]["enabled"], true);
+        // still a map of objects, whichever name it arrives under
+        assert!(serde_json::from_value::<AgentSettings>(json!({ "flow": "x" })).is_err());
+        assert!(serde_json::from_value::<AgentSettings>(json!({ "plugins": "x" })).is_err());
     }
 
     #[test]

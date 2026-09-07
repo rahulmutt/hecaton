@@ -60,6 +60,13 @@ impl Daemon {
         let mut fleets = BTreeMap::new();
         for (record, secrets) in existing {
             match FleetName::try_from(record.spec.name.clone()) {
+                // The plugin host owns this name and already has an actor;
+                // a stored record under it predates the reservation (or was
+                // written by hand) and would fight it for tmux and state.
+                Ok(name) if is_reserved_fleet(name.as_str()) => tracing::error!(
+                    fleet = %name,
+                    "ignoring a stored fleet named {name}: the name is reserved for the daemon's plugins"
+                ),
                 Ok(name) => {
                     let h = actor::spawn(
                         name.clone(),

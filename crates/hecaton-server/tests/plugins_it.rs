@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hecaton_api::{AgentPhase, AgentSettings, CrewSpec, FleetRequest, FleetSpec, GitSettings};
-use hecaton_core::{AgentId, PassThrough, plugin_id};
+use hecaton_core::{AgentId, FleetRecord, PassThrough, plugin_id};
 use hecaton_server::testing::{Harness, plugin_config_in};
 use hecaton_server::{Daemon, Metrics, router, serve};
 use serde_json::{Value, json};
@@ -341,4 +341,70 @@ async fn plugins_sync_hello_list_and_purge() {
 
     let _ = stop_tx.send(());
     server.await.unwrap().unwrap();
+}
+
+/// A `fleet.json` under the reserved name — written before the name was
+/// reserved, or by hand — must not get an actor: the plugin host already
+/// owns `hecaton`, its tmux session and its state root.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stored_fleet_under_the_reserved_name_is_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("plugins.yaml"), "plugins: []\n").unwrap();
+
+    let h = Harness::new(Duration::from_secs(3600));
+    let mut record = FleetRecord::new(FleetSpec {
+        name: "hecaton".into(),
+        crews: BTreeMap::from([(
+            "plugins".to_string(),
+            CrewSpec {
+                repo: "acme/x".into(),
+                git_ref: "main".into(),
+                git: GitSettings::default(),
+                agents: BTreeMap::from([("hello".to_string(), AgentSettings::default())]),
+            },
+        )]),
+    });
+    record.status.entry("hecaton/plugins/hello");
+    let ports = hecaton_server::Ports {
+        materializer: h.materializer.clone(),
+        runner: h.runner.clone(),
+        clock: h.clock.clone(),
+        store: h.store.clone(),
+        policy: Default::default(),
+        hook_url: "http://127.0.0.1:1".into(),
+        resync: Duration::from_secs(3600),
+    };
+    let daemon = Daemon::start(
+        ports,
+        Arc::new(PassThrough),
+        Metrics::new().unwrap(),
+        "admin-tok".into(),
+        vec![(record, Default::default())],
+        plugin_config_in(dir.path()),
+    );
+    daemon.sync_plugins().await.unwrap();
+
+    let name: hecaton_core::FleetName = "hecaton".parse().unwrap();
+    let rec = daemon.get(&name).await.unwrap();
+    assert!(
+        rec.status.agents.is_empty(),
+        "the plugin host's own record answers, not the stored one: {:?}",
+        rec.status.agents
+    );
+    assert!(daemon.list().await.is_empty(), "and it is not a fleet row");
+    // no actor ran the stored spec: its agent was never materialized or
+    // started. The plugin host's own actor may have observed `hecaton` by
+    // now — `plugins.yaml` is empty, so it touches nothing else.
+    let r = h.runner.clone();
+    let m = h.materializer.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut calls = r.calls();
+        calls.extend(m.calls());
+        assert!(
+            calls.iter().all(|c| !c.contains("hello")),
+            "the stored record's agent was acted on: {calls:?}"
+        );
+    })
+    .await
+    .unwrap();
 }

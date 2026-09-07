@@ -36,3 +36,12 @@ a repository.
 Spec A is complete. Spec B (plugins) is in progress: phase 1, plugin
 workloads, is done — packages, `plugins.yaml`, the sandboxed plugin fleet and
 `hello`; the event protocol and the `flow` plugin are next.
+
+### Upgrading to Spec B phase 1
+- Fleet files rename the reserved `flow: {}` settings block to `plugins: {}`
+  (a map of plugin name → that plugin's config). Stored `fleet.json` records
+  still load with the old name.
+- On the first start after the upgrade every running agent restarts once: its
+  spec hash changed with the block.
+- A stored fleet named `hecaton` is ignored, with an error in the daemon log —
+  the name is now reserved for the plugin fleet.

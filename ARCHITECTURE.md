@@ -83,7 +83,9 @@ root). The actor's per-agent hook secret is the plugin's token;
 - **Exact tool versions only.** `tools: { node: "22" }` is rejected; an unpinned
   entry is a reproducibility bug (developer-environment skill).
 - **`claude.settings.hooks` is hecaton-owned.** Hook wiring is how the daemon
-  hears from agents; users shape behaviour through `flow` instead.
+  hears from agents; users shape behaviour through the settings block's
+  `plugins:` map instead (it was called `flow:` before Spec B, and still
+  loads under that name).
 - **Ports live in `hecaton-core`, adapters depend on it, never on each other.**
   The future Kubernetes split cuts between `hecaton-server` and
   `hecaton-runtime`; `core` is shared.
