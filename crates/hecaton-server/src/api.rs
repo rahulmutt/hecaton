@@ -78,9 +78,15 @@ impl From<PluginError> for ApiError {
             | PluginError::ManifestParse(_)
             | PluginError::Digest { .. }
             | PluginError::Package(_)
-            | PluginError::StillDeclared(_) => StatusCode::BAD_REQUEST,
+            | PluginError::StillDeclared(_)
+            | PluginError::Activation { .. }
+            | PluginError::KvKey(_) => StatusCode::BAD_REQUEST,
             PluginError::Fetch { .. } => StatusCode::BAD_GATEWAY,
-            PluginError::Io { .. } | PluginError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            PluginError::Capability(_) => StatusCode::FORBIDDEN,
+            PluginError::NotActive(_) => StatusCode::NOT_FOUND,
+            PluginError::Io { .. } | PluginError::Internal(_) | PluginError::Kv { .. } => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         };
         Self::new(status, e.to_string())
     }

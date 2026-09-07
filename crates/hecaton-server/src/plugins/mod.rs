@@ -1,20 +1,25 @@
 //! Plugins in the daemon (plugins spec §2.1, §5.2): the declarative file,
 //! package install, and the host that drives them as the `hecaton` fleet.
 
+pub mod activation;
 pub mod client;
 pub mod config;
 pub mod host;
+pub mod kv;
 pub mod manifest;
 pub mod materializer;
 pub mod package;
+pub mod registry;
 
 use std::path::PathBuf;
 
 pub use client::{CallFailure, PluginClient};
 pub use config::{Source, load_plugins_file, resolve_source};
 pub use host::{PluginHost, PluginHostConfig};
+pub use kv::{PluginKv, validate_key};
 pub use manifest::read_manifest;
 pub use materializer::{NullStore, PluginMaterializer};
+pub use registry::{ActivationRow, PluginInfo, PluginRegistry};
 
 /// Every plugin failure, with the config path or file first.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -39,6 +44,18 @@ pub enum PluginError {
     StillDeclared(String),
     #[error("{0}")]
     Internal(String),
+    /// An agent's `plugins.<name>` could not be activated; `path` is the
+    /// config path (`crews.c.agents.a.plugins.flow`).
+    #[error("{path}: {message}")]
+    Activation { path: String, message: String },
+    #[error("capability {0:?} not declared in hecaton-plugin.yaml")]
+    Capability(String),
+    #[error("kv: invalid key: {0}")]
+    KvKey(String),
+    #[error("plugin is not active for agent {0}")]
+    NotActive(String),
+    #[error("{path}: {message}")]
+    Kv { path: PathBuf, message: String },
 }
 
 impl PluginError {
@@ -48,4 +65,13 @@ impl PluginError {
             message: e.to_string(),
         }
     }
+}
+
+/// The wire label of a serializable enum value (e.g. `Capability::Kv` →
+/// `"kv"`): shared by `metrics.rs` (label values) and `PluginError::Capability`.
+pub(crate) fn wire_label<T: serde::Serialize>(v: T) -> String {
+    serde_json::to_value(v)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
 }

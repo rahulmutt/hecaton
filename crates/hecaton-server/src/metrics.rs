@@ -9,6 +9,8 @@ use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder,
 };
 
+use crate::plugins::wire_label as label;
+
 #[derive(Clone)]
 pub struct Metrics {
     inner: Arc<Inner>,
@@ -30,14 +32,6 @@ struct Inner {
     plugin_events_dropped: IntCounterVec,
     plugin_actions: IntCounterVec,
     plugin_metrics_scrape_failures: IntCounterVec,
-}
-
-/// Lowercase phase label, the same spelling as the wire form.
-fn label<T: serde::Serialize>(v: T) -> String {
-    serde_json::to_value(v)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_default()
 }
 
 impl Metrics {
