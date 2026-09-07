@@ -281,7 +281,13 @@ impl Daemon {
     /// Reconciles the plugin set to `plugins.yaml`; `serve` calls it once
     /// at start and fails fast on an error, `plugin sync` on demand.
     pub async fn sync_plugins(&self) -> Result<SyncReport, PluginError> {
-        self.plugins.sync().await
+        let report = self.plugins.sync().await;
+        // `replace_plugins` drops the activation rows of every plugin the
+        // sync removed, and the plugin fleet's own actor snapshot is not
+        // forwarded to `changes` — so this registry write ticks like the
+        // others, or `fleets/watch` keeps serving the removed rows.
+        self.bump();
+        report
     }
 
     /// `hello` authenticates with the plugin's token — the hook secret the

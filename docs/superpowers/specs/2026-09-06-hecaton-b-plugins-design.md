@@ -1239,3 +1239,29 @@ Where the phase 3 implementation plan refined this section:
 - **`hecaton_server::sessions` and the SDK each carry their own
   `constant_time_eq`/`bearer`**: the SDK depends on `hecaton-api` only, so
   the copy is forced by the dependency direction.
+- **Every mount shares one browser origin, as an accepted risk**: the
+  session cookie is scoped `Path=/v1/plugins/`, so a page under one
+  plugin's mount can reach every other plugin's routes same-origin with
+  the operator's session — bypassing `needs` for anything a browser can
+  reach — and that is recorded in `docs/THREAT-MODEL.md` rather than
+  mitigated (one loopback origin; no default CSP, since the web plugin's
+  pages use inline script).
+- **`http-body-util` was not added after all**: §18.1 lists it beside
+  `hyper`/`hyper-util`, but the proxy never names it (axum's `Body`
+  carries the request and response bodies through), so it is not a
+  workspace dependency.
+- **`attach` closes 1000 on a PTY read error, not 1011** (§18.4 assigns
+  1011 to the runner failing): a Linux PTY master answers `EIO`, never
+  EOF, once the last client of the slave is gone, so the error *is* the
+  ordinary end of a session and 1011 would be the common case.
+- **The attached stream travels to the bridge in a `StreamGuard`**
+  (`attach.rs`): the runner attaches before `ws.on_upgrade`, so an upgrade
+  that never completes leaves axum dropping the closure — and a
+  `TmuxAttach` drop kills its client, waits for it and runs `tmux
+  kill-session` — on a tokio worker. The guard offloads that drop to
+  `spawn_blocking`; the bridge takes the stream out and keeps offloading
+  its own.
+- **`sync_plugins` bumps the watch tick**: `replace_plugins` drops the
+  activation rows of every removed plugin with no actor snapshot behind
+  it, so `plugin remove`/`plugin sync` would otherwise leave
+  `fleets/watch` consumers serving rows that are gone.

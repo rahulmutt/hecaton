@@ -36,15 +36,14 @@ ureq = { version = "3.4.1", default-features = false, features = ["json"] }
 # Async loopback HTTP for the daemon → plugin calls and the plugin SDK
 # (plugins spec §16.1). No TLS provider, no HTTP/2, no proxy discovery.
 reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
-# Phase 3 (plugins spec §18.1). hyper, hyper-util, http-body-util and
-# futures-util were already in the lock through axum and reqwest and are
-# direct, exact dependencies now: the proxy is a plain reverse proxy on
-# hyper's legacy client (upgrades passed through as bytes), and the SDK's
-# stream clients need Sink/Stream adaptors. tokio-tungstenite (no TLS
-# feature, P3-1) is the WebSocket client for the SDK and the tests.
+# Phase 3 (plugins spec §18.1). hyper, hyper-util and futures-util were
+# already in the lock through axum and reqwest and are direct, exact
+# dependencies now: the proxy is a plain reverse proxy on hyper's legacy
+# client (upgrades passed through as bytes), and the SDK's stream clients
+# need Sink/Stream adaptors. tokio-tungstenite (no TLS feature, P3-1) is
+# the WebSocket client for the SDK and the tests.
 hyper = { version = "1.11.1", features = ["http1", "client"] }
 hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "tokio"] }
-http-body-util = "0.1.5"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 tokio-tungstenite = "0.30.0"
 # AgentRunner::attach on tmux (plugins spec §18.4): a PTY for the tmux

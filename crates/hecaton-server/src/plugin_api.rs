@@ -122,7 +122,11 @@ async fn attach(
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     tracing::info!(plugin = %plugin, agent = %agent, "attach opened");
-    Ok(ws.on_upgrade(move |socket| crate::attach::bridge(socket, stream)))
+    // The guard, not the stream: an upgrade that never completes leaves
+    // axum dropping this closure on a runtime task, and ending a tmux
+    // attach blocks (`StreamGuard`).
+    let guard = crate::attach::StreamGuard::new(stream);
+    Ok(ws.on_upgrade(move |socket| crate::attach::bridge(socket, guard)))
 }
 
 async fn post_action(

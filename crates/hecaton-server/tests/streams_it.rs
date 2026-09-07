@@ -50,6 +50,17 @@ fn status_of(e: &tungstenite::Error) -> Option<u16> {
     }
 }
 
+/// The refused handshake's response body, as text.
+fn body_of(e: &tungstenite::Error) -> String {
+    match e {
+        tungstenite::Error::Http(r) => match r.body() {
+            Some(b) => String::from_utf8_lossy(b).into_owned(),
+            None => String::new(),
+        },
+        _ => String::new(),
+    }
+}
+
 /// The next text frame, parsed, within five seconds.
 async fn next_text(s: &mut Socket) -> Value {
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -254,6 +265,53 @@ async fn a_rejected_activation_is_a_watch_frame() {
     s.close(None).await.unwrap();
 }
 
+/// `plugin sync` drops the activation rows of every removed plugin through
+/// `replace_plugins`, and the plugin fleet's actor snapshot never reaches
+/// `changes` — so the sync ticks the counter itself, or a watch keeps
+/// serving rows for a plugin that is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_a_plugin_is_a_watch_frame() {
+    let w = world().await;
+    let _flow = start_silent(&w, "flow").await;
+    let req = json!(FleetRequest {
+        spec: spec(&[("a", &[("flow", json!({ "v": 1 }))])]),
+        credentials: Default::default()
+    });
+    let (st, v) = w.api.admin("POST", "/v1/fleets", Some(&req));
+    assert_eq!(st, 200, "{v}");
+
+    let mut s = ws(
+        &ws_url(&w, "/v1/plugin-host/fleets/watch"),
+        &token(&w, "web").await,
+    )
+    .await
+    .unwrap();
+    wait_frame(&mut s, |v| {
+        v[0]["status"]["agents"]["f/c/a"]["plugins"]["flow"]["state"] == "active"
+    })
+    .await;
+
+    // `web` stays declared (the watch rides its token); `flow` goes.
+    std::fs::write(
+        w.dir.path().join("plugins.yaml"),
+        "plugins:\n  - name: web\n    source: ./web-pkg\n",
+    )
+    .unwrap();
+    let (st, report) = w.api.admin("POST", "/v1/plugins/sync", None);
+    assert_eq!(st, 200, "{report}");
+    assert_eq!(report["stopped"], json!(["flow"]));
+
+    let frame = wait_frame(&mut s, |v| {
+        v[0]["status"]["agents"]["f/c/a"]["plugins"]["flow"].is_null()
+    })
+    .await;
+    assert!(
+        frame[0]["status"]["agents"]["f/c/a"].is_object(),
+        "the agent is still there, only the activation went: {frame}"
+    );
+    s.close(None).await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attach_bridges_the_runner_pty_and_gates_on_activation() {
     let w = world().await;
@@ -298,6 +356,19 @@ async fn attach_bridges_the_runner_pty_and_gates_on_activation() {
         .await
         .unwrap_err();
     assert_eq!(status_of(&e), Some(401));
+
+    // the runner fails before the upgrade: an ordinary 500, its text in
+    // the body, and no socket to close
+    w.h.runner.fail_next("attach", "f/c/a", "no such window");
+    let e = ws(&ws_url(&w, "/v1/plugin-host/agents/f/c/a/attach"), &web)
+        .await
+        .unwrap_err();
+    assert_eq!(status_of(&e), Some(500), "{e}");
+    assert!(
+        body_of(&e).contains("no such window"),
+        "the runner's error: {}",
+        body_of(&e)
+    );
 
     // the bridge: echo, resize, an unsupported text frame closes 1003
     let mut s = ws(&ws_url(&w, "/v1/plugin-host/agents/f/c/a/attach"), &web)
@@ -350,6 +421,7 @@ async fn attach_bridges_the_runner_pty_and_gates_on_activation() {
             .iter()
             .filter(|c| *c == "attach f/c/a")
             .count(),
-        2
+        3,
+        "two bridges and the one the runner refused"
     );
 }

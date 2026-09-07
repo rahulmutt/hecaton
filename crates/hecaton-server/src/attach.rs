@@ -19,7 +19,44 @@ pub const CLOSE_UNSUPPORTED: u16 = 1003;
 /// The runner's side failed.
 pub const CLOSE_ERROR: u16 = 1011;
 
-pub async fn bridge(mut socket: WebSocket, stream: Box<dyn PtyStream>) {
+/// Carries the attached stream from the handler to the bridge without ever
+/// letting it drop on a tokio worker. Dropping a `TmuxAttach` kills its
+/// client, waits for it and runs `tmux kill-session` — blocking work — and
+/// the handler attaches *before* the upgrade, so the closure axum drops
+/// when the upgrade never completes is holding the stream. The bridge
+/// takes it out and offloads its own drops; anything else offloads here.
+pub struct StreamGuard(Option<Box<dyn PtyStream>>);
+
+impl StreamGuard {
+    pub fn new(stream: Box<dyn PtyStream>) -> StreamGuard {
+        StreamGuard(Some(stream))
+    }
+
+    /// The stream, out of the guard; the guard's own drop then does nothing.
+    pub fn take(&mut self) -> Option<Box<dyn PtyStream>> {
+        self.0.take()
+    }
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        let Some(stream) = self.0.take() else { return };
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => {
+                tokio::task::spawn_blocking(move || drop(stream));
+            }
+            // No runtime to protect (a plain thread, or one shutting down):
+            // dropping here is the only option left.
+            Err(_) => drop(stream),
+        }
+    }
+}
+
+pub async fn bridge(mut socket: WebSocket, mut guard: StreamGuard) {
+    let Some(stream) = guard.take() else {
+        close(&mut socket, CLOSE_ERROR, "attach: the stream is gone").await;
+        return;
+    };
     let (reader, mut writer) = match (stream.reader(), stream.writer()) {
         (Ok(r), Ok(w)) => (r, w),
         (Err(e), _) | (_, Err(e)) => {
@@ -93,6 +130,12 @@ fn pump_reader(mut reader: Box<dyn Read + Send>, tx: &mpsc::Sender<Vec<u8>>) {
     let mut buf = [0u8; READ_CHUNK];
     loop {
         match reader.read(&mut buf) {
+            // A read error is the ordinary end of a terminal session, not a
+            // fault: a Linux PTY master answers `EIO`, never EOF, once the
+            // last client of the slave is gone. §18.4 reserves 1011 for the
+            // runner failing, so both arms close 1000 — reporting 1011 for
+            // every window that simply closed would make the error code
+            // meaningless.
             Ok(0) | Err(_) => return,
             Ok(n) => {
                 if tx.blocking_send(buf[..n].to_vec()).is_err() {
@@ -110,4 +153,74 @@ async fn close(socket: &mut WebSocket, code: u16, reason: &str) {
             reason: reason.to_string().into(),
         })))
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::{SyncSender, sync_channel};
+    use std::thread::ThreadId;
+    use std::time::Duration;
+
+    /// A stream whose drop reports the thread it ran on.
+    struct Marker(SyncSender<ThreadId>);
+
+    impl PtyStream for Marker {
+        fn reader(&self) -> std::io::Result<Box<dyn Read + Send>> {
+            Err(std::io::Error::other("no reader"))
+        }
+        fn writer(&self) -> std::io::Result<Box<dyn Write + Send>> {
+            Err(std::io::Error::other("no writer"))
+        }
+        fn resize(&self, _: u16, _: u16) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for Marker {
+        fn drop(&mut self) {
+            let _ = self.0.send(std::thread::current().id());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_still_held_stream_is_dropped_off_the_runtime() {
+        let (tx, rx) = sync_channel::<ThreadId>(1);
+        let here = std::thread::current().id();
+        drop(StreamGuard::new(Box::new(Marker(tx))));
+        let dropped_on =
+            tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(5)))
+                .await
+                .unwrap()
+                .expect("the stream was dropped");
+        assert_ne!(dropped_on, here, "the drop left the tokio worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_taken_stream_is_the_caller_s_to_drop() {
+        let (tx, rx) = sync_channel::<ThreadId>(1);
+        let mut guard = StreamGuard::new(Box::new(Marker(tx)));
+        let stream = guard.take().expect("the stream");
+        assert!(guard.take().is_none(), "taken once");
+        drop(guard);
+        assert!(
+            rx.try_recv().is_err(),
+            "the guard dropped a stream it no longer holds"
+        );
+        drop(stream);
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the caller's own drop");
+    }
+
+    #[test]
+    fn outside_a_runtime_the_drop_is_inline() {
+        let (tx, rx) = sync_channel::<ThreadId>(1);
+        let here = std::thread::current().id();
+        drop(StreamGuard::new(Box::new(Marker(tx))));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)),
+            Ok(here),
+            "no runtime to protect, so the drop runs here"
+        );
+    }
 }
