@@ -1,0 +1,281 @@
+//! Plugins spec §18.4 through a real listener: `fleets/watch` frames on
+//! every change, and `attach` bridged to the fake runner's echo PTY.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+mod support;
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures_util::{SinkExt, StreamExt};
+use hecaton_api::{ActivationState, AgentSettings, CrewSpec, FleetRequest, FleetSpec, GitSettings};
+use hecaton_core::plugin_id;
+use hecaton_plugin_sdk::{Env, Host, Plugin, bind, run};
+use serde_json::{Value, json};
+use support::{World, world};
+use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::{self, Message};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+
+type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// A plugin with every method left at its default.
+struct Silent;
+impl Plugin for Silent {}
+
+async fn token(w: &World, plugin: &str) -> String {
+    w.daemon
+        .hook_secret(&plugin_id(&plugin.parse().unwrap()))
+        .await
+        .unwrap()
+}
+
+fn ws_url(w: &World, path: &str) -> String {
+    format!("{}{path}", w.api.base.replacen("http://", "ws://", 1))
+}
+
+async fn ws(url: &str, token: &str) -> Result<Socket, tungstenite::Error> {
+    let mut req = url.into_client_request()?;
+    req.headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    connect_async(req).await.map(|(s, _)| s)
+}
+
+fn status_of(e: &tungstenite::Error) -> Option<u16> {
+    match e {
+        tungstenite::Error::Http(r) => Some(r.status().as_u16()),
+        _ => None,
+    }
+}
+
+/// The next text frame, parsed, within five seconds.
+async fn next_text(s: &mut Socket) -> Value {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match s.next().await.expect("socket open").unwrap() {
+                Message::Text(t) => return serde_json::from_str(&t).unwrap(),
+                Message::Ping(_) | Message::Pong(_) => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("a text frame")
+}
+
+/// Frames until one satisfies `pred` (the actor publishes several per apply).
+async fn wait_frame(s: &mut Socket, pred: impl Fn(&Value) -> bool) -> Value {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let v = next_text(s).await;
+            if pred(&v) {
+                return v;
+            }
+        }
+    })
+    .await
+    .expect("the expected frame")
+}
+
+fn spec(agents: &[(&str, &[(&str, Value)])]) -> FleetSpec {
+    FleetSpec {
+        name: "f".into(),
+        crews: BTreeMap::from([(
+            "c".to_string(),
+            CrewSpec {
+                repo: "acme/x".into(),
+                git_ref: "main".into(),
+                git: GitSettings::default(),
+                agents: agents
+                    .iter()
+                    .map(|(n, plugins)| {
+                        let s = AgentSettings {
+                            plugins: plugins
+                                .iter()
+                                .map(|(p, c)| (p.to_string(), c.clone()))
+                                .collect(),
+                            ..Default::default()
+                        };
+                        (n.to_string(), s)
+                    })
+                    .collect(),
+            },
+        )]),
+    }
+}
+
+/// Starts a silent SDK plugin under `name` and says hello with its token.
+async fn start_silent(w: &World, name: &str) -> Host {
+    let env = Env {
+        api_url: w.api.base.clone(),
+        name: name.into(),
+        token: token(w, name).await,
+        scratch: w.dir.path().join("s"),
+    };
+    let (listener, listen) = bind().await.unwrap();
+    let tok = env.token.clone();
+    tokio::spawn(async move { run(listener, Arc::new(Silent), &tok).await });
+    let host = Host::new(env).unwrap();
+    host.hello("0.1.0", &listen).await.unwrap();
+    host
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fleets_watch_sends_the_full_list_on_every_change() {
+    let w = world().await;
+    let e = ws(
+        &ws_url(&w, "/v1/plugin-host/fleets/watch"),
+        &token(&w, "flow").await,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(status_of(&e), Some(403), "flow lacks `fleets`: {e}");
+    let e = ws(&ws_url(&w, "/v1/plugin-host/fleets/watch"), "nope")
+        .await
+        .unwrap_err();
+    assert_eq!(status_of(&e), Some(401));
+
+    let web = token(&w, "web").await;
+    let mut s = ws(&ws_url(&w, "/v1/plugin-host/fleets/watch"), &web)
+        .await
+        .unwrap();
+    assert_eq!(
+        next_text(&mut s).await,
+        json!([]),
+        "the first frame is the current list"
+    );
+
+    // an apply: the record appears, then its agent
+    let req = json!(FleetRequest {
+        spec: spec(&[("a", &[("flow", json!({ "v": 1 }))])]),
+        credentials: Default::default()
+    });
+    let (st, _) = w.api.admin("POST", "/v1/fleets", Some(&req));
+    assert_eq!(st, 200);
+    let frame = wait_frame(&mut s, |v| v[0]["status"]["agents"]["f/c/a"].is_object()).await;
+    assert_eq!(frame[0]["spec"]["name"], "f");
+    assert_eq!(
+        frame[0]["status"]["agents"]["f/c/a"]["plugins"]["flow"]["state"], "pending",
+        "the activation overlay is in the frame"
+    );
+
+    // a registry-only change: the plugin says hello and the pair activates,
+    // with no actor snapshot behind it
+    let _flow = start_silent(&w, "flow").await;
+    wait_frame(&mut s, |v| {
+        v[0]["status"]["agents"]["f/c/a"]["plugins"]["flow"]["state"] == "active"
+    })
+    .await;
+
+    // purge: the list empties
+    let (st, _) = w.api.admin(
+        "DELETE",
+        "/v1/fleets/f?keep_repos=false&keep_sessions=false&purge=true",
+        None,
+    );
+    assert_eq!(st, 200);
+    wait_frame(&mut s, |v| v.as_array().is_some_and(Vec::is_empty)).await;
+    s.close(None).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attach_bridges_the_runner_pty_and_gates_on_activation() {
+    let w = world().await;
+    let web = token(&w, "web").await;
+    let _web_plugin = start_silent(&w, "web").await;
+    let req = json!(FleetRequest {
+        spec: spec(&[("a", &[("web", json!({}))]), ("b", &[])]),
+        credentials: Default::default()
+    });
+    let (st, _) = w.api.admin("POST", "/v1/fleets", Some(&req));
+    assert_eq!(st, 200);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let r = w.daemon.get(&"f".parse().unwrap()).await.unwrap();
+            if r.status.observed_generation == 1
+                && r.status.agents["f/c/a"]
+                    .plugins
+                    .get("web")
+                    .is_some_and(|p| p.state == ActivationState::Active)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    // gates: capability, activation, token
+    let e = ws(
+        &ws_url(&w, "/v1/plugin-host/agents/f/c/a/attach"),
+        &token(&w, "flow").await,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(status_of(&e), Some(403), "{e}");
+    let e = ws(&ws_url(&w, "/v1/plugin-host/agents/f/c/b/attach"), &web)
+        .await
+        .unwrap_err();
+    assert_eq!(status_of(&e), Some(404), "b is not active for web: {e}");
+    let e = ws(&ws_url(&w, "/v1/plugin-host/agents/f/c/a/attach"), "nope")
+        .await
+        .unwrap_err();
+    assert_eq!(status_of(&e), Some(401));
+
+    // the bridge: echo, resize, an unsupported text frame closes 1003
+    let mut s = ws(&ws_url(&w, "/v1/plugin-host/agents/f/c/a/attach"), &web)
+        .await
+        .unwrap();
+    s.send(Message::Binary(b"hello".to_vec().into()))
+        .await
+        .unwrap();
+    let echo = s.next().await.unwrap().unwrap();
+    assert_eq!(echo.into_data().as_ref(), b"hello");
+    s.send(Message::Text(r#"{"resize":{"cols":120,"rows":40}}"#.into()))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !w
+            .h
+            .runner
+            .resizes()
+            .contains(&("f/c/a".to_string(), 120, 40))
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the resize reached the runner");
+    s.send(Message::Text("junk".into())).await.unwrap();
+    let close = s.next().await.unwrap().unwrap();
+    match close {
+        Message::Close(Some(f)) => assert_eq!(u16::from(f.code), 1003, "{f:?}"),
+        other => panic!("expected a close, got {other:?}"),
+    }
+
+    // a second attach, then the window dies: 1000
+    let mut s2 = ws(&ws_url(&w, "/v1/plugin-host/agents/f/c/a/attach"), &web)
+        .await
+        .unwrap();
+    s2.send(Message::Binary(b"x".to_vec().into()))
+        .await
+        .unwrap();
+    assert_eq!(s2.next().await.unwrap().unwrap().into_data().as_ref(), b"x");
+    assert!(w.h.runner.close_attach(&"f/c/a".parse().unwrap()));
+    let close = s2.next().await.unwrap().unwrap();
+    match close {
+        Message::Close(Some(f)) => assert_eq!(u16::from(f.code), 1000, "{f:?}"),
+        other => panic!("expected a close, got {other:?}"),
+    }
+    assert_eq!(
+        w.h.runner
+            .calls()
+            .iter()
+            .filter(|c| *c == "attach f/c/a")
+            .count(),
+        2
+    );
+}

@@ -56,6 +56,9 @@ daemon by `crates/hecaton-server/tests/events_it.rs` (§6).
 | `GET fleets` | `fleets` | — | `[FleetRecord]` | 200 | `fleets.json` |
 | `GET fleets/{name}` | `fleets` | — | `FleetRecord` | 200 | (shape as in `fleets.json`'s `response[0]`) |
 | `GET fleets/{name}`, unknown name | `fleets` | — | `{ error }` | 404 | `fleet-missing.json` |
+| `GET fleets/watch` (WebSocket) | `fleets` | — | one text frame per change, each the complete `GET fleets` body | 101 | `fleets-watch.json` (Task 6) |
+| `GET agents/{fleet}/{crew}/{agent}/attach` (WebSocket) | `attach` | — | binary frames are terminal bytes both ways; the one text frame is `{ "resize": { "cols", "rows" } }` | 101 | `attach-resize.json` (Task 6) |
+| `GET agents/…/attach`, agent not active for this plugin | `attach` | — | `{ "error": "plugin is not active for agent <id>" }` | 404 | (as for actions) |
 | `POST agents/{fleet}/{crew}/{agent}/actions` | `actions` | one of the three action shapes below | `{}` | 200 | `action.json` |
 | `POST agents/…/actions`, agent not active for this plugin | `actions` | — | `{ "error": "plugin is not active for agent <id>" }` | 404 | (same status as `fleet-missing.json`; asserted by `events_it.rs`, §6) |
 | `GET kv?prefix=` | `kv` | — | `{ keys }` | 200 | `kv-list.json` |
@@ -82,6 +85,17 @@ bare `.` or `..` segment. `PUT` and
 `?secret=true` on `PUT` stores the value through the daemon's vault.
 `?prefix=` on the list route filters returned `keys` by prefix
 (`kv-list.json`).
+
+**Streams** (plugins spec §18.4). `fleets/watch` sends the current list
+as its first frame and the whole list again after every change (fleet
+records and activation rows alike), pinging every 30 s; a consumer
+replaces its state on each frame and reconnects when the socket drops.
+`attach` opens a terminal on the agent's window: binary frames carry
+bytes both ways, a text frame must be a resize (`{ "resize": { "cols":
+120, "rows": 40 } }`, both at least 1) or the daemon closes with 1003;
+the daemon closes with 1000 when the window ends and 1011 on a runner
+failure. Both take the plugin's bearer on the handshake and answer the
+usual 401/403 before upgrading.
 
 ## 4. Daemon → plugin
 

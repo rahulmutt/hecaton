@@ -145,6 +145,36 @@ pub struct KvKeys {
     pub keys: Vec<String>,
 }
 
+/// The one text frame an attach socket accepts, both directions of the
+/// protocol (plugins spec §18.4): `{ "resize": { "cols", "rows" } }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResizeFrame {
+    pub resize: Resize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Resize {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+impl ResizeFrame {
+    pub fn new(cols: u16, rows: u16) -> Self {
+        Self {
+            resize: Resize { cols, rows },
+        }
+    }
+
+    /// `None` for anything but a well-formed frame with both dimensions
+    /// at least 1: a zero-sized terminal is a bug on the sender's side.
+    pub fn parse(text: &str) -> Option<Self> {
+        let frame: Self = serde_json::from_str(text).ok()?;
+        (frame.resize.cols >= 1 && frame.resize.rows >= 1).then_some(frame)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,5 +265,27 @@ mod tests {
             (OBSERVER_BATCH, OBSERVER_QUEUE, CHAIN_BUDGET_MS),
             (64, 1024, 1500)
         );
+    }
+
+    #[test]
+    fn resize_frames_round_trip_and_reject_the_malformed() {
+        let f = ResizeFrame::new(120, 40);
+        assert_eq!(
+            serde_json::to_string(&f).unwrap(),
+            r#"{"resize":{"cols":120,"rows":40}}"#
+        );
+        assert_eq!(
+            ResizeFrame::parse(r#"{"resize":{"cols":120,"rows":40}}"#),
+            Some(f)
+        );
+        for bad in [
+            "junk",
+            r#"{"resize":{"cols":0,"rows":40}}"#,
+            r#"{"resize":{"cols":80}}"#,
+            r#"{"resize":{"cols":80,"rows":24},"x":1}"#,
+            r#"{"cols":80,"rows":24}"#,
+        ] {
+            assert_eq!(ResizeFrame::parse(bad), None, "{bad}");
+        }
     }
 }

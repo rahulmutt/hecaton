@@ -25,7 +25,7 @@ pub use plugin::{
 };
 pub use protocol::{
     ActivateRequest, CHAIN_BUDGET_MS, DeactivateRequest, EventBatch, InterceptRequest,
-    InterceptResponse, KvKeys, OBSERVER_BATCH, OBSERVER_QUEUE, PluginAction,
+    InterceptResponse, KvKeys, OBSERVER_BATCH, OBSERVER_QUEUE, PluginAction, Resize, ResizeFrame,
 };
 pub use record::{Desired, FleetRecord, Keep};
 pub use request::{DownQuery, ErrorBody, FleetRequest, SessionRequest, SessionResponse};

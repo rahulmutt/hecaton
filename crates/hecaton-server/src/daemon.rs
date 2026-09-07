@@ -11,10 +11,10 @@ use hecaton_api::{
     SyncReport,
 };
 use hecaton_core::{
-    AgentId, AgentName, EventHandler, Fleet, FleetName, FleetRecord, FleetSecrets, Keep, Outcome,
-    is_reserved_fleet, plugin_id,
+    AgentId, AgentName, AgentRunner, EventHandler, Fleet, FleetName, FleetRecord, FleetSecrets,
+    Keep, Outcome, is_reserved_fleet, plugin_id,
 };
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
 use crate::actor::{self, FleetHandle, Msg, Ports, Shared};
 use crate::auth::constant_time_eq;
@@ -62,6 +62,9 @@ pub struct Daemon {
     proxy_client: crate::proxy::HttpClient,
     kv: Arc<PluginKv>,
     sessions: Sessions,
+    /// Ticks once per published actor snapshot and once per registry
+    /// write; `fleets/watch` waits on it (§18.4).
+    changes: Arc<watch::Sender<u64>>,
     /// One `apply` or `down` at a time *per fleet*: activation and the
     /// actor message must not interleave with another apply of the same
     /// fleet. Every other fleet runs on its own lock — an apply waits for
@@ -105,6 +108,7 @@ impl Daemon {
         let (shared, purged) = actor::shared(metrics);
         let plugins = PluginHost::start(plugin_config, &ports, shared.clone(), registry.clone());
         let ports = Arc::new(ports);
+        let changes = Arc::new(watch::channel(0u64).0);
         let mut fleets = BTreeMap::new();
         for (record, secrets) in existing {
             match FleetName::try_from(record.spec.name.clone()) {
@@ -139,6 +143,7 @@ impl Daemon {
                         shared.clone(),
                         true,
                     );
+                    tokio::spawn(Self::forward_changes(h.status.clone(), changes.clone()));
                     fleets.insert(name, h);
                 }
                 Err(e) => tracing::error!("skipping a stored fleet with an invalid name: {e}"),
@@ -156,6 +161,7 @@ impl Daemon {
             proxy_client: crate::proxy::client(),
             kv,
             sessions: Sessions::new(),
+            changes,
             applying: std::sync::Mutex::new(BTreeMap::new()),
         });
         tokio::spawn(Self::forget_purged(Arc::downgrade(&daemon), purged));
@@ -196,6 +202,7 @@ impl Daemon {
                 return;
             };
             d.fleets.write().await.remove(&name);
+            d.bump();
         }
     }
 
@@ -244,6 +251,33 @@ impl Daemon {
         record
     }
 
+    /// Every published snapshot of one actor becomes one tick of the
+    /// change counter `fleets/watch` waits on; a final tick when the actor
+    /// ends (a purge), so the list without it goes out too.
+    async fn forward_changes(
+        mut status: watch::Receiver<FleetRecord>,
+        changes: Arc<watch::Sender<u64>>,
+    ) {
+        while status.changed().await.is_ok() {
+            changes.send_modify(|n| *n += 1);
+        }
+        changes.send_modify(|n| *n += 1);
+    }
+
+    /// Ticks when any fleet record or activation row changed (§18.4).
+    pub fn changes(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    /// Registry writes have no actor behind them; the writer ticks.
+    fn bump(&self) {
+        self.changes.send_modify(|n| *n += 1);
+    }
+
+    pub fn runner(&self) -> Arc<dyn AgentRunner> {
+        self.ports.runner.clone()
+    }
+
     /// Reconciles the plugin set to `plugins.yaml`; `serve` calls it once
     /// at start and fails fast on an error, `plugin sync` on demand.
     pub async fn sync_plugins(&self) -> Result<SyncReport, PluginError> {
@@ -283,6 +317,7 @@ impl Daemon {
                 self.registry.set_state(&agent, name, activation);
             }
         }
+        self.bump();
         Ok(response)
     }
 
@@ -501,6 +536,10 @@ impl Daemon {
                         self.shared.clone(),
                         false,
                     );
+                    tokio::spawn(Self::forward_changes(
+                        h.status.clone(),
+                        self.changes.clone(),
+                    ));
                     fleets.insert(name.clone(), h.clone());
                     h
                 }
@@ -535,6 +574,7 @@ impl Daemon {
                 },
             );
         }
+        self.bump();
         Ok(self.overlay(record))
     }
 
@@ -566,6 +606,7 @@ impl Daemon {
         for (agent, plugin) in self.registry.remove_fleet(name) {
             self.deactivate_pair(&agent, &plugin).await;
         }
+        self.bump();
         Ok(self.overlay(record))
     }
 
