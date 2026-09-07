@@ -67,7 +67,11 @@ say "nono: $(nono --version 2>/dev/null | head -1)   tmux: $(tmux -V)   mise: $(
 
 hr "build"
 (cd "$REPO" && cargo build -q -p hecaton) || { say "cargo build failed"; exit 2; }
-HECATON="$REPO/target/debug/hecaton"
+# Under CARGO_TARGET_DIR the binary is not in ./target (same rule as
+# package-plugins.sh); a relative value is taken from the repo root.
+target="${CARGO_TARGET_DIR:-target}"
+case "$target" in /*) ;; *) target="$REPO/$target" ;; esac
+HECATON="$target/debug/hecaton"
 
 hr "scratch root"
 # A previous run (interrupted, or still parked at the prompt) leaves its
