@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use hecaton_api::{PluginEntry, PluginManifest, PluginStatus, PluginsFile, SyncReport};
 use hecaton_runtime::fsutil::write_atomic;
-use hecaton_server::plugins::package::{create, fetch, sha256_hex, unpack};
+use hecaton_server::plugins::config::NO_TLS;
+use hecaton_server::plugins::package::{create, sha256_hex, unpack};
 use hecaton_server::plugins::read_manifest;
 
 use crate::cli::{ApiOnlyArgs, ListArgs, PluginInstallArgs, PluginPackageArgs, PluginRemoveArgs};
@@ -116,16 +117,9 @@ fn describe_source(
     sha256: Option<&str>,
 ) -> Result<(String, Option<String>, PluginManifest)> {
     if source.starts_with("https://") {
-        let expected = sha256.ok_or_else(|| anyhow!("--sha256 is required for a URL source"))?;
-        let bytes = fetch(source)?;
-        let digest = sha256_hex(&bytes);
-        if digest != expected {
-            bail!("digest mismatch for {source} (expected {expected}, got {digest})");
-        }
-        let tmp = tempfile::tempdir()?;
-        let dir = tmp.path().join("pkg");
-        unpack(&bytes, &dir)?;
-        return Ok((source.to_string(), Some(digest), read_manifest(&dir)?));
+        // enabled when a TLS provider is added; `package::fetch` and the
+        // `Source::Url` plumbing behind it stay in place for that day
+        bail!(NO_TLS);
     }
     if source.contains("://") {
         bail!("only https:// URLs, tarball paths and directories are accepted");

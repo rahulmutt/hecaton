@@ -21,7 +21,8 @@ a repository.
    `$XDG_CONFIG_HOME/hecaton/plugins.yaml` and syncs the daemon; `plugin list`
    shows its phase, `plugin remove <name> [--purge]` takes it out. `plugin
    package <dir>` builds the tarball and prints the `sha256` a `plugins.yaml`
-   entry needs.
+   entry needs. `https://` sources are part of the file format but rejected
+   until a TLS-enabled build — package the plugin and point at the tarball.
 8. `mise x -- cargo run -q -p hecaton -- dev materialize examples/payments.yaml backend/bob --no-host-defaults`
    — renders bob's generated files into a temp dir without launching anything.
 

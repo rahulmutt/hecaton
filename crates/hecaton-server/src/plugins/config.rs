@@ -8,6 +8,12 @@ use hecaton_core::name::validate_name;
 
 use super::PluginError;
 
+/// What an `https://` source is answered with. `ureq` is built without a
+/// TLS feature (Phase 3 spec P3-1 forbids the crates), so a fetch could
+/// only fail; the format keeps the field and the plumbing below.
+pub const NO_TLS: &str =
+    "URL sources need a TLS-enabled build; use `plugin package` and a tarball path";
+
 /// Where a package comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
@@ -63,15 +69,17 @@ pub fn load_plugins_file(path: &Path) -> Result<PluginsFile, PluginError> {
         if entry.source.trim().is_empty() {
             return Err(entry_error(i, "source", "must not be empty"));
         }
-        if entry.source.contains("://") && !entry.source.starts_with("https://") {
+        if entry.source.starts_with("https://") {
+            return Err(entry_error(i, "source", NO_TLS));
+        }
+        if entry.source.contains("://") {
             return Err(entry_error(
                 i,
                 "source",
                 "only https:// URLs, tarball paths and directories are accepted",
             ));
         }
-        let is_dir =
-            !entry.source.starts_with("https://") && resolve_path(&entry.source, base).is_dir();
+        let is_dir = resolve_path(&entry.source, base).is_dir();
         match &entry.sha256 {
             Some(s) if !is_hex64(s) => {
                 return Err(entry_error(i, "sha256", "expected 64 lowercase hex digits"));
@@ -99,7 +107,9 @@ fn resolve_path(source: &str, base: &Path) -> PathBuf {
 }
 
 /// URL, existing tarball, or existing directory; relative paths resolve
-/// against the directory holding `plugins.yaml`.
+/// against the directory holding `plugins.yaml`. `load_plugins_file`
+/// rejects URLs before this is reached; the arm is enabled when a TLS
+/// provider is added.
 pub fn resolve_source(entry: &PluginEntry, base: &Path) -> Result<Source, PluginError> {
     if entry.source.starts_with("https://") {
         return Ok(Source::Url(entry.source.clone()));
@@ -138,19 +148,46 @@ mod tests {
     fn loads_and_validates_entries() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("web")).unwrap();
+        std::fs::write(dir.path().join("flow.tar.gz"), b"").unwrap();
         let p = write(
             dir.path(),
-            "plugins:\n  - name: flow\n    source: https://x/flow.tar.gz\n    sha256: \"0000000000000000000000000000000000000000000000000000000000000000\"\n  - name: web\n    source: ./web\n    config: { title: t }\n",
+            "plugins:\n  - name: flow\n    source: ./flow.tar.gz\n    sha256: \"0000000000000000000000000000000000000000000000000000000000000000\"\n  - name: web\n    source: ./web\n    config: { title: t }\n",
         );
         let f = load_plugins_file(&p).unwrap();
         assert_eq!(f.plugins.len(), 2);
         assert_eq!(
             resolve_source(&f.plugins[0], dir.path()).unwrap(),
-            Source::Url("https://x/flow.tar.gz".into())
+            Source::Tarball(dir.path().join("flow.tar.gz"))
         );
         assert_eq!(
             resolve_source(&f.plugins[1], dir.path()).unwrap(),
             Source::Directory(dir.path().join("web"))
+        );
+    }
+
+    /// The format still describes URL sources and `resolve_source` still
+    /// maps one; only the load path refuses them, because this build has
+    /// no TLS.
+    #[test]
+    fn url_sources_are_declared_but_rejected_until_tls() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            dir.path(),
+            "plugins:\n  - name: flow\n    source: https://x/flow.tar.gz\n    sha256: \"0000000000000000000000000000000000000000000000000000000000000000\"\n",
+        );
+        assert_eq!(
+            load_plugins_file(&p).unwrap_err().to_string(),
+            format!("plugins.yaml: plugins[0].source: {NO_TLS}")
+        );
+        let entry = PluginEntry {
+            name: "flow".into(),
+            source: "https://x/flow.tar.gz".into(),
+            sha256: Some("0".repeat(64)),
+            config: serde_json::json!({}),
+        };
+        assert_eq!(
+            resolve_source(&entry, dir.path()).unwrap(),
+            Source::Url("https://x/flow.tar.gz".into())
         );
     }
 
@@ -167,11 +204,11 @@ mod tests {
                 "plugins.yaml: plugins[1].name: duplicate",
             ),
             (
-                "plugins:\n  - name: a\n    source: https://x/a.tar.gz\n",
+                "plugins:\n  - name: a\n    source: ./a.tar.gz\n",
                 "plugins.yaml: plugins[0].sha256: required for URL and tarball sources",
             ),
             (
-                "plugins:\n  - name: a\n    source: https://x/a.tar.gz\n    sha256: xyz\n",
+                "plugins:\n  - name: a\n    source: ./a.tar.gz\n    sha256: xyz\n",
                 "plugins.yaml: plugins[0].sha256: expected 64 lowercase hex digits",
             ),
             (

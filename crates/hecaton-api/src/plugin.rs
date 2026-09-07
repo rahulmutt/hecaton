@@ -68,7 +68,9 @@ pub struct PluginsFile {
 #[serde(deny_unknown_fields)]
 pub struct PluginEntry {
     pub name: String,
-    /// `https://` URL, tarball path, or directory path (relative to the file).
+    /// `https://` URL, tarball path, or directory path (relative to the
+    /// file). URL sources are part of the format but rejected until a
+    /// TLS-enabled build: `ureq` here has no TLS provider.
     pub source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,

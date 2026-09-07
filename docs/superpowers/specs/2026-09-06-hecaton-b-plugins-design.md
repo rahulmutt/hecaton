@@ -97,6 +97,14 @@ is used in place, never copied, and carries no digest; that is how the in-tree
 plugins run in development and the e2e. `name` must equal the manifest's
 `name`, and names are unique in the file.
 
+**URL sources are declared but not yet installable.** This build's `ureq`
+carries no TLS provider (Phase 3 spec P3-1 forbids adding one), so
+`load_plugins_file` and `hecaton plugin install` reject an `https://` source
+with "URL sources need a TLS-enabled build; use `plugin package` and a tarball
+path". `fetch`, `Source::Url` and the digest plumbing stay in place and are
+enabled when a TLS provider arrives; until then an operator packages the plugin
+and declares the tarball.
+
 **Sync** (`serve` at start, and `hecaton plugin sync` against a live daemon)
 reconciles the installed set to the file: fetch and verify anything missing
 (URL fetch through `ureq`, 60 s timeout, 64 MiB cap, digest checked before
@@ -515,3 +523,4 @@ Three mergeable phases, each fully tested before the next:
 - Unpacked package directories are 0755 (files 0444/0555) so `--purge` is a plain `remove_dir_all`.
 - `plugins.yaml` is written atomically by `plugin install|remove` (temp file + rename).
 - `PluginError::Fetch` carries `url`, not `source`.
+- URL sources are rejected at load and at `plugin install` until a TLS-enabled build (§2.1); a pinned URL whose digest is already unpacked is answered from `install_root` without fetching.

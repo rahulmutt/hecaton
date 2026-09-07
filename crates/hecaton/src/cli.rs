@@ -128,9 +128,10 @@ pub enum PluginCommand {
 
 #[derive(Debug, Args)]
 pub struct PluginInstallArgs {
-    /// Package directory, tarball path, or https:// URL of a tarball.
+    /// Package directory or tarball path (https:// URLs are declarable but
+    /// rejected until a TLS-enabled build).
     pub source: String,
-    /// Expected sha256 of the tarball (required for URLs).
+    /// Expected sha256 of the tarball.
     #[arg(long)]
     pub sha256: Option<String>,
     #[arg(long)]

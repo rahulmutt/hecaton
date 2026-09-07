@@ -216,12 +216,24 @@ pub fn create(dir: &Path, out: &Path) -> Result<String, PluginError> {
 /// directory is used in place. A tarball or URL is read, digest-checked
 /// against `expected` *before* unpacking, and unpacked into
 /// `<install_root>/<name>/<digest12>/`, reused if already there.
+///
+/// A pinned URL is answered from that directory without fetching: the
+/// digest names the content, so an existing unpack of it is the same
+/// bytes, and every restart would otherwise re-download the tarball.
+/// A local tarball is still read — it is cheap, and reading it is what
+/// catches a `sha256` that no longer matches the file on disk.
 pub fn install(
     name: &str,
     source: &Source,
     expected: Option<&str>,
     install_root: &Path,
 ) -> Result<(PathBuf, Option<String>), PluginError> {
+    if let (Source::Url(_), Some(exp)) = (source, expected) {
+        let dest = install_root.join(name).join(digest_prefix(exp));
+        if dest.is_dir() {
+            return Ok((dest, Some(exp.to_string())));
+        }
+    }
     let bytes = match source {
         Source::Directory(d) => {
             let canon = std::fs::canonicalize(d).map_err(|e| PluginError::io(d, e))?;
@@ -575,5 +587,27 @@ mod tests {
         .unwrap();
         assert_eq!(d, std::fs::canonicalize(src.path()).unwrap());
         assert_eq!(none, None);
+    }
+
+    /// A pinned URL whose digest is already unpacked is answered from
+    /// disk: `fetch` is never reached, so a daemon restart does not
+    /// re-download every plugin. The URL here has no host that resolves —
+    /// a fetch would fail the call.
+    #[test]
+    fn install_reuses_an_unpacked_url_package_without_fetching() {
+        let out = tempfile::tempdir().unwrap();
+        let root = out.path().join("install");
+        let digest = "a".repeat(64);
+        let dest = root.join("p").join(digest_prefix(&digest));
+        std::fs::create_dir_all(&dest).unwrap();
+        let url = Source::Url("https://255.255.255.255/p.tar.gz".into());
+        let (dir, d) = install("p", &url, Some(&digest), &root).unwrap();
+        assert_eq!(dir, dest);
+        assert_eq!(d.as_deref(), Some(digest.as_str()));
+        // nothing unpacked means nothing to answer from: this one does
+        // reach the fetch, and fails there rather than returning a dir
+        let other = "b".repeat(64);
+        let e = install("p", &url, Some(&other), &root).unwrap_err();
+        assert!(matches!(e, PluginError::Fetch { .. }), "{e}");
     }
 }

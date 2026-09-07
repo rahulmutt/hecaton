@@ -97,6 +97,22 @@ fn package_install_and_remove_edit_plugins_yaml_offline() {
         .failure()
         .stderr(predicate::str::contains("is not declared"));
 
+    // a URL source is declarable in the format but not installable: this
+    // build has no TLS, so `plugin install` says so instead of fetching
+    hecaton(&home)
+        .args([
+            "plugin",
+            "install",
+            "https://x/hello-0.1.0.tar.gz",
+            "--sha256",
+            &digest,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "URL sources need a TLS-enabled build; use `plugin package` and a tarball path",
+        ));
+
     // a directory source records the absolute path and no digest
     hecaton(&home)
         .args(["plugin", "install", &pkg.display().to_string()])
