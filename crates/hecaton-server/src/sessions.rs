@@ -131,13 +131,17 @@ pub fn same_origin(headers: &HeaderMap, origin: &str) -> bool {
 
 /// Where a login may send the browser: a path under the mount made of
 /// `[A-Za-z0-9/._~-]`, so it needs no encoding in a URL and cannot smuggle
-/// a query, a fragment, a header or another host. `None` for anything else.
+/// a query, a fragment, a header or another host. A `.` or `..` segment is
+/// rejected too — a browser normalizes it out of the `Location` path per
+/// RFC 3986, and it could otherwise walk the redirect back out of the
+/// mount. `None` for anything else.
 pub fn login_target(to: Option<&str>) -> Option<String> {
     let to = to.unwrap_or(MOUNT_PREFIX);
     let charset_ok = to
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'~' | b'-'));
-    (to.starts_with(MOUNT_PREFIX) && charset_ok).then(|| to.to_string())
+    let no_dot_segments = to.split('/').all(|s| !matches!(s, "." | ".."));
+    (to.starts_with(MOUNT_PREFIX) && charset_ok && no_dot_segments).then(|| to.to_string())
 }
 
 #[cfg(test)]
@@ -251,6 +255,10 @@ mod tests {
             login_target(Some("/v1/plugins/web/agents/f/c/a")).as_deref(),
             Some("/v1/plugins/web/agents/f/c/a")
         );
+        assert_eq!(
+            login_target(Some("/v1/plugins/web/index.html")).as_deref(),
+            Some("/v1/plugins/web/index.html")
+        );
         for bad in [
             "/v1/fleets",
             "http://evil.example/v1/plugins/",
@@ -259,6 +267,9 @@ mod tests {
             "/v1/plugins/web/\r\nSet-Cookie: x",
             "/v1/plugins",
             "",
+            "/v1/plugins/../fleets",
+            "/v1/plugins/..",
+            "/v1/plugins/./web/",
         ] {
             assert_eq!(login_target(Some(bad)), None, "{bad:?}");
         }
