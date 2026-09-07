@@ -20,5 +20,24 @@ crews:
     defaults:
       tools: { python: "3.12.8" }
     agents:
-      alice: {}
+      alice:
+        # The flow plugin (declare it in plugins.yaml first): block recursive
+        # deletes, and after Claude's first Stop ask for the tests once.
+        plugins:
+          flow:
+            initial: working
+            states:
+              working:
+                on:
+                  - event: PreToolUse
+                    match: { /tool_input/command: "rm -rf.*" }   # full-match
+                    respond: { decision: block, reason: "no recursive deletes" }
+                  - event: Stop
+                    goto: review
+                    send: { text: "Run the tests and fix any failures." }
+              review:
+                on:
+                  - event: Stop
+                    goto: done
+              done: {}
       bob: { claude: { settings: { model: opus } } }

@@ -186,3 +186,26 @@ does not gate capabilities or activation the way the real daemon does — the
 403 capability gate and the 404 `plugin is not active for agent …` on
 `agents/…/actions` (§3) — are asserted against the real daemon by
 `crates/hecaton-server/tests/events_it.rs`.
+
+## 7. Packaging and distribution
+
+A package is a directory (or a tarball of one) with `mise.toml` and
+`hecaton-plugin.yaml` at its root (plugins spec §2). The manifest's
+`start` names a task in that `mise.toml`; the daemon runs `mise trust` and
+`mise install` on it, then `mise run <start>` inside the sandbox with the
+package directory as the working directory. Two shapes:
+
+- **Development**: the binary sits inside the package (`bin/…`) and the
+  task runs it by relative path. `mise run package-plugins` assembles the
+  in-tree plugins this way under `target/plugins/<name>/`; a
+  `plugins.yaml` entry names such a directory as its `source` and it is
+  used in place. Host-only by construction.
+- **Release**: the package carries **no binary**. Its `mise.toml` pins
+  the plugin binary as a mise tool (for example a `ubi:` or `github:`
+  backend entry against a release asset, exact version) and the task runs
+  it by name; the daemon's `mise install` fetches the asset for the host
+  platform, exactly as it installs `node` for an agent, and the sandbox
+  already grants read on the mise data dir. One platform-neutral tarball,
+  one `sha256`. Cross-compiling the per-platform assets is the plugin
+  repository's release pipeline (Linux x86_64 and aarch64 while the
+  sandbox is Landlock; static builds avoid libc mismatches).

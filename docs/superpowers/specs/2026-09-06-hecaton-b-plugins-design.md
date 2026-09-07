@@ -874,3 +874,31 @@ the gotchas as found (the KV reset rule and full-match anchoring first);
 `README.md` status "phase 2b done, phase 3 next" and a flow block;
 `examples/payments.yaml` a commented flow block for alice. The threat model
 is unchanged: flow adds no trust boundary.
+
+### 17.8 Refinements from the phase 2b plan (2026-09-07)
+
+Where the phase 2b implementation plan refined this section:
+
+- **`Harness::start` takes `&Env`, not the `FakeHost`**: the `Env` a
+  `FakeHost::env(name, scratch)` returns is what `Host::new` needs, and
+  the flow tests hold the same `Env` to build the plugin's own `Host`.
+- **`Harness::intercept` takes the event only**; the agent is in the
+  `HookEvent` that `event(agent, name, payload)` builds. `intercept_with`
+  adds `response_so_far` and `deadline_ms`.
+- **`Metrics` constructors** are `int_counter`, `int_counter_vec`,
+  `int_gauge`, `int_gauge_vec` and `render()`; the vector types are
+  re-exported from `hecaton_plugin_sdk::metrics`; registration errors are
+  `SdkError::Metrics`.
+- **`metrics.json` was re-recorded**: the encoder writes a `# HELP` line
+  the hand-written fixture lacked; `families_ok` accepted it already.
+- **Config errors are `ConfigError { path, message }`** (thiserror,
+  displayed `<path>: <message>`); `activate` stringifies it. Regex errors
+  keep only their last line without `error: `; unknown fields read
+  `unknown field `foo``.
+- **§11.1 row, verified 2026-09-07:** a binary inside a directory-source
+  package is executable under the package's read grant — yes, no sandbox
+  block needed (the manifest carries no `sandbox:` block; the plugin ran
+  to `hello` and `plugin list` showed `ready` with only the base package
+  read grant).
+- **`test` and `e2e` depend on `package-plugins`**, so `mise run check`
+  and CI assemble `target/plugins/flow/` before nextest.
