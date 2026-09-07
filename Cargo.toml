@@ -13,6 +13,7 @@ repository = "https://github.com/rahulmutt/hecaton"
 hecaton-api = { path = "crates/hecaton-api" }
 hecaton-core = { path = "crates/hecaton-core" }
 hecaton-config = { path = "crates/hecaton-config" }
+hecaton-plugin-sdk = { path = "crates/hecaton-plugin-sdk" }
 hecaton-runtime = { path = "crates/hecaton-runtime" }
 hecaton-server = { path = "crates/hecaton-server" }
 
