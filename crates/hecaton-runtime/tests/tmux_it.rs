@@ -7,8 +7,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
 
 use hecaton_core::{AgentId, AgentRunner, LaunchPlan, ProcessState};
-use hecaton_runtime::TmuxRunner;
 use hecaton_runtime::tmux::ATTACH_SESSION_PREFIX;
+use hecaton_runtime::{ANCHOR_WINDOW, TmuxRunner};
 
 fn wait_for(mut f: impl FnMut() -> bool) {
     let start = Instant::now();
@@ -155,6 +155,16 @@ fn attach_streams_the_pane_and_the_grouped_session_dies_with_the_stream() {
             .is_ok_and(|s| s.contains("hello-from-agent"))
     });
 
+    // Park the crew session on the anchor first, so the attach's
+    // `select-window -t =a` below has somewhere to leak from: without this
+    // the crew session is already on `a` and the assertion that it stays
+    // put would hold whatever the grouped session did.
+    tmux(&["select-window", "-t", &format!("=f/c:={ANCHOR_WINDOW}")]);
+    assert_eq!(
+        tmux(&["display-message", "-p", "-t", "f/c", "#{window_name}"]).trim(),
+        ANCHOR_WINDOW
+    );
+
     let stream = r.attach(&id).unwrap();
     let mut reader = stream.reader().unwrap();
     let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
@@ -211,8 +221,8 @@ fn attach_streams_the_pane_and_the_grouped_session_dies_with_the_stream() {
     );
     assert_eq!(
         tmux(&["display-message", "-p", "-t", "f/c", "#{window_name}"]).trim(),
-        "a",
-        "the crew session's current window is whatever it was"
+        ANCHOR_WINDOW,
+        "the viewer's select-window never moved the operator's own session"
     );
 
     drop(stream);

@@ -47,9 +47,21 @@ fn attach_session_name() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
         .unwrap_or(0);
-    let seq = ATTACH_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mixed = nanos ^ (seq << 32) ^ u64::from(std::process::id());
-    let low = u32::try_from(mixed & 0xffff_ffff).unwrap_or(0);
+    attach_name(
+        nanos,
+        ATTACH_SEQ.fetch_add(1, Ordering::Relaxed),
+        std::process::id(),
+    )
+}
+
+/// The name's arithmetic, without the clock or the process: the three
+/// inputs are xored apart (the counter into the high half, so two names
+/// taken within one clock tick still differ) and then the high half is
+/// folded back down, or everything the counter contributes would be
+/// truncated away.
+fn attach_name(nanos: u64, seq: u64, pid: u32) -> String {
+    let mixed = nanos ^ (seq << 32) ^ u64::from(pid);
+    let low = u32::try_from((mixed ^ (mixed >> 32)) & 0xffff_ffff).unwrap_or(0);
     format!("{ATTACH_SESSION_PREFIX}{low:08x}")
 }
 
@@ -540,6 +552,11 @@ mod tests {
         assert!(sessions_in_group(text, "f/e").is_empty());
         assert!(attach_session_name().starts_with(ATTACH_SESSION_PREFIX));
         assert_ne!(attach_session_name(), attach_session_name());
+        // The counter alone must change the name: two attaches within one
+        // clock tick, in one process, would otherwise collide.
+        assert_ne!(attach_name(1, 0, 7), attach_name(1, 1, 7));
+        assert_ne!(attach_name(1, 0, 7), attach_name(2, 0, 7), "and the clock");
+        assert_ne!(attach_name(1, 0, 7), attach_name(1, 0, 8), "and the pid");
     }
 
     #[test]
