@@ -86,16 +86,22 @@ impl PluginClient {
         format!("http://{listen}{path}")
     }
 
-    /// Reads at most `MAX_BODY` bytes; a non-2xx becomes `Status` with
-    /// the `{ "error" }` message or the raw text.
-    async fn body(resp: reqwest::Response) -> Result<Vec<u8>, CallFailure> {
+    /// Reads at most `MAX_BODY` bytes off the wire, chunk by chunk, so an
+    /// untrusted plugin cannot force the whole (unbounded) body into memory
+    /// before the cap is enforced: as soon as the accumulated length passes
+    /// `MAX_BODY` this stops reading and fails, without draining the rest
+    /// of the response. A non-2xx becomes `Status` with the `{ "error" }`
+    /// message or the raw text.
+    async fn body(mut resp: reqwest::Response) -> Result<Vec<u8>, CallFailure> {
         let status = resp.status().as_u16();
-        let bytes = resp.bytes().await?;
-        if bytes.len() > MAX_BODY {
-            return Err(CallFailure::Body(format!(
-                "{} bytes exceeds 1 MiB",
-                bytes.len()
-            )));
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() > MAX_BODY {
+                return Err(CallFailure::Body(format!(
+                    "body exceeds {MAX_BODY} bytes (1 MiB cap)"
+                )));
+            }
         }
         if !(200..300).contains(&status) {
             let text = String::from_utf8_lossy(&bytes).trim().to_string();
@@ -104,7 +110,7 @@ impl PluginClient {
                 .unwrap_or(text);
             return Err(CallFailure::Status { status, message });
         }
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 
     async fn post<T: Serialize + ?Sized>(
@@ -193,8 +199,10 @@ mod tests {
     use serde_json::{Value, json};
 
     /// A plugin stub: activate rejects agent "bad", intercept echoes the
-    /// event name (or returns a non-object for "PreCompact"), health is
-    /// fine, metrics is one family, `/slow` never answers in time.
+    /// event name (or returns a non-object for "PreCompact", or sleeps 3 s
+    /// past any short caller timeout for "Stop"), health is fine, metrics
+    /// is one family. `oversized_stub` below is a second, dedicated stub
+    /// whose `/v1/metrics` answers with a body over the 1 MiB cap.
     async fn stub() -> String {
         let app = Router::new()
             .route(
@@ -233,6 +241,16 @@ mod tests {
                 "/v1/metrics",
                 get(|| async { "# TYPE hecaton_plugin_x_up gauge\nhecaton_plugin_x_up 1\n" }),
             );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    /// A second, dedicated stub whose `/v1/metrics` answers with a body
+    /// one byte over the 1 MiB cap.
+    async fn oversized_stub() -> String {
+        let app = Router::new().route("/v1/metrics", get(|| async { "x".repeat(MAX_BODY + 1) }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -349,5 +367,17 @@ mod tests {
             .await
             .unwrap();
         assert!(text.starts_with("# TYPE hecaton_plugin_x_up"));
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_cap_fails_without_being_fully_buffered() {
+        let listen = oversized_stub().await;
+        let c = PluginClient::new().unwrap();
+        let e = c
+            .metrics(&listen, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(e.reason(), "body");
+        assert!(matches!(e, CallFailure::Body(_)), "{e}");
     }
 }
