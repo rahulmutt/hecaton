@@ -162,29 +162,35 @@ async fn metrics(State(state): State<AppState>) -> Response {
     state.daemon.metrics().set_gauges(&snapshots);
     let mut body = state.daemon.metrics().encode();
     let registry = state.daemon.registry().clone();
-    let mut scrapes = tokio::task::JoinSet::new();
+    // The plugin name lives outside the spawned task (not inside its
+    // returned value) so a panicked or cancelled scrape is still
+    // attributable: a bare `JoinError` carries no payload to recover it
+    // from. Every task is spawned before any is awaited, so this keeps
+    // the scrapes running in parallel despite the sequential awaits below.
+    let mut scrapes = Vec::new();
     for name in registry.names() {
         let Some(listen) = registry.ready_listen(&name) else {
             continue;
         };
         let client = state.daemon.client().clone();
-        scrapes.spawn(async move {
-            let r = client.metrics(&listen, SCRAPE_TIMEOUT).await;
-            (name, r)
-        });
+        let handle = tokio::spawn(async move { client.metrics(&listen, SCRAPE_TIMEOUT).await });
+        scrapes.push((name, handle));
     }
-    while let Some(joined) = scrapes.join_next().await {
-        let Ok((name, result)) = joined else { continue };
-        match result {
-            Ok(text) if crate::plugin_api::families_ok(&text, name.as_str()) => {
+    for (name, handle) in scrapes {
+        match handle.await {
+            Ok(Ok(text)) if crate::plugin_api::families_ok(&text, name.as_str()) => {
                 body.push_str(&text);
                 if !text.ends_with('\n') {
                     body.push('\n');
                 }
             }
-            Ok(_) => state.daemon.metrics().scrape_failure(name.as_str()),
-            Err(e) => {
+            Ok(Ok(_)) => state.daemon.metrics().scrape_failure(name.as_str()),
+            Ok(Err(e)) => {
                 tracing::debug!(plugin = %name, "metrics scrape failed: {e}");
+                state.daemon.metrics().scrape_failure(name.as_str());
+            }
+            Err(e) => {
+                tracing::warn!(plugin = %name, "metrics scrape task failed: {e}");
                 state.daemon.metrics().scrape_failure(name.as_str());
             }
         }

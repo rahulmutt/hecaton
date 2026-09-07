@@ -268,6 +268,9 @@ impl Metrics {
             .inc();
     }
 
+    /// Bumped only after `encode()` already rendered this scrape's body
+    /// (§9), so a failure here is reflected in the *next* `/metrics`
+    /// response, not this one.
     pub fn scrape_failure(&self, plugin: &str) {
         self.inner
             .plugin_metrics_scrape_failures

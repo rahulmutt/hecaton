@@ -2,7 +2,7 @@
 //! bearer identifies it, the manifest's `needs` gates every route.
 
 use axum::body::Bytes;
-use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
+use axum::extract::rejection::{BytesRejection, JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
 use axum::response::{IntoResponse, Response};
@@ -156,11 +156,12 @@ async fn put_key(
     headers: HeaderMap,
     key: Result<Path<String>, PathRejection>,
     q: Result<Query<KvQuery>, QueryRejection>,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let plugin = caller(&state, &headers, Capability::Kv).await?;
     let key = key_of(key)?;
     let q = kv_query(q)?;
+    let body = body.map_err(|e| ApiError::new(e.status(), e.body_text()))?;
     let kv = state.daemon.kv().clone();
     tokio::task::spawn_blocking(move || kv.put(&plugin, &key, &body, q.secret))
         .await
