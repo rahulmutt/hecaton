@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use hecaton_api::{PluginEntry, PluginManifest, PluginStatus, PluginsFile, SyncReport};
+use hecaton_runtime::fsutil::write_atomic;
 use hecaton_server::plugins::package::{create, fetch, sha256_hex, unpack};
 use hecaton_server::plugins::read_manifest;
 
@@ -75,13 +76,13 @@ pub fn load_file(path: &Path) -> Result<PluginsFile> {
     }
 }
 
-/// Rewrites the file; comments are not preserved.
+/// Rewrites the file; comments are not preserved. Atomic (sibling temp file
+/// then rename), so a crash or a full disk cannot leave the operator's
+/// source of truth truncated — `serve` fail-fasts on an unreadable one.
+/// 0644: it holds no secrets.
 pub fn save_file(path: &Path, file: &PluginsFile) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| parent.display().to_string())?;
-    }
     let text = serde_norway::to_string(file)?;
-    std::fs::write(path, text).with_context(|| path.display().to_string())
+    write_atomic(path, text.as_bytes(), 0o644).with_context(|| path.display().to_string())
 }
 
 pub fn install_entry(file: &mut PluginsFile, entry: PluginEntry) -> Result<()> {
@@ -315,6 +316,15 @@ mod tests {
         assert!(remove_entry(&mut again, "web"));
         assert!(!remove_entry(&mut again, "web"));
         assert!(again.plugins.is_empty());
+        // the rewrite is atomic: the previous content is fully replaced and
+        // no sibling temp file survives to be mistaken for the real file
+        save_file(&path, &again).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("web"));
+        let left: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["plugins.yaml"], "no temp file left behind");
     }
 
     /// `--purge` on an entry that is already gone still reaches the daemon:

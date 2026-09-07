@@ -29,7 +29,7 @@ pub(crate) fn ensure_private_dir(path: &Path) -> io::Result<()> {
 /// umask can only remove bits, so a restrictive umask (e.g. `0o077`) could
 /// otherwise leave the file narrower than the caller asked for. A stale
 /// temp file from a crashed run is removed first.
-pub(crate) fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
+pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::other("path has no parent"))?;
