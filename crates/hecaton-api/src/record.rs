@@ -1,6 +1,8 @@
 //! One fleet as the daemon stores and returns it (Phase 3 spec §2). A wire
 //! type: the CLI, the plugin SDK and the daemon all read it.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{FleetPhase, FleetSpec, FleetStatus, FleetSummary};
@@ -18,6 +20,11 @@ pub struct FleetRecord {
     pub spec: FleetSpec,
     pub generation: u64,
     pub desired: Desired,
+    /// Agents held stopped by a plugin action (plugins spec §16.4): stopped
+    /// if observed, never restarted, restart counter untouched. Keyed like
+    /// `status.agents`. Cleared for every agent an `Apply` declares.
+    #[serde(default)]
+    pub stopped: BTreeSet<String>,
     pub status: FleetStatus,
 }
 
@@ -35,6 +42,7 @@ impl FleetRecord {
             spec,
             generation: 0,
             desired: Desired::Up,
+            stopped: BTreeSet::new(),
             status: FleetStatus::default(),
         }
     }
@@ -115,5 +123,21 @@ mod tests {
         assert!(!r.is_down(), "still terminating");
         r.status.phase = FleetPhase::Down;
         assert!(r.is_down());
+    }
+
+    #[test]
+    fn stopped_defaults_empty_and_round_trips() {
+        let mut r = FleetRecord::new(spec());
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["stopped"], serde_json::json!([]));
+        let older: FleetRecord = serde_json::from_value(serde_json::json!({
+            "spec": { "name": "payments" }, "generation": 1, "desired": { "state": "up" },
+            "status": { "generation": 1, "observed_generation": 1, "phase": "ready" }
+        }))
+        .unwrap();
+        assert!(older.stopped.is_empty(), "a phase 1 fleet.json loads");
+        r.stopped.insert("payments/backend/bob".into());
+        let back: FleetRecord = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back.stopped, r.stopped);
     }
 }

@@ -102,6 +102,7 @@ pub fn backoff_secs(policy: &ReconcilePolicy, restarts: u32) -> u64 {
 ///
 /// | observed | condition | steps |
 /// |---|---|---|
+/// | any | in `stopped` | `Stop` if observed, else — |
 /// | `Running` | `!changed` | — |
 /// | `Running` | `changed` | `Stop`, `Materialize`, `Start` |
 /// | `Exited` | `changed` | `Materialize`, `Start` |
@@ -112,14 +113,20 @@ pub fn backoff_secs(policy: &ReconcilePolicy, restarts: u32) -> u64 {
 /// | absent | phase `Dead` and `!changed` | — |
 /// | absent | otherwise | `Materialize`, `Start` |
 ///
+/// A desired agent in `stopped` (plugins spec §16.4) gets `Stop` if it is
+/// observed at all and nothing else: no restart, no `NoteExit`, even when
+/// its hash changed. Leaving the set is an ordinary "absent → restart".
+///
 /// Known-but-not-desired agents get `Stop` (if observed) and `RemoveAgent`;
 /// their crews, if no longer desired, `RemoveCrew` with the caller's `keep`.
 /// With `desired == None` (down) every observed agent is stopped and every
 /// known crew removed with `keep`; nothing is ensured.
+#[allow(clippy::too_many_arguments)]
 pub fn plan(
     fleet: &FleetName,
     desired: Option<&Fleet>,
     keep: Keep,
+    stopped: &BTreeSet<AgentId>,
     status: &FleetStatus,
     observed: &ObservedState,
     _policy: &ReconcilePolicy,
@@ -174,6 +181,12 @@ pub fn plan(
     }
 
     for (id, agent) in &desired_agents {
+        if stopped.contains(id) {
+            if observed.get(id).is_some() {
+                stops.push(Step::Stop(id.clone()));
+            }
+            continue;
+        }
         let hash = agent.hash();
         let st = status.agents.get(&id.to_string());
         let changed = st.and_then(|s| s.applied_hash.as_ref()) != Some(&hash);
@@ -276,14 +289,17 @@ mod tests {
 
     fn plan_for(
         desired: Option<&Fleet>,
+        stopped: &[&str],
         status: &FleetStatus,
         observed: &ObservedState,
         now: u64,
     ) -> Vec<String> {
+        let stopped: BTreeSet<AgentId> = stopped.iter().map(|s| id(s)).collect();
         render(&plan(
             &fleet_name(),
             desired,
             Keep::default(),
+            &stopped,
             status,
             observed,
             &ReconcilePolicy::default(),
@@ -307,6 +323,7 @@ mod tests {
         let f = fleet(&[("b", 1), ("a", 1)]);
         let got = plan_for(
             Some(&f),
+            &[],
             &FleetStatus::default(),
             &ObservedState::default(),
             0,
@@ -331,7 +348,10 @@ mod tests {
         st.entry("f/c/a").phase = AgentPhase::Ready;
         let mut obs = ObservedState::default();
         obs.set(&id("f/c/a"), ProcessState::Running { pid: 1 });
-        assert_eq!(plan_for(Some(&f), &st, &obs, 0), vec!["ensure-crew f/c"]);
+        assert_eq!(
+            plan_for(Some(&f), &[], &st, &obs, 0),
+            vec!["ensure-crew f/c"]
+        );
     }
 
     #[test]
@@ -343,7 +363,7 @@ mod tests {
         let mut obs = ObservedState::default();
         obs.set(&id("f/c/a"), ProcessState::Running { pid: 1 });
         assert_eq!(
-            plan_for(Some(&new), &st, &obs, 0),
+            plan_for(Some(&new), &[], &st, &obs, 0),
             vec![
                 "stop f/c/a".to_string(),
                 "ensure-crew f/c".into(),
@@ -360,7 +380,7 @@ mod tests {
         st.entry("f/old/z").phase = AgentPhase::Ready;
         let mut obs = ObservedState::default();
         obs.set(&id("f/c/gone"), ProcessState::Running { pid: 1 });
-        let got = plan_for(Some(&f), &st, &obs, 0);
+        let got = plan_for(Some(&f), &[], &st, &obs, 0);
         assert_eq!(got[0], "stop f/c/gone");
         assert_eq!(got[1], "remove-agent f/c/gone");
         assert_eq!(got[2], "remove-agent f/old/z");
@@ -384,6 +404,7 @@ mod tests {
                 repos: true,
                 sessions: false,
             },
+            &BTreeSet::new(),
             &st,
             &ObservedState::default(),
             &ReconcilePolicy::default(),
@@ -409,6 +430,7 @@ mod tests {
                 repos: true,
                 sessions: false,
             },
+            &BTreeSet::new(),
             &st,
             &obs,
             &ReconcilePolicy::default(),
@@ -434,7 +456,7 @@ mod tests {
         let mut obs = ObservedState::default();
         obs.set(&id("f/c/a"), ProcessState::Exited { code: Some(137) });
         assert_eq!(
-            plan_for(Some(&f), &st, &obs, 0),
+            plan_for(Some(&f), &[], &st, &obs, 0),
             vec!["ensure-crew f/c", "note-exit f/c/a Some(137)"]
         );
     }
@@ -452,8 +474,11 @@ mod tests {
         };
         let mut obs = ObservedState::default();
         obs.set(&id("f/c/a"), ProcessState::Exited { code: None });
-        assert_eq!(plan_for(Some(&f), &st, &obs, 9), vec!["ensure-crew f/c"]);
-        let due = plan_for(Some(&f), &st, &obs, 10);
+        assert_eq!(
+            plan_for(Some(&f), &[], &st, &obs, 9),
+            vec!["ensure-crew f/c"]
+        );
+        let due = plan_for(Some(&f), &[], &st, &obs, 10);
         assert_eq!(due.len(), 3);
         assert_eq!(due[1], "materialize f/c/a");
     }
@@ -470,15 +495,18 @@ mod tests {
         };
         let mut obs = ObservedState::default();
         obs.set(&id("f/c/a"), ProcessState::Exited { code: Some(1) });
-        assert_eq!(plan_for(Some(&f), &st, &obs, 0), vec!["ensure-crew f/c"]);
+        assert_eq!(
+            plan_for(Some(&f), &[], &st, &obs, 0),
+            vec!["ensure-crew f/c"]
+        );
         // window vanished entirely: still left alone
         assert_eq!(
-            plan_for(Some(&f), &st, &ObservedState::default(), 0),
+            plan_for(Some(&f), &[], &st, &ObservedState::default(), 0),
             vec!["ensure-crew f/c"]
         );
         // new spec: restart
         let f2 = fleet(&[("a", 2)]);
-        assert_eq!(plan_for(Some(&f2), &st, &obs, 0).len(), 3);
+        assert_eq!(plan_for(Some(&f2), &[], &st, &obs, 0).len(), 3);
     }
 
     #[test]
@@ -490,8 +518,69 @@ mod tests {
             applied_hash: Some(hash_of(&f, "a")),
             ..AgentStatus::default()
         };
-        let got = plan_for(Some(&f), &st, &ObservedState::default(), 0);
+        let got = plan_for(Some(&f), &[], &st, &ObservedState::default(), 0);
         assert_eq!(got.len(), 3);
         assert_eq!(got[1], "materialize f/c/a");
+    }
+
+    #[test]
+    fn a_stopped_agent_is_stopped_and_never_restarted() {
+        let f = fleet(&[("a", 1), ("b", 1)]);
+        let mut st = FleetStatus::default();
+        for a in ["a", "b"] {
+            let e = st.entry(&format!("f/c/{a}"));
+            e.applied_hash = Some(hash_of(&f, a));
+            e.phase = AgentPhase::Ready;
+        }
+        let mut obs = ObservedState::default();
+        obs.set(&id("f/c/a"), ProcessState::Running { pid: 1 });
+        obs.set(&id("f/c/b"), ProcessState::Running { pid: 2 });
+        assert_eq!(
+            plan_for(Some(&f), &["f/c/b"], &st, &obs, 0),
+            vec!["stop f/c/b", "ensure-crew f/c"],
+            "running: stopped, a untouched"
+        );
+        // exited with a due restart: still nothing but the stop
+        st.entry("f/c/b").next_restart_at = Some(Timestamp(0));
+        obs.set(&id("f/c/b"), ProcessState::Exited { code: Some(1) });
+        assert_eq!(
+            plan_for(Some(&f), &["f/c/b"], &st, &obs, 5),
+            vec!["stop f/c/b", "ensure-crew f/c"]
+        );
+        // window gone, phase Stopped: nothing at all
+        st.entry("f/c/b").phase = AgentPhase::Stopped;
+        st.entry("f/c/b").next_restart_at = None;
+        obs.remove(&id("f/c/b"));
+        assert_eq!(
+            plan_for(Some(&f), &["f/c/b"], &st, &obs, 5),
+            vec!["ensure-crew f/c"]
+        );
+        // a changed hash while stopped: still nothing (the stop wins)
+        let f2 = fleet(&[("a", 1), ("b", 2)]);
+        assert_eq!(
+            plan_for(Some(&f2), &["f/c/b"], &st, &obs, 5),
+            vec!["ensure-crew f/c"]
+        );
+    }
+
+    #[test]
+    fn resuming_a_stopped_agent_restarts_it() {
+        let f = fleet(&[("a", 1)]);
+        let mut st = FleetStatus::default();
+        *st.entry("f/c/a") = AgentStatus {
+            phase: AgentPhase::Stopped,
+            applied_hash: Some(hash_of(&f, "a")),
+            restarts: 3,
+            ..AgentStatus::default()
+        };
+        let got = plan_for(Some(&f), &[], &st, &ObservedState::default(), 0);
+        assert_eq!(
+            got,
+            vec![
+                "ensure-crew f/c".to_string(),
+                "materialize f/c/a".into(),
+                format!("start f/c/a {}", short(&hash_of(&f, "a")))
+            ]
+        );
     }
 }

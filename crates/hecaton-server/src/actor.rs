@@ -3,7 +3,7 @@
 //! snapshots go out on a `watch` channel; the inbox queues while a pass
 //! runs, so a Ready arriving mid-pass lands when the pass ends.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -275,6 +275,12 @@ impl Actor {
         let mut status = before.clone();
         let creds = self.secrets.credentials.clone();
         let hook_secrets = self.secrets.hook_secrets.clone();
+        let stopped: BTreeSet<AgentId> = self
+            .record
+            .stopped
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect();
         let started = Instant::now();
         let joined = tokio::task::spawn_blocking(move || {
             let fleet = match desired {
@@ -293,6 +299,7 @@ impl Actor {
                 fleet: &name,
                 desired: fleet.as_ref(),
                 keep,
+                stopped: &stopped,
                 materializer: ports.materializer.as_ref(),
                 runner: ports.runner.as_ref(),
                 creds: &creds,

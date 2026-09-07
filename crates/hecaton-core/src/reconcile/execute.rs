@@ -1,7 +1,7 @@
 //! Walks a `Plan` through the ports (Phase 2 spec §3.3). Dumb on purpose:
 //! every decision was made by `plan`, every status change is `apply`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use hecaton_api::{CredentialBundle, FleetStatus};
 
@@ -15,6 +15,7 @@ pub struct ReconcileContext<'a> {
     pub fleet: &'a FleetName,
     pub desired: Option<&'a Fleet>,
     pub keep: Keep,
+    pub stopped: &'a BTreeSet<AgentId>,
     pub materializer: &'a dyn Materializer,
     pub runner: &'a dyn AgentRunner,
     pub creds: &'a CredentialBundle,
@@ -141,6 +142,7 @@ pub fn reconcile_pass(
         ctx.fleet,
         ctx.desired,
         ctx.keep,
+        ctx.stopped,
         status,
         &observed,
         ctx.policy,
@@ -191,6 +193,7 @@ mod tests {
         creds: CredentialBundle,
         policy: ReconcilePolicy,
         fleet_name: FleetName,
+        stopped: BTreeSet<AgentId>,
     }
 
     impl Harness {
@@ -202,6 +205,7 @@ mod tests {
                 creds: CredentialBundle::default(),
                 policy: ReconcilePolicy::default(),
                 fleet_name: "f".parse().unwrap(),
+                stopped: BTreeSet::new(),
             }
         }
         fn ctx<'a>(&'a self, desired: Option<&'a Fleet>) -> ReconcileContext<'a> {
@@ -209,6 +213,7 @@ mod tests {
                 fleet: &self.fleet_name,
                 desired,
                 keep: Keep::default(),
+                stopped: &self.stopped,
                 materializer: &self.m,
                 runner: &self.r,
                 creds: &self.creds,
@@ -356,6 +361,35 @@ mod tests {
         assert_eq!(
             h.r.observed().get(&"f/c/a".parse().unwrap()),
             Some(&crate::ports::ProcessState::Running { pid: 2 })
+        );
+    }
+
+    #[test]
+    fn stop_then_resume_keeps_the_restart_count() {
+        let mut h = Harness::new();
+        let f = fleet(&["a"]);
+        let mut st = FleetStatus::default();
+        reconcile_pass(&mut st, &h.ctx(Some(&f))).unwrap();
+        st.agents.get_mut("f/c/a").unwrap().restarts = 2;
+        h.stopped.insert("f/c/a".parse().unwrap());
+        let (p, rep) = reconcile_pass(&mut st, &h.ctx(Some(&f))).unwrap();
+        assert!(rep.all_ok());
+        assert_eq!(
+            p.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec!["stop f/c/a", "ensure-crew f/c"]
+        );
+        assert_eq!(st.agents["f/c/a"].phase, AgentPhase::Stopped);
+        assert_eq!(h.r.observed().get(&"f/c/a".parse().unwrap()), None);
+        // idle while stopped
+        let (p, _) = reconcile_pass(&mut st, &h.ctx(Some(&f))).unwrap();
+        assert_eq!(p.len(), 1);
+        h.stopped.clear();
+        let (p, _) = reconcile_pass(&mut st, &h.ctx(Some(&f))).unwrap();
+        assert_eq!(p.len(), 3);
+        assert_eq!(st.agents["f/c/a"].phase, AgentPhase::Starting);
+        assert_eq!(
+            st.agents["f/c/a"].restarts, 2,
+            "a deliberate stop is not an exit"
         );
     }
 }

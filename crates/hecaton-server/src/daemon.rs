@@ -317,7 +317,7 @@ impl Daemon {
             payload: event.payload,
         };
         tracing::debug!(agent = %agent, event = %hook_event.name, payload = %hook_event.payload, "hook event");
-        let outcome = self.handler.handle(&hook_event);
+        let outcome = self.handler.handle(&hook_event).await;
         self.shared
             .metrics
             .hook_event(agent, &hook_event.name, started.elapsed().as_secs_f64());
