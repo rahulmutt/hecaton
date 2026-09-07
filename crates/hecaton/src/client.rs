@@ -5,7 +5,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use hecaton_api::{DownQuery, ErrorBody, FleetRequest, FleetSummary, PluginStatus, SyncReport};
+use hecaton_api::{
+    DownQuery, ErrorBody, FleetRequest, FleetSummary, PluginStatus, SessionRequest,
+    SessionResponse, SyncReport,
+};
 use hecaton_core::FleetRecord;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -193,6 +196,21 @@ impl Client {
         .map(|_| ())
     }
 
+    /// `POST /v1/sessions`: a single-use login URL landing on `to`.
+    pub fn create_session(&self, to: &str) -> Result<String> {
+        let resp: SessionResponse = Self::must(
+            self.request(
+                "POST",
+                "/v1/sessions",
+                Some(&serde_json::to_value(SessionRequest {
+                    to: Some(to.to_string()),
+                })?),
+            ),
+            "session",
+        )?;
+        Ok(resp.login_url)
+    }
+
     pub fn down(&self, name: &str, q: &DownQuery) -> Result<FleetRecord> {
         Self::must(
             self.request(
@@ -282,5 +300,27 @@ mod tests {
         let (url, rx) = crate::testutil::stub_server("200 OK", "[]");
         assert!(Client::new(url, "t".into()).plugins().unwrap().is_empty());
         assert!(rx.recv().unwrap().starts_with("GET /v1/plugins HTTP/1.1"));
+    }
+
+    #[test]
+    fn create_session_posts_the_target_and_returns_the_url() {
+        let (url, rx) = crate::testutil::stub_server(
+            "200 OK",
+            r#"{"login_url":"http://127.0.0.1:1/v1/login/abc?to=/v1/plugins/web/"}"#,
+        );
+        let c = Client::new(url, "t".into());
+        assert_eq!(
+            c.create_session("/v1/plugins/web/").unwrap(),
+            "http://127.0.0.1:1/v1/login/abc?to=/v1/plugins/web/"
+        );
+        let raw = rx.recv().unwrap();
+        assert!(raw.starts_with("POST /v1/sessions HTTP/1.1"), "{raw}");
+        // `send_json` renders the body pretty-printed, so compare it parsed
+        let (_, body) = raw.split_once("\r\n\r\n").unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(body).unwrap(),
+            json!({ "to": "/v1/plugins/web/" }),
+            "{raw}"
+        );
     }
 }

@@ -147,6 +147,26 @@ that breaks this rule instead of re-exposing it. The Rust SDK's
 cannot break the rule; a plugin in another language formats the text
 itself and must apply the prefix.
 
+### 4.1 Routes
+
+A manifest with `routes: true` mounts the plugin's own HTTP surface at
+`/v1/plugins/<name>/…` on the daemon's listener, authenticated by the
+admin bearer or a browser session cookie (plugins spec §18.2). The daemon
+forwards `/v1/plugins/<name>/` to `GET|POST|… http://<listen>/v1/routes`
+and `/v1/plugins/<name>/<rest>?<query>` to `/v1/routes/<rest>?<query>`,
+with the method, the body (1 MiB cap, 413 beyond), and the request
+headers minus `Authorization`, `Cookie`, `Host` and the hop-by-hop set
+(`Connection` and `Upgrade` are kept on an upgrade request). Two headers
+are added: `Authorization: Bearer <HECATON_PLUGIN_TOKEN>` (§2) and
+`X-Hecaton-Forwarded-Prefix: /v1/plugins/<name>`, the mount to build links
+from. The response streams back with its hop-by-hop headers removed; a
+101 is upgraded on both sides and the two byte streams copied until either
+closes, so a WebSocket route works unchanged behind the mount. 404
+`plugin "x" has no routes` without `routes: true`, 503 `plugin "x" is not
+ready` before `hello`. The Rust SDK nests `Plugin::routes` under
+`/v1/routes` behind the same bearer check as every other route
+(`routes.json`, Task 6).
+
 ## 5. Activation lifecycle
 
 An agent's `(agent, plugin)` pair is one of three states, visible in

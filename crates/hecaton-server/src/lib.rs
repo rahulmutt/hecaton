@@ -13,6 +13,7 @@ pub mod lifecycle;
 pub mod metrics;
 pub mod plugin_api;
 pub mod plugins;
+pub mod proxy;
 pub mod sessions;
 pub mod store;
 pub mod testing;

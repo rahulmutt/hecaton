@@ -58,6 +58,8 @@ pub struct Daemon {
     plugins: Arc<PluginHost>,
     registry: Arc<PluginRegistry>,
     client: PluginClient,
+    /// The reverse proxy's own connection pool for the plugin mount.
+    proxy_client: crate::proxy::HttpClient,
     kv: Arc<PluginKv>,
     sessions: Sessions,
     /// One `apply` or `down` at a time *per fleet*: activation and the
@@ -151,6 +153,7 @@ impl Daemon {
             plugins,
             registry,
             client,
+            proxy_client: crate::proxy::client(),
             kv,
             sessions: Sessions::new(),
             applying: std::sync::Mutex::new(BTreeMap::new()),
@@ -214,6 +217,10 @@ impl Daemon {
 
     pub fn client(&self) -> &PluginClient {
         &self.client
+    }
+
+    pub fn proxy_client(&self) -> &crate::proxy::HttpClient {
+        &self.proxy_client
     }
 
     pub fn kv(&self) -> &Arc<PluginKv> {

@@ -11,7 +11,7 @@ use axum::http::header::{CONTENT_TYPE, LOCATION, SET_COOKIE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{any, delete, get, post};
 use axum::{Json, Router};
 use hecaton_api::{
     DownQuery, ErrorBody, FleetRequest, FleetSummary, HelloRequest, HelloResponse, PluginStatus,
@@ -25,7 +25,8 @@ use crate::auth::{RateLimiter, bearer, constant_time_eq};
 use crate::daemon::{Daemon, DaemonError};
 use crate::hooks;
 use crate::plugins::PluginError;
-use crate::sessions::{MOUNT_PREFIX, login_target, set_cookie};
+use crate::proxy;
+use crate::sessions::{COOKIE, MOUNT_PREFIX, cookie_value, login_target, same_origin, set_cookie};
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -134,6 +135,12 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
         .route("/v1/plugin-host/hello", post(plugin_hello))
         .layer(DefaultBodyLimit::max(64 << 10));
     let plugin_host = crate::plugin_api::router().layer(DefaultBodyLimit::max(1 << 20));
+    // The plugin mount authenticates itself (bearer or session cookie),
+    // so it sits outside the admin middleware. `/v1/plugins/{name}` with
+    // no slash stays the purge route.
+    let mount = Router::new()
+        .route("/v1/plugins/{name}/", any(proxy_root))
+        .route("/v1/plugins/{name}/{*rest}", any(proxy_rest));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/metrics", get(metrics))
@@ -142,6 +149,7 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
         .merge(agents)
         .merge(plugins)
         .merge(plugin_host)
+        .merge(mount)
         .with_state(state)
 }
 
@@ -369,6 +377,93 @@ async fn create_session(
     Ok(Json(SessionResponse {
         login_url: format!("{}/v1/login/{code}?to={to}", state.daemon.origin()),
     }))
+}
+
+async fn proxy_root(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    req: Request,
+) -> Response {
+    proxied(&state, &name, "", req).await
+}
+
+async fn proxy_rest(
+    State(state): State<AppState>,
+    Path((name, rest)): Path<(String, String)>,
+    req: Request,
+) -> Response {
+    proxied(&state, &name, &rest, req).await
+}
+
+/// The mount (plugins spec §6, §18.2): authenticate, resolve the plugin,
+/// forward, count.
+async fn proxied(state: &AppState, name: &str, rest: &str, req: Request) -> Response {
+    let resp = proxy_inner(state, name, rest, req)
+        .await
+        .unwrap_or_else(IntoResponse::into_response);
+    // an unparseable name is one label, not one per guess
+    let label = name
+        .parse::<AgentName>()
+        .map_or("unknown".to_string(), |n| n.to_string());
+    state
+        .daemon
+        .metrics()
+        .proxy_request(&label, resp.status().as_u16());
+    resp
+}
+
+async fn proxy_inner(
+    state: &AppState,
+    name: &str,
+    rest: &str,
+    req: Request,
+) -> Result<Response, ApiError> {
+    authenticate_browser_or_admin(state, req.headers())?;
+    let no_routes = || {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("plugin {name:?} has no routes"),
+        )
+    };
+    let plugin: AgentName = name.parse().map_err(|_: NameError| no_routes())?;
+    let registry = state.daemon.registry();
+    if !registry.plugin(&plugin).is_some_and(|p| p.manifest.routes) {
+        return Err(no_routes());
+    }
+    let addr = registry.ready_addr(&plugin).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("plugin {name:?} is not ready"),
+        )
+    })?;
+    Ok(proxy::forward(state.daemon.proxy_client(), &addr, name, rest, req).await)
+}
+
+/// The admin bearer, or a live session cookie on a same-origin request
+/// (§18.2). A bearer that is present but wrong is refused outright; the
+/// cookie is never consulted then.
+fn authenticate_browser_or_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let unauthorized = || ApiError::new(StatusCode::UNAUTHORIZED, "missing or invalid admin token");
+    if let Some(t) = bearer(headers) {
+        return if constant_time_eq(t.as_bytes(), state.daemon.token().as_bytes()) {
+            Ok(())
+        } else {
+            Err(unauthorized())
+        };
+    }
+    match cookie_value(headers, COOKIE) {
+        Some(id) if state.daemon.sessions().is_valid(&id) => {
+            if same_origin(headers, state.daemon.origin()) {
+                Ok(())
+            } else {
+                Err(ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "cross-origin request refused",
+                ))
+            }
+        }
+        _ => Err(unauthorized()),
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]

@@ -10,7 +10,9 @@ use hecaton_server::plugins::config::NO_TLS;
 use hecaton_server::plugins::package::{create, sha256_hex, unpack};
 use hecaton_server::plugins::read_manifest;
 
-use crate::cli::{ApiOnlyArgs, ListArgs, PluginInstallArgs, PluginPackageArgs, PluginRemoveArgs};
+use crate::cli::{
+    ApiOnlyArgs, ListArgs, PluginInstallArgs, PluginOpenArgs, PluginPackageArgs, PluginRemoveArgs,
+};
 use crate::client::{Client, NOT_RUNNING};
 use crate::wiring::layout_from_env;
 
@@ -243,6 +245,21 @@ pub fn package_command(args: &PluginPackageArgs) -> Result<String> {
         .unwrap_or_else(|| PathBuf::from(format!("{}-{}.tar.gz", manifest.name, manifest.version)));
     let digest = create(&args.dir, &out)?;
     Ok(format!("{}\nsha256: {digest}\n", out.display()))
+}
+
+/// `hecaton plugin open <name>` (plugins spec §18.2): prints the login URL;
+/// opening it in a browser sets the session cookie and lands on the
+/// plugin's mount. Nothing is launched.
+pub fn open_command(args: &PluginOpenArgs) -> Result<String> {
+    let client = Client::connect(args.api_url.as_deref())?;
+    let name: hecaton_core::AgentName = args
+        .name
+        .parse()
+        .map_err(|e: hecaton_core::NameError| anyhow!("plugin name: {e}"))?;
+    Ok(format!(
+        "{}\n",
+        client.create_session(&format!("/v1/plugins/{name}/"))?
+    ))
 }
 
 #[cfg(test)]

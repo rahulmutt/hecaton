@@ -30,11 +30,22 @@ toml = "1.1.5"
 tar = "0.4.46"
 flate2 = "1.1.10"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
-axum = "0.8.9"
+axum = { version = "0.8.9", features = ["ws"] }
 ureq = { version = "3.4.1", default-features = false, features = ["json"] }
 # Async loopback HTTP for the daemon → plugin calls and the plugin SDK
 # (plugins spec §16.1). No TLS provider, no HTTP/2, no proxy discovery.
 reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
+# Phase 3 (plugins spec §18.1). hyper, hyper-util, http-body-util and
+# futures-util were already in the lock through axum and reqwest and are
+# direct, exact dependencies now: the proxy is a plain reverse proxy on
+# hyper's legacy client (upgrades passed through as bytes), and the SDK's
+# stream clients need Sink/Stream adaptors. tokio-tungstenite (no TLS
+# feature, P3-1) is the WebSocket client for the SDK and the tests.
+hyper = { version = "1.11.1", features = ["http1", "client"] }
+hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "tokio"] }
+http-body-util = "0.1.5"
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+tokio-tungstenite = "0.30.0"
 prometheus = "0.14.0"
 # The flow plugin's rule matcher (plugins spec §8.1, §17.2): full-match
 # regexes with a 10 KiB size limit. Already in the lock through

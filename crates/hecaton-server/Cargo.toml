@@ -25,6 +25,9 @@ tar = { workspace = true }
 flate2 = { workspace = true }
 ureq = { workspace = true }
 reqwest = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
 tracing = { workspace = true }
 # `testing.rs` is a library module (integration tests and the daemon's own
 # tests share it) and its harness owns temporary directories.
@@ -33,6 +36,8 @@ tempfile = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 hecaton-plugin-sdk = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
 
 [lints]
 workspace = true
