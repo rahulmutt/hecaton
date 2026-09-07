@@ -371,6 +371,10 @@ and `hecaton_plugin_flow_transitions_total{fleet,crew,agent,from,to}`.
 
 ### 8.2 `hecaton-plugin-web`
 
+*Superseded by §18.5 (2026-09-07): no `ttyd`; the plugin serves a vendored
+xterm.js and bridges the daemon's attach stream itself. Kept as written for
+history.*
+
 Observes `SessionStart` and `SessionEnd`; needs `fleets`, `attach`; `routes:
 true`; its `mise.toml` pins `ttyd`. `GET /v1/routes/` is an index page of the
 agents whose per-agent config has `enabled: true`, with their phase from the
@@ -503,7 +507,8 @@ Three mergeable phases, each fully tested before the next:
      2026-09-07, §17.1.)
 3. **Proxy and attach** — the `/v1/plugins/*` mount with WebSocket passthrough,
    `AgentRunner::attach` on tmux, `fleets/watch`, `hecaton-plugin-web`. Ends
-   with the web e2e assertions.
+   with the web e2e assertions. (Refined in §18 on 2026-09-07: browser
+   sessions, the daemon bearer on plugin calls, xterm.js instead of `ttyd`.)
 
 ## 14. Done when
 
@@ -933,3 +938,237 @@ their old config, and flow resets those through the hash check. The
 blast radius is the pairs whose config actually changed in the rejected
 spec, not every changed pair as before; a `validate` route that would
 close it entirely is not worth a protocol addition yet.
+
+## 18. Refinements from the phase 3 brainstorm (2026-09-07)
+
+Decisions phases 1–2b's code forced on §4.1, §6, §8.2 and §11, plus two
+gaps the earlier text left open: a browser cannot present the admin bearer
+§6 requires, and nothing authenticated the daemon to a plugin. Phase 3 is
+the proxy with browser sessions, `AgentRunner::attach` on tmux, the
+`attach` and `fleets/watch` streams, the daemon bearer on every plugin
+call, the SDK's stream clients and `routes`, and `hecaton-plugin-web`.
+
+### 18.1 Transport: generic upgrade passthrough
+
+The proxy is a plain reverse proxy on a `hyper-util` legacy client (already
+in the lock through `axum` and `reqwest`; promoted to a direct exact
+dependency together with `http-body-util`). It forwards any method and
+streams response bodies; when the plugin answers 101 the daemon takes
+`hyper::upgrade::on` on both sides and runs `copy_bidirectional` on a
+spawned task until either end closes. The proxy never parses a WebSocket
+frame, so subprotocols, extensions and any other upgrade pass untouched.
+The daemon terminates WebSockets only where it owns the stream — `attach`
+and `fleets/watch` — through `axum`'s `ws` feature. The SDK's stream
+clients and the e2e use `tokio-tungstenite`, a new exact workspace
+dependency with no TLS feature (P3-1 holds). The frame-copying proxy of
+§11.1 remains the fallback if the legacy client's upgrade handoff fails at
+implementation time.
+
+### 18.2 The proxy and browser sessions
+
+**Proxy.** `ANY /v1/plugins/{name}/{*rest}` sits outside the admin
+router's bearer middleware and authenticates itself: the admin bearer, or a
+session cookie (below). It resolves the plugin in the registry: 404
+`plugin "x" has no routes` when the manifest says `routes: false` or the
+name is unknown, 503 `plugin "x" is not ready` without a `listen`. It
+forwards to `http://<listen>/v1/routes/<rest>?<query>` (an empty `rest` or
+a trailing slash maps to `/v1/routes/`) with the method, the body (1 MiB
+cap, 413 beyond), and the headers minus hop-by-hop ones, `Authorization`
+and `Cookie`; it adds `X-Hecaton-Forwarded-Prefix: /v1/plugins/<name>` and
+`Authorization: Bearer <that plugin's token>` (§18.3).
+`hecaton_plugin_proxy_requests_total{plugin,status}` is registered now,
+labelled with the response status.
+
+**Sessions.** A browser cannot send the admin bearer on a navigation, so
+the daemon gains two routes. `POST /v1/sessions` (admin bearer) answers
+`{ login_url }` carrying a one-time code: 32 random bytes hex, valid for
+60 s, single use. `GET /v1/login/{code}?to=<path>` exchanges the code for
+a session — another 32 random bytes hex, in memory only, expiring after
+12 h — sets `hecaton_session=<id>; HttpOnly; SameSite=Strict;
+Path=/v1/plugins` and answers 303 to `to`, which must be a path under
+`/v1/plugins/` (400 otherwise). A bad, used or expired code is a plain-text
+404. Sessions die with the daemon; nothing is persisted; there is no
+logout route. The admin token never enters the browser.
+
+A cookie-authenticated proxy request must also be same-origin: when
+`Sec-Fetch-Site` is present it must be `same-origin` or `none`; otherwise
+`Origin` must be absent or equal the daemon's own origin — exactly the
+`http://127.0.0.1:<port>` of the printed login URL (`localhost` is a
+different origin to a browser). Anything else is 403. The cookie is accepted on the proxy alone, never on another route.
+
+**CLI.** `hecaton plugin open <name>` calls `POST /v1/sessions` with `to`
+set to `/v1/plugins/<name>/` and prints the login URL. It does not launch
+a browser.
+
+### 18.3 The daemon authenticates to the plugin
+
+Until now nothing authenticated the daemon → plugin direction: any local
+process could call a plugin's `/v1/activate` or `/v1/intercept`, and with
+`routes` it could have opened a terminal on the plugin's port without the
+admin token. Every daemon → plugin request — `activate`, `deactivate`,
+`events`, `intercept`, `health`, `metrics` and the proxied `/v1/routes/*`
+— now carries `Authorization: Bearer <that plugin's HECATON_PLUGIN_TOKEN>`.
+The SDK router checks it with a constant-time compare on every route,
+`/v1/routes/*` included, and answers 401 `{ "error": "bad daemon token" }`
+otherwise; the token comes from the `Env` the plugin already holds. The
+protocol doc states that a plugin must check it and every fixture under
+`docs/plugin-protocol/` gains the header. Still protocol 1: the secret and
+its delivery are unchanged, only its use widens.
+
+### 18.4 `attach` and `fleets/watch`
+
+**The port.** `AgentRunner` gains
+`fn attach(&self, agent: &AgentId) -> Result<Box<dyn PtyStream>, RunnerError>`.
+`PtyStream` is sync like every other port and is split for the async
+bridge:
+
+```rust
+pub trait PtyStream: Send {
+    fn reader(&self) -> io::Result<Box<dyn Read + Send>>;
+    fn writer(&self) -> io::Result<Box<dyn Write + Send>>;
+    fn resize(&self, cols: u16, rows: u16) -> io::Result<()>;
+}
+```
+
+Dropping the stream ends the session. `FakeRunner::attach` returns an
+in-memory echo (bytes written come back on the reader, resizes are
+recorded) and `FakeRunner::close_attach(agent)` ends the reader so tests
+can play "the window died".
+
+**tmux.** A direct `attach-session` on the crew session would share the
+current window with every other client, an operator's terminal included,
+so each attach gets a throwaway grouped session: `new-session -d -t =f/c
+-s hecaton-attach-<8 hex>`, then `set-option destroy-unattached on` and
+`status off` on it, `select-window` to the agent's window, and
+`attach-session -t =<that session>` spawned through `portable-pty` (new
+exact dependency of `hecaton-runtime`; the workspace forbids the `unsafe`
+a hand-rolled `pre_exec` would need) at 80×24 until the first resize.
+`observe` already ignores session names without the `<fleet>/` prefix.
+`stop_crew` changes: it lists sessions as `#{session_name}\t#{session_group}`
+and kills every session in the crew's group, because `kill-session` on the
+crew alone leaves the windows alive in a grouped session. Dropping the
+stream kills the tmux client process and waits for it; if the daemon dies
+the PTY closes, the client detaches and `destroy-unattached` cleans up.
+`window-size latest` (tmux's default since 3.1) makes the newest resize
+win when two viewers watch one agent.
+
+**Daemon route.** `GET /v1/plugin-host/agents/{id}/attach` upgrades
+through `axum`'s `ws`; capability `attach`; 404 unless the plugin is
+active for that agent, as for actions. The handler calls `runner.attach`
+in `spawn_blocking`, then runs one blocking reader task feeding binary
+frames and one writer task taking binary frames to the writer and text
+frames `{ "resize": { "cols", "rows" } }` to `resize`. Any other text
+frame closes with 1003; EOF on the reader closes with 1000; an error with
+1011. Attach failures before the upgrade are 500 with the runner's error.
+
+**`fleets/watch`.** `GET /v1/plugin-host/fleets/watch`, capability
+`fleets`. Every frame is the complete `GET fleets` body — the user fleets
+with their activation overlay — so a consumer replaces its state and never
+diffs or handles removals. The first frame is sent on connect. The daemon
+gains one `watch::Sender<u64>` tick: a forwarder task per fleet actor
+bumps it on each published snapshot, and every daemon method that writes a
+registry row bumps it too. The handler waits on the tick, recomputes, and
+sends only if the list differs from what it last sent. The daemon pings
+every 30 s so dead clients are reaped.
+
+**SDK.** `Host::attach(agent) -> Attach` with `read().await ->
+Option<Vec<u8>>`, `write(bytes)`, `resize(cols, rows)` and `close()`.
+`Host::watch_fleets() -> FleetWatch` with `next().await ->
+Option<Vec<FleetRecord>>`, reconnecting with a 1–10 s backoff and yielding
+the full list after each reconnect. `Plugin` gains
+`fn routes(&self) -> Option<axum::Router>`, default `None`, which `router`
+nests under `/v1/routes` behind the bearer check. `FakeHost` serves both
+streams: attach as an echo, watch from a `set_fleets` the test calls.
+
+### 18.5 `hecaton-plugin-web`, without `ttyd`
+
+§8.2 is superseded. The plugin serves one page with a vendored xterm.js and
+bridges the daemon's attach stream itself: one WebSocket hop per browser
+tab, no subprocess per viewer, no `SIGWINCH` bridge, no idle timer, an
+empty `[tools]` like flow, and the unverified "`ttyd` behind two proxies"
+row of §11.1 is closed as *not used*.
+
+**Crate and package.** `crates/hecaton-plugin-web`, a library plus thin
+binary like flow: `config.rs` (the per-agent block), `state.rs` (the
+watch-fed cache), `routes.rs` (the router and the bridge), `plugin.rs`
+(the `Plugin` impl). `package/mise.toml` has an empty `[tools]` and a
+`serve` task; the manifest is name `web`, protocol 1, no hook
+subscriptions, `needs: [fleets, attach]`, `routes: true`.
+`scripts/package-plugins.sh` loops over `flow web`.
+
+**Per-agent config.** `{ enabled: bool }`, default `true`,
+`deny_unknown_fields`, validated at `activate` in flow's path style. An
+agent is listed when it is active for web and enabled; `deactivate` drops
+it. The cache holds the enabled set and the latest `Vec<FleetRecord>`
+from `watch_fleets`, started after `hello`. The plugin never calls `GET
+fleets`, so an index that is right at all proves the watch path (§17.1).
+
+**Routes** under `/v1/routes/`, every link built from
+`X-Hecaton-Forwarded-Prefix`:
+
+- `GET /` — the index: one row per enabled agent with phase and message,
+  refreshed every 2 s from `agents.json`. Names are validated identifiers;
+  everything else is HTML-escaped.
+- `GET /agents.json` — `[{ id, phase, message }]` from the cache.
+- `GET /agents/{fleet}/{crew}/{agent}` — the terminal page: xterm.js with
+  the fit addon, opens the bridge, sends `{ resize }` on fit and on window
+  resize, prints a "disconnected" line when the socket closes. 404 for an
+  agent that is not enabled.
+- `GET /agents/{fleet}/{crew}/{agent}/ws` — the bridge: `Host::attach`,
+  frames copied both ways (binary as bytes, text resizes as resizes); one
+  daemon attach per tab, closed when either side closes.
+- `GET /assets/xterm.js`, `xterm.css`, `addon-fit.js` — `include_bytes!`,
+  with cache headers.
+
+**Vendored assets.** `@xterm/xterm` 6.0.0 and `@xterm/addon-fit` 0.11.0,
+the minified builds only, under `crates/hecaton-plugin-web/assets/`, with
+`VENDOR.md` recording the npm tarball URL and sha256 of each file and
+`scripts/vendor-xterm.sh` re-fetching and verifying them. About 400 KB in
+the repo; `cargo audit` and `deny.toml` do not cover it, so the recorded
+digest is the supply-chain control.
+
+**Metrics** through the SDK: `hecaton_plugin_web_terminals_open` (gauge)
+and `hecaton_plugin_web_terminals_total` (counter).
+
+### 18.6 Security, docs, testing, scope
+
+**Threat model.** A new boundary, *browser ↔ daemon*: cookie session over
+loopback, `HttpOnly` + `SameSite=Strict`, same-origin check on every
+cookie request, single-use 60 s login code so the admin token never enters
+the browser, sessions in memory only. The *plugin ↔ daemon* row gains "the
+daemon authenticates with the plugin's own token on every call". New
+accepted risks: a plugin with `attach` has a keyboard into every agent it
+is active for, and anyone holding a browser session can type into every
+agent web lists. New mitigation rows: proxy header filtering, the grouped
+tmux session.
+
+**Docs.** `docs/plugin-protocol.md`: the daemon bearer, the `attach` and
+`fleets/watch` frame formats, `routes` and the forwarded prefix, fixtures
+`attach-resize.json`, `fleets-watch.json`, `routes.json`.
+`ARCHITECTURE.md`: a phase 3 paragraph and four non-obvious decisions
+(passthrough proxy, grouped attach sessions, full-list watch frames, the
+daemon bearer on plugin calls). `AGENTS.md`: gotchas as found, `stop_crew`
+and session groups first. `README.md`: "Spec B complete", with an upgrade
+note that plugins in other languages must now check the bearer.
+`examples/payments.yaml` enables web in `defaults`. `THREAT-MODEL.md` as
+above.
+
+**Testing**, by layer:
+
+| Layer | What |
+|---|---|
+| unit | proxy header filtering and URL building; session code expiry and single use; the same-origin table; bridge framing; tick coalescing; tmux session-group parsing; web config errors; index escaping |
+| property | a header set the proxy forwards never contains a hop-by-hop, `Authorization` or `Cookie` header; a watch consumer that replaces state on every frame ends equal to `GET fleets` for any sequence of changes |
+| server integration (fakes) | cookie login round trip and 403 cross-origin; 401 without the bearer on the SDK router; a plain route and a WebSocket echo proxied to a fake plugin with `routes`; attach echo and resize through the route; watch frames on apply, activation change and purge; 404 attach for an inactive agent |
+| runtime (`test-it`) | a real tmux attach through the PTY sees output; typed bytes reach the pane; the grouped session disappears on drop; `stop_crew` leaves no session in the group |
+| plugin (`Harness`) | index from watch frames; bridge echo; `enabled: false` hidden |
+| e2e `web_journey` | `plugins.yaml` with the flow and web directory sources; `up` with web enabled; `plugin open web`, then a `ureq` GET of the login URL that yields the cookie; the index lists alice; a `tokio-tungstenite` client through the proxy receives bytes containing `fake-claude` from the pane, sends `hello\n`, and `fake-claude.stdin` shows it; `down`, and `agents.json` drops alice with no `GET fleets` ever hitting the daemon |
+| by hand | `verify-claude` prints the login URL for a terminal check in a browser — the §14 "live Claude terminal" verdict |
+
+**§11.1 verdicts** are recorded at implementation for the `hyper-util`
+upgrade handoff and the `portable-pty` attach; the `ttyd` row is closed
+as "not used, xterm.js chosen".
+
+**Out of scope, stated.** No `hecaton attach` CLI, no persistent sessions,
+no logout route, no browser launch, no TLS, no live-push index. A plugin's
+`/v1/routes/*` is the only browser surface.
