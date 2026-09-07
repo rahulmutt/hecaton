@@ -5,6 +5,8 @@
 
 pub mod config;
 pub mod machine;
+pub mod plugin;
 
 pub use config::{Compiled, ConfigError, FlowConfig, compile};
 pub use machine::{Step, step};
+pub use plugin::FlowPlugin;
