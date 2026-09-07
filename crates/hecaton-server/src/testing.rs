@@ -83,3 +83,12 @@ impl Harness {
         }
     }
 }
+
+/// A `PluginHostConfig` under a test directory: no `plugins.yaml` yet, so
+/// the first sync is a no-op.
+pub fn plugin_config_in(dir: &std::path::Path) -> crate::plugins::PluginHostConfig {
+    crate::plugins::PluginHostConfig {
+        plugins_file: dir.join("plugins.yaml"),
+        install_root: dir.join("plugins"),
+    }
+}

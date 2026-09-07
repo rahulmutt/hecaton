@@ -13,8 +13,9 @@ use anyhow::{Context, Result, bail};
 use hecaton_core::{FleetStore, PassThrough, ReconcilePolicy};
 use hecaton_runtime::{Runtime, StateLayout, TmuxRunner};
 use hecaton_server::{
-    Daemon, FileFleetStore, Metrics, Ports, ServerPaths, Vault, load_or_create_token,
-    read_endpoint, remove_if_exists, router, serve, write_endpoint, write_pid,
+    Daemon, FileFleetStore, Metrics, PluginHostConfig, Ports, ServerPaths, Vault,
+    load_or_create_token, read_endpoint, remove_if_exists, router, serve, write_endpoint,
+    write_pid,
 };
 use serde::Deserialize;
 
@@ -173,6 +174,10 @@ fn run(
             Metrics::new()?,
             token,
             existing,
+            PluginHostConfig {
+                plugins_file: layout.config_root.join("plugins.yaml"),
+                install_root: layout.plugins_data_dir(),
+            },
         );
         write_endpoint(&paths.endpoint(), &url)?;
         write_pid(&paths.pid(), std::process::id())?;

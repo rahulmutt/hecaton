@@ -23,6 +23,8 @@ struct Stub {
     daemon: Arc<Daemon>,
     _stop: tokio::sync::oneshot::Sender<()>,
     _rt: tokio::runtime::Runtime,
+    /// The plugin host's (empty) config and install roots; dropped with the stub.
+    _plugin_dir: tempfile::TempDir,
 }
 
 fn stub() -> Stub {
@@ -37,6 +39,7 @@ fn stub() -> Stub {
         hook_url: "http://127.0.0.1:1".into(),
         resync: Duration::from_secs(3600),
     };
+    let plugin_dir = tempfile::tempdir().unwrap();
     let (daemon, url, stop) = rt.block_on(async {
         let daemon = Daemon::start(
             ports,
@@ -44,6 +47,7 @@ fn stub() -> Stub {
             Metrics::new().unwrap(),
             "tok".into(),
             Vec::new(),
+            hecaton_server::testing::plugin_config_in(plugin_dir.path()),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -64,6 +68,7 @@ fn stub() -> Stub {
         daemon,
         _stop: stop,
         _rt: rt,
+        _plugin_dir: plugin_dir,
     }
 }
 

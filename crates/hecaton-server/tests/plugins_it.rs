@@ -1,0 +1,336 @@
+//! The plugin host over the fakes through a real listener (plugins spec
+//! §11 "server integration", phase 1 slice): sync, hello, list, the
+//! reserved fleet, removal and purge.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use hecaton_api::{AgentPhase, AgentSettings, CrewSpec, FleetRequest, FleetSpec, GitSettings};
+use hecaton_core::{AgentId, PassThrough, plugin_id};
+use hecaton_server::testing::{Harness, plugin_config_in};
+use hecaton_server::{Daemon, Metrics, router, serve};
+use serde_json::{Value, json};
+
+const MANIFEST: &str = "apiVersion: hecaton/v1\nkind: Plugin\nname: hello\nversion: 0.1.0\nprotocol: 1\nstart: serve\nroutes: true\n";
+const MISE: &str = "[tools]\n[tasks.serve]\nrun = \"true\"\n";
+
+fn write_package(dir: &Path, manifest: &str) {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(dir.join("hecaton-plugin.yaml"), manifest).unwrap();
+    fs::write(dir.join("mise.toml"), MISE).unwrap();
+}
+
+struct Api {
+    base: String,
+    agent: ureq::Agent,
+}
+
+impl Api {
+    fn call(
+        &self,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: Option<&Value>,
+    ) -> (u16, Value) {
+        let url = format!("{}{path}", self.base);
+        let mut req = match method {
+            "GET" => self.agent.get(&url).force_send_body(),
+            "POST" => self.agent.post(&url),
+            "DELETE" => self.agent.delete(&url).force_send_body(),
+            _ => unreachable!(),
+        };
+        if let Some(t) = token {
+            req = req.header("Authorization", &format!("Bearer {t}"));
+        }
+        let mut resp = match body {
+            Some(b) => req.send_json(b).unwrap(),
+            None => req.send_empty().unwrap(),
+        };
+        let status = resp.status().as_u16();
+        let text = resp.body_mut().read_to_string().unwrap();
+        let v = serde_json::from_str(&text).unwrap_or(Value::String(text));
+        (status, v)
+    }
+}
+
+fn wait(mut f: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !f() {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "condition not reached"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plugins_sync_hello_list_and_purge() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugins_yaml = dir.path().join("plugins.yaml");
+    let package = dir.path().join("hello-pkg");
+    write_package(&package, MANIFEST);
+    fs::write(
+        &plugins_yaml,
+        "plugins:\n  - name: hello\n    source: ./hello-pkg\n    config: { greeting: hi }\n",
+    )
+    .unwrap();
+
+    let h = Harness::new(Duration::from_secs(3600));
+    let ports = hecaton_server::Ports {
+        materializer: h.materializer.clone(),
+        runner: h.runner.clone(),
+        clock: h.clock.clone(),
+        store: h.store.clone(),
+        policy: Default::default(),
+        hook_url: "http://127.0.0.1:1".into(),
+        resync: Duration::from_secs(3600),
+    };
+    let daemon = Daemon::start(
+        ports,
+        Arc::new(PassThrough),
+        Metrics::new().unwrap(),
+        "admin-tok".into(),
+        Vec::new(),
+        plugin_config_in(dir.path()),
+    );
+    let report = daemon.sync_plugins().await.unwrap();
+    assert_eq!(report.installed, vec!["hello"]);
+    assert!(report.stopped.is_empty() && report.unchanged.is_empty());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(serve(listener, router(daemon.clone()), async {
+        let _ = stop_rx.await;
+    }));
+    let api = Api {
+        base,
+        agent: ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into(),
+    };
+    let admin = Some("admin-tok");
+    let id: AgentId = plugin_id(&"hello".parse().unwrap());
+
+    // the actor's pass materialized and started the synthetic agent
+    {
+        let m = h.materializer.clone();
+        let r = h.runner.clone();
+        tokio::task::spawn_blocking(move || {
+            wait(|| {
+                m.calls()
+                    .contains(&"materialize_plugin hecaton/plugins/hello".to_string())
+                    && r.calls()
+                        .contains(&"ensure_agent hecaton/plugins/hello".to_string())
+            })
+        })
+        .await
+        .unwrap();
+    }
+    let (s, rows) = api.call("GET", "/v1/plugins", admin, None);
+    assert_eq!(s, 200);
+    assert_eq!(rows[0]["name"], "hello");
+    assert_eq!(rows[0]["version"], "0.1.0");
+    assert_eq!(rows[0]["routes"], true);
+    assert!(rows[0]["listen"].is_null());
+    assert_eq!(rows[0]["phase"], "starting");
+    let (s, _) = api.call("GET", "/v1/plugins", None, None);
+    assert_eq!(s, 401, "admin token required");
+
+    // hello: token, protocol, listen, then Ready with the config
+    let token = daemon.hook_secret(&id).await.unwrap();
+    let hello = |name: &str, protocol: u32, listen: &str| json!({ "name": name, "version": "0.1.0", "protocol": protocol, "listen": listen });
+    let (s, _) = api.call(
+        "POST",
+        "/v1/plugin-host/hello",
+        Some("wrong"),
+        Some(&hello("hello", 1, "127.0.0.1:4000")),
+    );
+    assert_eq!(s, 401);
+    let (s, _) = api.call(
+        "POST",
+        "/v1/plugin-host/hello",
+        None,
+        Some(&hello("hello", 1, "127.0.0.1:4000")),
+    );
+    assert_eq!(s, 401);
+    let (s, body) = api.call(
+        "POST",
+        "/v1/plugin-host/hello",
+        Some(&token),
+        Some(&hello("hello", 2, "127.0.0.1:4000")),
+    );
+    assert_eq!(s, 400);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("hello.protocol"),
+        "{body}"
+    );
+    let (s, body) = api.call(
+        "POST",
+        "/v1/plugin-host/hello",
+        Some(&token),
+        Some(&hello("hello", 1, "0.0.0.0:4000")),
+    );
+    assert_eq!(
+        (s, body["error"].as_str().unwrap()),
+        (400, "hello.listen: must be a loopback address")
+    );
+    let (s, _body) = api.call(
+        "POST",
+        "/v1/plugin-host/hello",
+        Some(&token),
+        Some(&hello("other", 1, "127.0.0.1:4000")),
+    );
+    assert_eq!(
+        s, 401,
+        "the body's name must be the token's plugin; unknown plugin answers like a bad token"
+    );
+    let (s, body) = api.call(
+        "POST",
+        "/v1/plugin-host/hello",
+        Some(&token),
+        Some(&hello("hello", 1, "127.0.0.1:4000")),
+    );
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(body["config"]["greeting"], "hi");
+    {
+        let d = daemon.clone();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let rows = d.plugins().list().await;
+                if rows[0].phase == AgentPhase::Ready {
+                    assert_eq!(rows[0].listen.as_deref(), Some("127.0.0.1:4000"));
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    // the reserved fleet: readable, not writable, not listed
+    let (s, rec) = api.call("GET", "/v1/fleets/hecaton", admin, None);
+    assert_eq!(s, 200);
+    assert_eq!(
+        rec["status"]["agents"]["hecaton/plugins/hello"]["phase"],
+        "ready"
+    );
+    let (s, rows) = api.call("GET", "/v1/fleets", admin, None);
+    assert_eq!(
+        (s, rows.as_array().unwrap().len()),
+        (200, 0),
+        "plugins are not a fleet row"
+    );
+    let spec = FleetSpec {
+        name: "hecaton".into(),
+        crews: BTreeMap::from([(
+            "c".to_string(),
+            CrewSpec {
+                repo: "acme/x".into(),
+                git_ref: "main".into(),
+                git: GitSettings::default(),
+                agents: BTreeMap::from([("a".to_string(), AgentSettings::default())]),
+            },
+        )]),
+    };
+    let req = serde_json::to_value(FleetRequest {
+        spec,
+        credentials: Default::default(),
+    })
+    .unwrap();
+    let (s, body) = api.call("POST", "/v1/fleets", admin, Some(&req));
+    assert_eq!(s, 400);
+    assert_eq!(
+        body["error"],
+        "name: \"hecaton\" is reserved for the daemon's plugins"
+    );
+    let (s, _) = api.call(
+        "DELETE",
+        "/v1/fleets/hecaton?keep_repos=false&keep_sessions=false&purge=false",
+        admin,
+        None,
+    );
+    assert_eq!(s, 400);
+
+    // metrics carry the plugin fleet's gauges
+    let (_, metrics) = api.call("GET", "/metrics", None, None);
+    assert!(
+        metrics
+            .as_str()
+            .unwrap()
+            .contains("hecaton_agents{crew=\"plugins\",fleet=\"hecaton\",phase=\"ready\"} 1"),
+        "{metrics}"
+    );
+
+    // a broken manifest fails the sync and changes nothing
+    let bad = dir.path().join("bad-pkg");
+    write_package(
+        &bad,
+        &MANIFEST
+            .replace("name: hello", "name: bad")
+            .replace("protocol: 1", "protocol: 7"),
+    );
+    fs::write(
+        &plugins_yaml,
+        "plugins:\n  - name: hello\n    source: ./hello-pkg\n    config: { greeting: hi }\n  - name: bad\n    source: ./bad-pkg\n",
+    )
+    .unwrap();
+    let (s, body) = api.call("POST", "/v1/plugins/sync", admin, None);
+    assert_eq!(s, 400);
+    assert_eq!(
+        body["error"],
+        "plugins.yaml: plugins[1]: hecaton-plugin.yaml: protocol: this daemon speaks protocol 1, got 7"
+    );
+    assert_eq!(daemon.plugins().list().await.len(), 1, "previous set kept");
+
+    // purge refuses while declared; removal stops; purge then deletes
+    let (s, body) = api.call("DELETE", "/v1/plugins/hello", admin, None);
+    assert_eq!(s, 400);
+    assert_eq!(
+        body["error"],
+        "plugin \"hello\" is still declared in plugins.yaml; remove it first"
+    );
+    fs::write(&plugins_yaml, "plugins: []\n").unwrap();
+    let (s, report) = api.call("POST", "/v1/plugins/sync", admin, None);
+    assert_eq!(s, 200);
+    assert_eq!(report["stopped"], json!(["hello"]));
+    {
+        let r = h.runner.clone();
+        tokio::task::spawn_blocking(move || {
+            wait(|| {
+                r.calls()
+                    .contains(&"stop_agent hecaton/plugins/hello".to_string())
+            })
+        })
+        .await
+        .unwrap();
+    }
+    assert!(daemon.plugins().list().await.is_empty());
+    assert!(
+        daemon.hook_secret(&id).await.is_none(),
+        "a removed plugin's token is revoked"
+    );
+    let (s, _) = api.call("DELETE", "/v1/plugins/hello", admin, None);
+    assert_eq!(s, 200);
+    assert!(
+        h.materializer
+            .calls()
+            .contains(&"purge_plugin hello".to_string())
+    );
+    let (s, _) = api.call("DELETE", "/v1/plugins/Nope", admin, None);
+    assert_eq!(s, 400);
+
+    let _ = stop_tx.send(());
+    server.await.unwrap().unwrap();
+}

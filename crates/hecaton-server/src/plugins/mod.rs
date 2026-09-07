@@ -2,7 +2,7 @@
 //! package install, and the host that drives them as the `hecaton` fleet.
 
 pub mod config;
-// pub mod host; // restored in the next task
+pub mod host;
 pub mod manifest;
 pub mod materializer;
 pub mod package;
@@ -10,7 +10,7 @@ pub mod package;
 use std::path::PathBuf;
 
 pub use config::{Source, load_plugins_file, resolve_source};
-// pub use host::{PluginHost, PluginHostConfig}; // restored in the next task
+pub use host::{PluginHost, PluginHostConfig};
 pub use manifest::read_manifest;
 pub use materializer::{NullStore, PluginMaterializer};
 
