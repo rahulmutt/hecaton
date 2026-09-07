@@ -294,10 +294,10 @@ impl Daemon {
         }
     }
 
-    /// Puts back the pairs a rejected apply had deactivated on the way in:
-    /// their rows still say `Active`, so the plugin must be told to hold
-    /// them again, with the config the row carries. A refusal now is the
-    /// row's new state — the pair really is not active any more.
+    /// Puts back the pairs a rejected apply had already replaced with a new
+    /// config: their rows still say `Active` with the old config, so the
+    /// plugin is told to hold that again. A refusal now is the row's new
+    /// state — the pair really is not active any more.
     async fn restore_pairs(&self, pairs: &[Pair]) {
         for p in pairs {
             let Some(listen) = self.registry.ready_listen(&p.plugin) else {
@@ -414,29 +414,13 @@ impl Daemon {
             }
         }
         d.deactivate.sort();
-        // deactivate changed pairs first (§16.2), then activate every new or
-        // changed pair on a ready plugin; the first rejection rolls back the
-        // ones already accepted and nothing reaches the actor
-        let mut restore: Vec<Pair> = Vec::new();
-        for (agent, plugin) in &d.deactivate {
-            if d.activate
-                .iter()
-                .any(|p| &p.agent == agent && &p.plugin == plugin)
-            {
-                if let Some(row) = self
-                    .registry
-                    .row(agent, plugin)
-                    .filter(|r| r.activation.state == ActivationState::Active)
-                {
-                    restore.push(Pair {
-                        agent: agent.clone(),
-                        plugin: plugin.clone(),
-                        config: row.config,
-                    });
-                }
-                self.deactivate_pair(agent, plugin).await;
-            }
-        }
+        // every new or changed pair on a ready plugin is offered its config
+        // by `activate` alone: a changed pair is replaced in place, never
+        // deactivated first (§16.2, §17.9), so a rejection leaves the
+        // plugin's state for it untouched. The first rejection rolls back
+        // the pairs already accepted — one that was active before gets its
+        // old config re-activated, a new one is deactivated — and nothing
+        // reaches the actor.
         let mut accepted: Vec<Pair> = Vec::new();
         let mut rows: Vec<(Pair, PluginActivation)> = Vec::new();
         for p in &d.activate {
@@ -452,8 +436,17 @@ impl Daemon {
                             rows.push((p.clone(), PluginActivation::active()));
                         }
                         Err(e) => {
+                            let previous = |a: &Pair| {
+                                old.iter()
+                                    .find(|o| o.agent == a.agent && o.plugin == a.plugin)
+                                    .cloned()
+                            };
+                            let mut restore = Vec::new();
                             for a in &accepted {
-                                self.deactivate_pair(&a.agent, &a.plugin).await;
+                                match previous(a) {
+                                    Some(was) => restore.push(was),
+                                    None => self.deactivate_pair(&a.agent, &a.plugin).await,
+                                }
                             }
                             self.restore_pairs(&restore).await;
                             return Err(DaemonError::Invalid(format!(
@@ -506,14 +499,10 @@ impl Daemon {
         let record = rx
             .await
             .map_err(|_| DaemonError::Internal("fleet task dropped the request".into()))?;
+        // only the pairs the new spec dropped: a changed pair kept its row
+        // and was replaced in place above
         for (agent, plugin) in &d.deactivate {
-            if !d
-                .activate
-                .iter()
-                .any(|p| &p.agent == agent && &p.plugin == plugin)
-            {
-                self.deactivate_pair(agent, plugin).await;
-            }
+            self.deactivate_pair(agent, plugin).await;
             self.registry.remove_row(agent, plugin);
         }
         for (p, activation) in rows {
@@ -1048,11 +1037,13 @@ mod tests {
             .collect();
         assert_eq!(
             after,
-            vec!["deactivate f/c/a", "activate f/c/a", "deactivate f/c/c"]
+            vec!["activate f/c/a", "deactivate f/c/c"],
+            "a changed pair gets its new activate in place; only the dropped pair is deactivated"
         );
 
-        // a rejection after a *changed* pair was already deactivated puts
-        // that pair back with the config its row still carries
+        // a rejection after a *changed* pair was already accepted puts that
+        // pair back by re-activating the config its row still carries; no
+        // deactivate is ever sent for a pair the new spec keeps
         let before = stub.calls().len();
         let e = w
             .daemon
@@ -1084,13 +1075,11 @@ mod tests {
         assert_eq!(
             after,
             vec![
-                "deactivate f/c/a null",
                 "activate f/c/a {\"v\":3}",
                 "activate f/c/bad {}",
-                "deactivate f/c/a null",
                 "activate f/c/a {\"v\":2}",
             ],
-            "the changed pair is restored with its old config"
+            "the accepted changed pair is restored by re-activating its old config"
         );
         let row = w
             .daemon

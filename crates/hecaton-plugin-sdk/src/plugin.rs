@@ -21,6 +21,11 @@ use crate::{Host, Metrics, SdkError};
 pub trait Plugin: Send + Sync + 'static {
     /// `activate`: `Err(message)` rejects the agent's config; the daemon
     /// reports it as `crews.<c>.agents.<a>.plugins.<name>: <message>`.
+    /// An `activate` for an agent the plugin already holds replaces that
+    /// agent's config in place — a changed `update` and every re-send
+    /// after `hello` arrive this way, with no `deactivate` before them —
+    /// so a plugin keeping per-agent resources releases the old ones
+    /// itself, and a rejection must leave what it held untouched.
     fn activate(
         &self,
         agent: &str,

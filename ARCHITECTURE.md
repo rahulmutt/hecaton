@@ -197,11 +197,9 @@ source the e2e loads.
 - **Flow's state survives restarts and resets on `deactivate`.** Plugin and
   daemon restarts re-`activate` without a `deactivate`, so the KV state is
   resumed; `down`, a config change and dropping the block go through
-  `deactivate`, which deletes it (§17.3). A rejected `update` also resets
-  it: the daemon deactivates the changed pair before offering the new
-  config to the plugin (§16.2 order × §17.3 delete-on-deactivate), so
-  restoring the old config after a rejection finds no stored state and
-  starts over at `initial`.
+  `deactivate`, which deletes it (§17.3). A changed config arrives as an
+  `activate` in place, with no `deactivate` before it, and resets through
+  the hash check; a rejected `update` therefore changes nothing (§17.9).
 - **Plugin metrics are registered through the SDK.** `Metrics` prefixes
   every family, so an SDK plugin cannot trip the daemon's prefix rule
   (§17.4).

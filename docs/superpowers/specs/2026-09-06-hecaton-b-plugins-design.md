@@ -563,9 +563,11 @@ registry before `Msg::Apply` is sent:
   quoting the plugin's `error`, and the whole apply is rejected before any
   pair is marked active. A plugin that is not `Ready` records the pair as
   **pending** and the apply proceeds.
-- After the actor replies, `deactivate` goes to pairs the new spec dropped
-  and to changed pairs (followed by their new `activate`). `down`
-  deactivates every pair of the fleet and removes the rows.
+- After the actor replies, `deactivate` goes to the pairs the new spec
+  dropped. A changed pair is never deactivated: its new config arrives by
+  `activate` alone, before the actor, and the plugin replaces the one it
+  holds (§17.9). `down` deactivates every pair of the fleet and removes
+  the rows.
 - Each `hello` clears the plugin's observer queue and re-sends `activate` for
   every pair, pending or active; a rejection then marks the pair
   **rejected** with the message. Nothing is persisted for this: the
@@ -764,8 +766,12 @@ operator's `up` loudly on a daemon-side fault, which is where loud is right.
 
 - a plugin restart or a daemon restart **resumes** the state (neither sends
   `deactivate`, only a fresh `activate` after `hello`, §16.2);
-- `update` with a changed flow config, `down`, or dropping the plugin from
-  the agent **resets** to `initial` (all go through `deactivate`).
+- `update` with a changed flow config **resets** to `initial` through the
+  hash check: the new config arrives by `activate` in place (§17.9) and
+  its hash does not match the stored one. `down` and dropping the plugin
+  from the agent **reset** through `deactivate`, which deletes the key. A
+  *rejected* `update` changes nothing: the plugin never hears about it
+  beyond the `activate` it refused.
 - Two events for one agent transitioning concurrently could race their KV
   writes. Claude fires a session's hooks sequentially; noted, not guarded.
 
@@ -902,3 +908,28 @@ Where the phase 2b implementation plan refined this section:
   read grant).
 - **`test` and `e2e` depend on `package-plugins`**, so `mise run check`
   and CI assemble `target/plugins/flow/` before nextest.
+
+### 17.9 A rejected `update` leaves plugin state alone (2026-09-07)
+
+Phase 2b's e2e showed a gap between §16.2 and §17.3: the daemon sent
+`deactivate` to every changed pair before offering the new config, flow's
+`deactivate` deletes `state/<agent>`, and when the new config was rejected
+the restored old config found no state and started at `initial`. An
+operator's typo in a flow rule reset every agent whose block it touched.
+
+The order is now: a changed pair gets its new config by `activate` alone,
+and **an `activate` for an agent the plugin already holds replaces that
+agent's config in place**. `deactivate` is sent only for `down` and for
+pairs the new spec drops. A rejection therefore touches nothing the
+plugin holds; on acceptance, flow resets through the hash check as
+before. Every `hello` re-send already arrived as an in-place `activate`,
+so plugins on the SDK were written for this; the protocol doc and the
+`Plugin::activate` contract now say it, and a plugin keeping per-agent
+resources releases the old ones itself.
+
+One edge remains: when an `update` changes several pairs and a later one
+is rejected, the pairs already accepted are put back by re-activating
+their old config, and flow resets those through the hash check. The
+blast radius is the pairs whose config actually changed in the rejected
+spec, not every changed pair as before; a `validate` route that would
+close it entirely is not worth a protocol addition yet.

@@ -101,10 +101,14 @@ timeout unless stated otherwise.
 **`activate`**: `config` is the agent's resolved settings for this plugin.
 A non-2xx rejects the agent's activation; the operator sees it as
 `crews.<c>.agents.<a>.plugins.<name>: <message>`, `<message>` being the
-body's `error` (`activate-rejected.json`).
+body's `error` (`activate-rejected.json`). An `activate` for an agent the
+plugin already holds replaces that agent's config in place — a changed
+`update` and every re-send after `hello` arrive this way, with no
+`deactivate` before them — so a rejected config leaves whatever the plugin
+held for the agent untouched.
 
-**`deactivate`**: sent on `down`, when the agent's spec drops the plugin,
-and on a config change (immediately followed by a new `activate`).
+**`deactivate`**: sent on `down` and when the agent's spec drops the
+plugin; never for a config change.
 
 **`events`**: an observer batch, at most 64 events, oldest first; a 2xx
 acknowledges, anything else is logged and counted, and there is no
@@ -152,9 +156,10 @@ activations back without the daemon persisting anything about them. The
 answer to each is the pair's new state: a pair rejected before can become
 active, and one active before can be rejected. An `up` or `update` also
 re-offers every pair whose row is not `active`, even when its config did
-not change. A pair is deactivated when its fleet goes `down`, when an `up`
-or `update` drops the plugin from the agent's spec, or on a config change
-for that pair (immediately followed by the new `activate`). A `rejected`
+not change. A pair is deactivated when its fleet goes `down` or when an
+`up` or `update` drops the plugin from the agent's spec; a changed config
+arrives as a new `activate` in place, and a rejected one changes nothing
+for that pair. A `rejected`
 pair does not stop the agent — the fleet keeps running, and a plugin that
 never activates simply never runs for that agent.
 

@@ -218,10 +218,10 @@ async fn deactivate_and_a_changed_config_reset_to_initial() {
     );
     h.intercept(stop()).await; // → review
 
-    // a changed config (the daemon sends deactivate then activate): initial again
+    // a changed config arrives as an `activate` in place, no `deactivate`
+    // before it (§16.2): the hash no longer matches, so initial again
     let mut changed = config();
     changed["states"]["review"]["on"][0]["action"] = json!("restart");
-    h.deactivate(ALICE).await;
     h.activate(ALICE, changed.clone()).await.unwrap();
     let stored = fake.kv_json(&FlowPlugin::state_key(ALICE)).unwrap();
     assert_eq!(stored["state"], "working");

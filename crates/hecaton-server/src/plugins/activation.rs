@@ -18,7 +18,7 @@ pub struct Pair {
 pub struct ActivationDiff {
     /// New pairs, and pairs whose config changed.
     pub activate: Vec<Pair>,
-    /// Dropped pairs, and pairs whose config changed (before their activate).
+    /// Dropped pairs only: a changed pair is replaced by its `activate`.
     pub deactivate: Vec<(AgentId, AgentName)>,
 }
 
@@ -79,11 +79,9 @@ pub fn diff(old: &[Pair], new: &[Pair]) -> ActivationDiff {
     for p in new {
         match find(old, p) {
             Some(prev) if prev.config == p.config => {}
-            Some(_) => {
-                d.deactivate.push((p.agent.clone(), p.plugin.clone()));
-                d.activate.push(p.clone());
-            }
-            None => d.activate.push(p.clone()),
+            // changed: the new config goes by `activate` alone and the
+            // plugin replaces the one it holds (§16.2, §17.9)
+            Some(_) | None => d.activate.push(p.clone()),
         }
     }
     for p in old {
@@ -166,7 +164,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_activates_new_and_changed_and_deactivates_dropped_and_changed() {
+    fn diff_activates_new_and_changed_and_deactivates_dropped_only() {
         let fleet: FleetName = "f".parse().unwrap();
         let old = pairs(
             &fleet,
@@ -194,7 +192,8 @@ mod tests {
                 .iter()
                 .map(|(a, p)| format!("{a} {p}"))
                 .collect::<Vec<_>>(),
-            vec!["f/c/a flow", "f/c/b web"]
+            vec!["f/c/b web"],
+            "a changed pair is re-activated in place, never deactivated"
         );
         let none = diff(&new, &new);
         assert!(none.activate.is_empty() && none.deactivate.is_empty());
