@@ -24,7 +24,9 @@ credentials, hook input, or sandbox rules.
   live in `hecaton-core`; adapter crates implement them and never depend on
   each other. Only the `hecaton` binary wires adapters to ports;
   `hecaton-server` receives `Ports` and never imports `hecaton-runtime`.
-  `hecaton-plugin-sdk` depends on `hecaton-api` only.
+  `hecaton-plugin-sdk` depends on `hecaton-api` only. `hecaton-server`'s
+  *dev*-dependencies may include `hecaton-plugin-sdk` (in-process plugin
+  tests).
 - Library crates return `thiserror` errors whose messages start with the config
   path (`crews.backend.agents.bob.tools.node: …`); only the binary uses `anyhow`.
 - Every tool version — `mise.toml` and fleet `tools:` — is exact.
@@ -111,3 +113,32 @@ credentials, hook input, or sandbox rules.
   sides — `PluginHost::purge` waits (30 s) for the actor to take the plugin
   out of the record before deleting anything, and `Runtime::rm_rf` retries
   `remove_dir_all` for 5 s while the error is `DirectoryNotEmpty`.
+- `up` waits for plugin activations as well as `Ready`; a `fake=pending` in
+  the timeout table means the plugin never said `hello` (look at
+  `plugins/<name>/logs/`), a `rejected` row fails `up` at once with the
+  plugin's message. Re-running `update` after fixing the plugin does
+  re-attempt it: `Daemon::apply` diffs against the fleet's *active* rows
+  only, so a pending or rejected pair is offered again even though its
+  config did not change (R24).
+- The activation table is not persisted: after a daemon restart every pair
+  is `pending` until the plugin's next `hello`, which re-activates all of
+  them.
+- `plugin remove` prunes the activation rows of the removed plugin; `plugin
+  remove --purge` also deletes `plugins/<name>/kv/` — a plugin's KV state
+  survives a plain remove.
+- A plugin's `stop` action leaves the agent `Stopped` until a `restart`
+  action or the next `up`/`update`; the reconciler will not restart it and
+  `status` shows `stopped`.
+- The `PluginClient` is built with `.no_proxy()`; do not remove it — a
+  `HTTP_PROXY` in the daemon's environment would otherwise capture loopback
+  calls.
+- Plugin `/v1/metrics` bodies must carry only `hecaton_plugin_<name>_`
+  families or the whole body is dropped (counted in
+  `hecaton_plugin_metrics_scrape_failures_total`).
+- The SDK's `Plugin` trait uses return-position `impl Future + Send`;
+  implement methods as `async fn` in the impl block (the compiler accepts
+  that), and keep `Send` state (`Mutex`, not `RefCell`).
+- The e2e waits for `plugin list … ready` before `up` when a fleet names a
+  plugin: `Daemon::apply` only activates a pair inline against a plugin that
+  is already listening, and the agent's first `PreToolUse` can fire before a
+  pending pair's next `hello`.

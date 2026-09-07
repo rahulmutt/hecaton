@@ -51,6 +51,46 @@ pub enum AgentPhase {
     Stopped,
 }
 
+/// Where a plugin stands for one agent (plugins spec §16.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ActivationState {
+    /// Recorded; `activate` goes out at the plugin's next `hello`.
+    Pending,
+    /// The plugin accepted the agent's config.
+    Active,
+    /// The plugin refused; `message` is its error.
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginActivation {
+    pub state: ActivationState,
+    #[serde(default)]
+    pub message: String,
+}
+
+impl PluginActivation {
+    pub fn pending() -> Self {
+        Self {
+            state: ActivationState::Pending,
+            message: String::new(),
+        }
+    }
+    pub fn active() -> Self {
+        Self {
+            state: ActivationState::Active,
+            message: String::new(),
+        }
+    }
+    pub fn rejected(message: impl Into<String>) -> Self {
+        Self {
+            state: ActivationState::Rejected,
+            message: message.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentStatus {
     pub phase: AgentPhase,
@@ -64,6 +104,10 @@ pub struct AgentStatus {
     pub restarts: u32,
     #[serde(default)]
     pub next_restart_at: Option<Timestamp>,
+    /// Plugin name → activation state, filled in by the daemon on the way
+    /// out (a read-time overlay); never stored.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub plugins: BTreeMap<String, PluginActivation>,
 }
 
 impl Default for AgentStatus {
@@ -75,6 +119,7 @@ impl Default for AgentStatus {
             applied_hash: None,
             restarts: 0,
             next_restart_at: None,
+            plugins: BTreeMap::new(),
         }
     }
 }
@@ -163,6 +208,32 @@ mod tests {
         assert_eq!(s.agents["f/c/a"].applied_hash, None);
         let back: FleetStatus = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);
+    }
+
+    #[test]
+    fn activation_rows_are_optional_on_the_wire() {
+        let s: AgentStatus = serde_json::from_value(json!({ "phase": "ready" })).unwrap();
+        assert!(s.plugins.is_empty());
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(v.get("plugins").is_none(), "empty map is skipped");
+        let mut s = s;
+        s.plugins
+            .insert("flow".into(), PluginActivation::rejected("bad regex"));
+        s.plugins.insert("web".into(), PluginActivation::active());
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["plugins"]["flow"]["state"], "rejected");
+        assert_eq!(v["plugins"]["flow"]["message"], "bad regex");
+        assert_eq!(v["plugins"]["web"]["state"], "active");
+        assert_eq!(v["plugins"]["web"]["message"], "");
+        let back: AgentStatus = serde_json::from_value(v).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(
+            PluginActivation::pending(),
+            PluginActivation {
+                state: ActivationState::Pending,
+                message: String::new()
+            }
+        );
     }
 
     #[test]

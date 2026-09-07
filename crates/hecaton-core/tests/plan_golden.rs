@@ -1,15 +1,15 @@
-//! Plans for four canned situations, rendered one step per line. Review a
+//! Plans for five canned situations, rendered one step per line. Review a
 //! `.snap.new` against the expected step lists in the Phase 2 plan, Task 7.
 #![allow(clippy::unwrap_used)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use hecaton_api::{
     AgentPhase, AgentSettings, AgentStatus, CrewSpec, FleetSpec, FleetStatus, GitSettings,
     Timestamp,
 };
 use hecaton_core::reconcile::{Plan, ReconcilePolicy, plan};
-use hecaton_core::{Fleet, Keep, ObservedState, ProcessState, ResolvedAgent};
+use hecaton_core::{AgentId, Fleet, Keep, ObservedState, ProcessState, ResolvedAgent};
 
 fn fleet(agents: &[(&str, &str)]) -> Fleet {
     Fleet::try_from(FleetSpec {
@@ -57,11 +57,22 @@ fn render(p: &Plan) -> String {
     p.iter().map(|s| format!("{s}\n")).collect()
 }
 
-fn go(desired: Option<&Fleet>, keep: Keep, st: &FleetStatus, obs: &ObservedState) -> String {
+fn go(
+    desired: Option<&Fleet>,
+    keep: Keep,
+    stopped: &[&str],
+    st: &FleetStatus,
+    obs: &ObservedState,
+) -> String {
+    let stopped: BTreeSet<AgentId> = stopped
+        .iter()
+        .map(|s| format!("payments/backend/{s}").parse().unwrap())
+        .collect();
     render(&plan(
         &"payments".parse().unwrap(),
         desired,
         keep,
+        &stopped,
         st,
         obs,
         &ReconcilePolicy::default(),
@@ -77,6 +88,7 @@ fn fresh_up() {
         go(
             Some(&f),
             Keep::default(),
+            &[],
             &FleetStatus::default(),
             &ObservedState::default()
         )
@@ -91,7 +103,7 @@ fn one_agent_hash_changed() {
     applied(&before, &mut st, AgentPhase::Ready);
     insta::assert_snapshot!(
         "one_agent_hash_changed",
-        go(Some(&after), Keep::default(), &st, &running(&before))
+        go(Some(&after), Keep::default(), &[], &st, &running(&before))
     );
 }
 
@@ -106,12 +118,12 @@ fn one_agent_exited_past_max_restarts() {
         ProcessState::Exited { code: Some(1) },
     );
     // not yet noted
-    let noted_next = go(Some(&f), Keep::default(), &st, &obs);
+    let noted_next = go(Some(&f), Keep::default(), &[], &st, &obs);
     // noted, dead
     let bob = st.entry("payments/backend/bob");
     bob.phase = AgentPhase::Dead;
     bob.restarts = 6;
-    let dead = go(Some(&f), Keep::default(), &st, &obs);
+    let dead = go(Some(&f), Keep::default(), &[], &st, &obs);
     insta::assert_snapshot!(
         "one_agent_exited",
         format!("-- unnoted exit --\n{noted_next}-- dead --\n{dead}")
@@ -131,8 +143,27 @@ fn down_keep_repos() {
                 repos: true,
                 sessions: false
             },
+            &[],
             &st,
             &running(&f)
         )
+    );
+}
+
+#[test]
+fn stopped_agent() {
+    let f = fleet(&[("alice", "sonnet"), ("bob", "opus")]);
+    let mut st = FleetStatus::default();
+    applied(&f, &mut st, AgentPhase::Ready);
+    insta::assert_snapshot!(
+        "stopped_agent_running",
+        go(Some(&f), Keep::default(), &["bob"], &st, &running(&f))
+    );
+    let mut obs = running(&f);
+    obs.remove(&"payments/backend/bob".parse().unwrap());
+    st.entry("payments/backend/bob").phase = AgentPhase::Stopped;
+    insta::assert_snapshot!(
+        "stopped_agent_resumed",
+        go(Some(&f), Keep::default(), &[], &st, &obs)
     );
 }

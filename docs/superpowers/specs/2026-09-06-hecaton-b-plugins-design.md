@@ -491,10 +491,14 @@ Three mergeable phases, each fully tested before the next:
    `materialize_plugin`, the plugin fleet and `PluginHost` skeleton, `hello`
    readiness, the SDK's `Env`/`hello` half. Ends with a trivial SDK plugin
    reaching `Ready` in the e2e.
-2. **Event protocol** — activate/deactivate, observers, the interceptor chain
-   replacing `PassThrough`, `Outcome.actions`, actions, fleets, KV, metrics
-   re-export, the full SDK, `hecaton-plugin-flow`. Ends with the flow e2e
-   assertions.
+2. **Event protocol** — split in two on 2026-09-07 (§16):
+   - **2a, the protocol** — activate/deactivate, observers, the interceptor
+     chain replacing `PassThrough`, `Outcome.actions`, actions, `fleets`, KV,
+     metrics re-export, the full SDK, `docs/plugin-protocol.md` and the
+     conformance test. Ends with `dev fake-plugin` blocking a `PreToolUse`
+     and sending text in the e2e.
+   - **2b, the flow plugin** — `hecaton-plugin-flow`, `mise run
+     package-plugins`, `fleets/watch`. Ends with the flow e2e assertions.
 3. **Proxy and attach** — the `/v1/plugins/*` mount with WebSocket passthrough,
    `AgentRunner::attach` on tmux, `hecaton-plugin-web`. Ends with the web e2e
    assertions.
@@ -526,3 +530,150 @@ Three mergeable phases, each fully tested before the next:
 - The plugin token is minted on the `Apply` that first declares the plugin and rotates on remove + re-add; the actor reuses an existing secret, so a restart keeps the token (§4.1).
 - `PluginError::Fetch` carries `url`, not `source`.
 - URL sources are rejected at load and at `plugin install` until a TLS-enabled build (§2.1); a pinned URL whose digest is already unpacked is answered from `install_root` without fetching.
+
+## 16. Refinements from the phase 2a brainstorm (2026-09-07)
+
+Decisions phase 1's code forced on the event protocol. Phase 2a is the
+protocol alone; the flow plugin is phase 2b.
+
+### 16.1 Async end to end, on `reqwest`
+
+Every daemon → plugin call (§4.2) and the SDK's `Host` (§4.1) use `reqwest`,
+pinned exact, `default-features = false` with `json` only: no TLS stack, so
+P3-1 holds. This reverses the phase 1 plan's "no `reqwest`" constraint: the
+interceptor chain runs on every hook event under a deadline, and a blocking
+client in `spawn_blocking` would have cost a thread per event and per observer
+batch. `ureq` stays in the CLI and the relay (P3-9) and leaves the SDK.
+`EventHandler::handle` becomes async, returning a boxed `std::future::Future`
+so `Arc<dyn EventHandler>` still works and `hecaton-core` stays free of tokio.
+`PassThrough` remains for tests and as the zero-plugin behaviour.
+
+### 16.2 Activation runs in `Daemon::apply`, before the actor
+
+`up`/`update` resolve each agent's `plugins:` map against the plugin
+registry before `Msg::Apply` is sent:
+
+- A name no `plugins.yaml` entry declares is 400
+  `crews.<c>.agents.<a>.plugins.<p>: no plugin "<p>" is installed`; nothing
+  reaches the actor.
+- For every `(agent, plugin)` pair whose config is new or changed: a `Ready`
+  plugin is sent `activate` now; a non-2xx is 400 in the same path style
+  quoting the plugin's `error`, and the whole apply is rejected before any
+  pair is marked active. A plugin that is not `Ready` records the pair as
+  **pending** and the apply proceeds.
+- After the actor replies, `deactivate` goes to pairs the new spec dropped
+  and to changed pairs (followed by their new `activate`). `down`
+  deactivates every pair of the fleet and removes the rows.
+- Each `hello` clears the plugin's observer queue and re-sends `activate` for
+  every pair, pending or active; a rejection then marks the pair
+  **rejected** with the message. Nothing is persisted for this: the
+  registry is rebuilt from the fleet records at daemon start.
+
+Two concurrent `up`s of one fleet can both pass activation; the actor's
+last-writer-wins is unchanged from Phase 3. The actor and reconciler are
+untouched by activation (PB-5).
+
+### 16.3 Activation state is visible, and `up` waits on it
+
+`AgentStatus` gains `plugins: BTreeMap<String, PluginActivation>` with
+`state: pending | active | rejected` and a `message`; `PluginStatus` gains
+`active_agents`. `status` prints both. Activation state is a read-time
+overlay, not an actor message: the `PluginRegistry` owns the `(agent,
+plugin) → PluginActivation` table, and `Daemon::get`/`snapshots`/`apply`
+copy it into `AgentStatus.plugins` on the way out. The actor never sees
+activations and its persisted record never carries them, so the
+single-writer rule holds for both records — the actor writes the fleet
+record, the registry writes activations.
+
+`hecaton up`/`update` wait for fleet `Ready` **and** every activation of the
+fleet `active`. A `rejected` row fails the command at once with
+`crews.<c>.agents.<a>.plugins.<p>: <message>`; the `--timeout` failure lists
+the rows still pending next to the agents still not ready. `--no-wait` is
+unchanged. The fleet keeps running in every case, as today: a plugin that
+never activates is the interceptor chain's fail-open, not a reason to stop
+the agent (§11 accepted risks).
+
+### 16.4 `stop` and `restart` are per-agent desired state in the planner
+
+`FleetRecord` gains `stopped: BTreeSet<AgentId>`, owned by the daemon, never
+part of the user's spec. The planner treats a stopped agent as: `Stop` if
+observed, phase `Stopped`, never restarted, restart counter untouched. The
+`stop` action adds the id and runs a pass; `restart` is add, pass, remove,
+pass. `Apply` clears the set for every agent the new spec declares, so an
+operator's `up` always wins. This is the one `reconcile` change of the phase;
+`cargo mutants` and the model-based test cover it, and a future
+`hecaton stop <agent>` reuses it.
+
+Execution is one path, `Daemon::execute_action`, for chain verdicts and for
+`POST agents/{id}/actions` alike: `send_text` to the runner in
+`spawn_blocking`; `stop`/`restart` as the new actor message
+`SetStopped { agent, stopped }`. Both `hecaton_hook_actions_total` and
+`hecaton_plugin_actions_total{plugin, action}` count them. The route answers
+404 for an agent the plugin is not active for.
+
+### 16.5 Smaller points
+
+- **Health**: a daemon task polls each `Ready` plugin's `GET /v1/health`
+  every 10 s; a failure sets the plugin's status message to
+  `degraded: <reason>`, a success clears it; never a restart (§4.2).
+- **KV**: keys are validated against `[A-Za-z0-9._/-]{1,200}` and may not
+  contain a `..` segment; secret entries are sealed with the plugin name and
+  key as associated data; writes are atomic through `fsutil`.
+- **`fleets/watch`** (WS) moves to phase 2b: nothing in 2a consumes it, and
+  2b/3 bring the WebSocket machinery anyway.
+- **`dev fake-plugin`** is rewritten on the full SDK: it intercepts
+  `PreToolUse` with `{ decision: block }` when `tool_input.command` starts
+  with `rm -rf`, answers `Stop` with a `send_text` action, and observes
+  everything into `$HECATON_PLUGIN_SCRATCH/events.jsonl`. `fake-claude` gains
+  the stdin reader of §11 so the e2e asserts both.
+- **Server modules**: `plugins/client.rs` (`PluginClient`),
+  `plugins/registry.rs` (order, `listen`, subscriptions, `needs`, the
+  activation table; replaces `PluginHost.listen`), `plugins/chain.rs`
+  (`PluginEventHandler`), `plugins/kv.rs`. The vault is shared with KV
+  through an `Arc`.
+- **SDK**: `Env` unchanged; `Host` async with one method per §4.1 route;
+  `Plugin` is a trait with default no-op `activate`, `deactivate`, `observe`,
+  `intercept`, `health`, `metrics`; `serve(plugin)` binds `127.0.0.1:0`,
+  sends `hello`, serves the §4.2 router; `testing::FakeHost` is an
+  in-process axum host that records calls.
+- **Protocol doc**: `docs/plugin-protocol.md` states §4.1 and §4.2 as the
+  versioned contract; fixtures under `docs/plugin-protocol/` are replayed
+  through the SDK router and the server's client by the conformance test.
+
+### 16.6 Refinements from the phase 2a plan (2026-09-07)
+
+Where the phase 2a implementation plan refined this section:
+
+- **Activation state is a read-time overlay, not an actor message.** §16.3
+  above said the daemon publishes activation changes "through the fleet's
+  actor"; the registry owns the `(agent, plugin) → PluginActivation` table
+  and `Daemon::get`/`snapshots`/`apply` copy it into `AgentStatus.plugins` on
+  the way out. The actor never sees activations, its persisted record never
+  carries them, and the single-writer rule holds for both: the actor writes
+  the record, the registry writes activations. `up` polls `GET
+  /v1/fleets/{name}`, so it sees the overlay.
+- **A plugin is identified by its token alone.** No route under
+  `/v1/plugin-host/` carries the plugin's name (§4.1 specifies only the
+  bearer). `Daemon::plugin_for_token` walks the `hecaton` fleet's entries of
+  the secret index with constant-time compares; plugins are few. `hello`
+  still checks that the body's `name` matches.
+- **`stopped` is keyed by the agent id's display form**, like
+  `FleetStatus.agents`, so a stored `fleet.json` from phase 1 loads with an
+  empty set (`#[serde(default)]`).
+- **Health is polled by a daemon task every 10 s**, and a failure only sets
+  the plugin's status message (`degraded: <reason>`), shown by `plugin
+  list`; the registry keeps that message, the actor's record is untouched.
+- **`fleets/watch` is not built** (§16.5); the `fleets` capability gates
+  `GET fleets` and `GET fleets/{f}` only.
+- **`hecaton_plugin_proxy_requests_total` is not registered**: it has no
+  producer until phase 3.
+- **`FleetRecord`, `Desired` and `Keep` moved to `hecaton-api`** (re-exported
+  by `hecaton-core`) so the SDK's `fleets()` is typed.
+- **The `hecaton` binary depends on `reqwest` only through the SDK**: no
+  direct dependency in `crates/hecaton/Cargo.toml`.
+- **An unchanged pair whose row is not `Active` is re-activated by the next
+  apply** (R24): `Daemon::apply` diffs the new spec against the fleet's
+  `Active` rows only, so a `pending` or `rejected` pair is offered to the
+  plugin again by the next `up`/`update` even when its config did not
+  change — a ready plugin gets the `activate` (a rejection fails the apply
+  like any other), a plugin that is not ready leaves the row pending.

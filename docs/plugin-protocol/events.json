@@ -1,0 +1,16 @@
+{
+  "route": "POST /v1/events",
+  "direction": "daemon-to-plugin",
+  "request": {
+    "events": [
+      {
+        "agent": "payments/backend/bob",
+        "name": "Stop",
+        "received_at": 1757000000,
+        "payload": { "hook_event_name": "Stop" }
+      }
+    ]
+  },
+  "status": 200,
+  "response": {}
+}

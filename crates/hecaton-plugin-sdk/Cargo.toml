@@ -9,9 +9,12 @@ repository.workspace = true
 
 [dependencies]
 hecaton-api = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-ureq = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

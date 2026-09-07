@@ -1,8 +1,12 @@
 //! Model-based test (Phase 2 spec §3, §6): the reconciler against a reference
-//! model over random up / update / down / exit / ready / tick sequences.
+//! model over random up / update / down / stop / resume / exit / ready / tick
+//! sequences. `stop` and `resume` are the per-agent desired state a plugin
+//! action sets (plugins spec §16.4): a stopped agent is stopped if observed,
+//! never restarted, and its restart counter is untouched; an `up` releases
+//! every agent it declares and an `update` releases the whole set.
 #![allow(clippy::unwrap_used)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use hecaton_api::{
     AgentPhase, AgentSettings, CredentialBundle, CrewSpec, FleetPhase, FleetSpec, FleetStatus,
@@ -43,6 +47,7 @@ struct RefAgent {
 struct RefState {
     desired: Option<BTreeMap<String, u32>>,
     agents: BTreeMap<String, RefAgent>,
+    stopped: BTreeSet<String>,
     now: u64,
 }
 
@@ -54,6 +59,8 @@ enum Transition {
     AgentExits(String),
     AgentReady(String),
     Tick(u64),
+    Stop(String),
+    Resume(String),
 }
 
 struct Model;
@@ -88,8 +95,10 @@ impl ReferenceStateMachine for Model {
             2 => (pick.clone(), 0..3u32).prop_map(|(a, v)| Transition::Update(a, v)),
             1 => Just(Transition::Down),
             3 => pick.clone().prop_map(Transition::AgentExits),
-            3 => pick.prop_map(Transition::AgentReady),
+            3 => pick.clone().prop_map(Transition::AgentReady),
             3 => tick,
+            2 => pick.clone().prop_map(Transition::Stop),
+            2 => pick.prop_map(Transition::Resume),
         ]
         .boxed()
     }
@@ -105,6 +114,11 @@ impl ReferenceStateMachine for Model {
                         && x.next_restart_at.is_none()
                 })
             }
+            Transition::Stop(a) => {
+                state.desired.as_ref().is_some_and(|d| d.contains_key(a))
+                    && !state.stopped.contains(a)
+            }
+            Transition::Resume(a) => state.stopped.contains(a),
             _ => true,
         }
     }
@@ -115,6 +129,13 @@ impl ReferenceStateMachine for Model {
             Transition::Up(map) => {
                 s.desired = Some(map.clone());
                 s.agents.retain(|k, _| map.contains_key(k));
+                let resumed: Vec<String> = s
+                    .stopped
+                    .iter()
+                    .filter(|n| map.contains_key(*n))
+                    .cloned()
+                    .collect();
+                s.stopped.retain(|n| !map.contains_key(n));
                 for (name, v) in map {
                     let changed = s.agents.get(name).is_none_or(|a| a.version != *v);
                     if changed {
@@ -127,6 +148,10 @@ impl ReferenceStateMachine for Model {
                                 version: *v,
                             },
                         );
+                    } else if resumed.contains(name) {
+                        let a = s.agents.get_mut(name).unwrap();
+                        a.phase = AgentPhase::Starting;
+                        a.next_restart_at = None;
                     }
                 }
             }
@@ -134,7 +159,9 @@ impl ReferenceStateMachine for Model {
                 if let Some(d) = s.desired.as_mut() {
                     d.insert(name.clone(), *v);
                 }
-                if s.agents.get(name).is_some_and(|a| a.version != *v) {
+                let resumed = std::mem::take(&mut s.stopped);
+                let changed = s.agents.get(name).is_some_and(|a| a.version != *v);
+                if changed {
                     s.agents.insert(
                         name.clone(),
                         RefAgent {
@@ -144,6 +171,16 @@ impl ReferenceStateMachine for Model {
                             version: *v,
                         },
                     );
+                }
+                for n in &resumed {
+                    if n == name && changed {
+                        // a changed version already becomes a fresh Starting entry
+                        continue;
+                    }
+                    if let Some(a) = s.agents.get_mut(n) {
+                        a.phase = AgentPhase::Starting;
+                        a.next_restart_at = None;
+                    }
                 }
             }
             Transition::Down => {
@@ -171,6 +208,22 @@ impl ReferenceStateMachine for Model {
             Transition::Tick(secs) => {
                 s.now += secs;
             }
+            Transition::Stop(name) => {
+                s.stopped.insert(name.clone());
+                if let Some(a) = s.agents.get_mut(name) {
+                    a.phase = AgentPhase::Stopped;
+                    a.next_restart_at = None;
+                }
+            }
+            Transition::Resume(name) => {
+                s.stopped.remove(name);
+                if s.desired.as_ref().is_some_and(|d| d.contains_key(name))
+                    && let Some(a) = s.agents.get_mut(name)
+                {
+                    a.phase = AgentPhase::Starting;
+                    a.next_restart_at = None;
+                }
+            }
         }
         // the pass after the transition restarts every due agent
         for a in s.agents.values_mut() {
@@ -191,6 +244,7 @@ struct Sut {
     desired: Option<Fleet>,
     fleet: FleetName,
     creds: CredentialBundle,
+    stopped: BTreeSet<AgentId>,
 }
 
 fn fleet_of(map: &BTreeMap<String, u32>) -> Fleet {
@@ -233,6 +287,7 @@ impl Sut {
             fleet: &self.fleet,
             desired: self.desired.as_ref(),
             keep: Keep::default(),
+            stopped: &self.stopped,
             materializer: &self.m,
             runner: &self.r,
             creds: &self.creds,
@@ -262,6 +317,7 @@ impl StateMachineTest for Sut {
             desired: None,
             fleet: "f".parse().unwrap(),
             creds: CredentialBundle::default(),
+            stopped: BTreeSet::new(),
         };
         // `proptest-state-machine` checks invariants on the initial state too
         // (before any transition is applied), and the model's init state
@@ -278,6 +334,7 @@ impl StateMachineTest for Sut {
     fn apply(mut sut: Self::SystemUnderTest, _: &RefState, t: Transition) -> Self::SystemUnderTest {
         match t {
             Transition::Up(map) => {
+                sut.stopped.retain(|a| !map.contains_key(a.agent.as_str()));
                 sut.desired = Some(fleet_of(&map));
                 sut.status.generation += 1;
             }
@@ -298,6 +355,7 @@ impl StateMachineTest for Sut {
                         .agents
                         .insert(name.parse().unwrap(), s);
                 }
+                sut.stopped.clear();
                 sut.status.generation += 1;
             }
             Transition::Down => sut.desired = None,
@@ -308,6 +366,12 @@ impl StateMachineTest for Sut {
                 hecaton_core::reconcile::agent_ready(&mut sut.status, &id(&name), sut.clock.now())
             }
             Transition::Tick(secs) => sut.clock.advance(secs),
+            Transition::Stop(name) => {
+                sut.stopped.insert(id(&name));
+            }
+            Transition::Resume(name) => {
+                sut.stopped.remove(&id(&name));
+            }
         }
         sut.pass();
         sut
@@ -367,6 +431,7 @@ impl StateMachineTest for Sut {
             desired: sut.desired.clone(),
             fleet: sut.fleet.clone(),
             creds: CredentialBundle::default(),
+            stopped: sut.stopped.clone(),
         };
         for (crew, agents) in &observed.crews {
             for (agent, s) in agents {
@@ -452,6 +517,7 @@ proptest! {
             fleet: &fleet_name,
             desired: desired.as_ref(),
             keep: Keep::default(),
+            stopped: &BTreeSet::new(),
             materializer: &m,
             runner: &r,
             creds: &creds,

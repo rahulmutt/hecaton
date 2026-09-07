@@ -13,7 +13,7 @@ pub mod store;
 pub mod version;
 
 pub use agent::{CrewRef, ResolvedAgent};
-pub use events::{EventHandler, Outcome, PassThrough};
+pub use events::{EventHandler, HandlerFuture, Outcome, PassThrough};
 pub use fleet::{Crew, Fleet, FleetError, RESERVED_AGENT_NAME};
 pub use name::{AgentId, AgentName, CrewName, FleetName, NameError};
 pub use plugin::{

@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use hecaton_api::{
-    AgentPhase, CredentialBundle, DownQuery, FleetPhase, FleetRequest, FleetSpec, FleetSummary,
+    ActivationState, AgentPhase, AgentStatus, CredentialBundle, DownQuery, FleetPhase,
+    FleetRequest, FleetSpec, FleetSummary,
 };
 use hecaton_config::{HostPaths, ResolveOptions, host, read, resolve};
 use hecaton_core::{Fleet, FleetRecord};
@@ -42,6 +43,16 @@ fn label<T: serde::Serialize>(v: T) -> String {
         .unwrap_or_default()
 }
 
+/// `flow=active,web=pending`, sorted by name (the map is a `BTreeMap`);
+/// empty when the agent has no plugins.
+fn plugins_cell(a: &AgentStatus) -> String {
+    a.plugins
+        .iter()
+        .map(|(name, p)| format!("{name}={}", label(p.state)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 pub fn render_status(r: &FleetRecord) -> String {
     let mut out = format!(
         "{}  {}  generation {} (observed {})\n",
@@ -50,7 +61,7 @@ pub fn render_status(r: &FleetRecord) -> String {
         r.generation,
         r.status.observed_generation
     );
-    let rows: Vec<[String; 4]> = r
+    let rows: Vec<[String; 5]> = r
         .status
         .agents
         .iter()
@@ -59,11 +70,15 @@ pub fn render_status(r: &FleetRecord) -> String {
                 id.clone(),
                 label(a.phase),
                 a.restarts.to_string(),
+                plugins_cell(a),
                 a.message.clone(),
             ]
         })
         .collect();
-    out.push_str(&table(&["AGENT", "PHASE", "RESTARTS", "MESSAGE"], &rows));
+    out.push_str(&table(
+        &["AGENT", "PHASE", "RESTARTS", "PLUGINS", "MESSAGE"],
+        &rows,
+    ));
     out
 }
 
@@ -84,6 +99,30 @@ pub fn render_list(rows: &[FleetSummary]) -> String {
         })
         .collect();
     table(&["NAME", "PHASE", "GEN", "OBSERVED", "AGENTS"], &rows)
+}
+
+/// `up`/`update` are done when the fleet is Ready and every plugin
+/// activation is active (plugins spec §16.3). A rejected activation is an
+/// error right away, in the same config-path style the daemon uses.
+pub(crate) fn ready_check(r: &FleetRecord) -> Result<bool> {
+    for (id, a) in &r.status.agents {
+        for (name, p) in &a.plugins {
+            if p.state == ActivationState::Rejected {
+                let (crew, agent) = id
+                    .rsplit_once('/')
+                    .and_then(|(rest, agent)| rest.rsplit_once('/').map(|(_, crew)| (crew, agent)))
+                    .unwrap_or(("?", id.as_str()));
+                bail!("crews.{crew}.agents.{agent}.plugins.{name}: {}", p.message);
+            }
+        }
+    }
+    Ok(r.status.observed_generation == r.generation
+        && r.status.phase == FleetPhase::Ready
+        && r.status.agents.values().all(|a| {
+            a.plugins
+                .values()
+                .all(|p| p.state == ActivationState::Active)
+        }))
 }
 
 /// Columns padded to the widest cell, two spaces apart, trailing spaces
@@ -139,7 +178,7 @@ fn wait_until(
     name: &str,
     timeout: Duration,
     what: &str,
-    done: impl Fn(&FleetRecord) -> bool,
+    done: impl Fn(&FleetRecord) -> Result<bool>,
 ) -> Result<String> {
     let start = Instant::now();
     let mut seen: BTreeMap<String, AgentPhase> = BTreeMap::new();
@@ -157,7 +196,7 @@ fn wait_until(
                 seen.insert(id.clone(), a.phase);
             }
         }
-        if done(&record) {
+        if done(&record)? {
             return Ok(render_status(&record));
         }
         if start.elapsed() >= timeout {
@@ -185,9 +224,7 @@ fn apply(args: &ApplyArgs, replace: bool) -> Result<String> {
     if args.no_wait {
         return Ok(render_status(&record));
     }
-    wait_until(&client, &name, timeout, "ready", |r| {
-        r.status.observed_generation == r.generation && r.status.phase == FleetPhase::Ready
-    })
+    wait_until(&client, &name, timeout, "ready", ready_check)
 }
 
 pub fn up_command(args: &ApplyArgs) -> Result<String> {
@@ -225,7 +262,7 @@ pub fn down_command(args: &DownArgs) -> Result<String> {
         return Ok(format!("{}: purged\n", args.fleet));
     }
     wait_until(&client, &args.fleet, timeout, "down", |r| {
-        r.status.phase == FleetPhase::Down
+        Ok(r.status.phase == FleetPhase::Down)
     })
 }
 
@@ -254,7 +291,7 @@ pub fn list_command(args: &ListArgs) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hecaton_api::{AgentPhase, FleetPhase, FleetSpec};
+    use hecaton_api::{AgentPhase, FleetPhase, FleetSpec, PluginActivation};
     use std::collections::BTreeMap;
 
     #[test]
@@ -277,17 +314,25 @@ mod tests {
         r.status.generation = 3;
         r.status.observed_generation = 3;
         r.status.phase = FleetPhase::Degraded;
-        r.status.entry("payments/backend/alice").phase = AgentPhase::Ready;
+        let alice = r.status.entry("payments/backend/alice");
+        alice.phase = AgentPhase::Ready;
+        alice
+            .plugins
+            .insert("flow".into(), PluginActivation::active());
         let bob = r.status.entry("payments/backend/bob");
         bob.phase = AgentPhase::Starting;
         bob.restarts = 1;
         bob.message = "exited with status 1".into();
+        bob.plugins
+            .insert("flow".into(), PluginActivation::rejected("bad regex"));
+        bob.plugins
+            .insert("web".into(), PluginActivation::pending());
         assert_eq!(
             render_status(&r),
             "payments  degraded  generation 3 (observed 3)\n\
-             AGENT                   PHASE     RESTARTS  MESSAGE\n\
-             payments/backend/alice  ready     0\n\
-             payments/backend/bob    starting  1         exited with status 1\n"
+             AGENT                   PHASE     RESTARTS  PLUGINS                    MESSAGE\n\
+             payments/backend/alice  ready     0         flow=active\n\
+             payments/backend/bob    starting  1         flow=rejected,web=pending  exited with status 1\n"
         );
         let rows = vec![r.summary()];
         assert_eq!(
@@ -296,5 +341,40 @@ mod tests {
              payments  degraded  3    3         2\n"
         );
         assert_eq!(render_list(&[]), "no fleets\n");
+    }
+
+    #[test]
+    fn ready_needs_every_activation_active_and_a_rejection_fails() {
+        let mut r = FleetRecord::new(FleetSpec {
+            name: "p".into(),
+            crews: BTreeMap::new(),
+        });
+        r.generation = 1;
+        r.status.generation = 1;
+        r.status.observed_generation = 1;
+        r.status.phase = FleetPhase::Ready;
+        r.status.entry("p/c/a").phase = AgentPhase::Ready;
+        assert!(ready_check(&r).unwrap());
+        r.status
+            .entry("p/c/a")
+            .plugins
+            .insert("flow".into(), PluginActivation::pending());
+        assert!(!ready_check(&r).unwrap(), "pending holds");
+        r.status
+            .entry("p/c/a")
+            .plugins
+            .insert("flow".into(), PluginActivation::active());
+        assert!(ready_check(&r).unwrap());
+        r.status.entry("p/c/a").plugins.insert(
+            "web".into(),
+            PluginActivation::rejected("initial: unknown state \"x\""),
+        );
+        assert_eq!(
+            ready_check(&r).unwrap_err().to_string(),
+            "crews.c.agents.a.plugins.web: initial: unknown state \"x\""
+        );
+        r.status.phase = FleetPhase::Reconciling;
+        r.status.entry("p/c/a").plugins.clear();
+        assert!(!ready_check(&r).unwrap());
     }
 }

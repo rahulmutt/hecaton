@@ -27,7 +27,7 @@ pub fn render_plugins(rows: &[PluginStatus]) -> String {
     if rows.is_empty() {
         return "no plugins\n".to_string();
     }
-    let rows: Vec<[String; 6]> = rows
+    let rows: Vec<[String; 7]> = rows
         .iter()
         .map(|p| {
             [
@@ -36,12 +36,15 @@ pub fn render_plugins(rows: &[PluginStatus]) -> String {
                 label(p.phase),
                 p.listen.clone().unwrap_or_else(|| "-".to_string()),
                 if p.routes { "yes" } else { "no" }.to_string(),
+                p.active_agents.to_string(),
                 p.message.clone(),
             ]
         })
         .collect();
     super::fleet::table(
-        &["NAME", "VERSION", "PHASE", "LISTEN", "ROUTES", "MESSAGE"],
+        &[
+            "NAME", "VERSION", "PHASE", "LISTEN", "ROUTES", "ACTIVE", "MESSAGE",
+        ],
         &rows,
     )
 }
@@ -257,6 +260,7 @@ mod tests {
                 listen: Some("127.0.0.1:4000".into()),
                 routes: false,
                 message: String::new(),
+                active_agents: 2,
             },
             PluginStatus {
                 name: "web".into(),
@@ -265,13 +269,14 @@ mod tests {
                 listen: None,
                 routes: true,
                 message: "exited with status 1".into(),
+                active_agents: 0,
             },
         ];
         assert_eq!(
             render_plugins(&rows),
-            "NAME  VERSION  PHASE     LISTEN          ROUTES  MESSAGE\n\
-             flow  0.1.0    ready     127.0.0.1:4000  no\n\
-             web   0.2.0    starting  -               yes     exited with status 1\n"
+            "NAME  VERSION  PHASE     LISTEN          ROUTES  ACTIVE  MESSAGE\n\
+             flow  0.1.0    ready     127.0.0.1:4000  no      2\n\
+             web   0.2.0    starting  -               yes     0       exited with status 1\n"
         );
         assert_eq!(render_plugins(&[]), "no plugins\n");
         let r = SyncReport {

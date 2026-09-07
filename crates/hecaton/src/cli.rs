@@ -205,11 +205,12 @@ pub enum DevCommand {
     /// Render one agent's generated files (settings.json, mise.toml,
     /// nono-profile.json, launch.sh) without launching anything.
     Materialize(MaterializeArgs),
-    /// Stand-in for `claude` in the e2e: runs the SessionStart command hooks
-    /// and one Notification HTTP hook from settings.json, then sleeps.
+    /// Stand-in for `claude` in the e2e: runs the SessionStart command hooks,
+    /// posts Notification, PreToolUse and Stop to their HTTP hooks, records
+    /// the replies, echoes stdin to $HOME/fake-claude.stdin, then sleeps.
     FakeClaude(FakeClaudeArgs),
-    /// Stand-in plugin for the e2e: binds a loopback listener, sends hello,
-    /// writes the reply to $HECATON_PLUGIN_SCRATCH/fake-plugin.hello, sleeps.
+    /// Stand-in plugin for the e2e on the SDK: blocks `rm -rf`, answers Stop
+    /// with send_text, observes into scratch.
     FakePlugin,
 }
 

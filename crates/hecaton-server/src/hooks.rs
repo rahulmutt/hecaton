@@ -58,7 +58,19 @@ pub(crate) async fn events(
         Err(e) => return ApiError::new(StatusCode::BAD_REQUEST, e).into_response(),
     };
     match tokio::time::timeout(HANDLE_TIMEOUT, state.daemon.event(&id, secret, parsed)).await {
-        Ok(Ok(outcome)) => Json(outcome.response).into_response(),
+        Ok(Ok(outcome)) => {
+            // The verdict's actions run after the response (spec §16.4):
+            // Claude is unblocked the moment this JSON is written.
+            if !outcome.actions.is_empty() {
+                tokio::spawn(
+                    state
+                        .daemon
+                        .clone()
+                        .run_actions(id.clone(), outcome.actions.clone()),
+                );
+            }
+            Json(outcome.response).into_response()
+        }
         Ok(Err(e)) => ApiError::from(e).into_response(),
         Err(_) => ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "hook handling timed out")
             .into_response(),

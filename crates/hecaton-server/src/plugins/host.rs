@@ -3,7 +3,7 @@
 //! with `hello` as its readiness event. The per-agent hook secret the actor
 //! mints is the plugin's `HECATON_PLUGIN_TOKEN`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,16 +14,17 @@ use hecaton_api::{
     PluginStatus, SpecHash, SyncReport,
 };
 use hecaton_core::{
-    AgentName, Clock, FleetRecord, FleetSecrets, Materializer, RESERVED_FLEET, ResolvedPlugin,
-    plugin_fleet, plugin_id,
+    AgentId, AgentName, Clock, FleetRecord, FleetSecrets, Materializer, RESERVED_FLEET,
+    ResolvedPlugin, plugin_fleet, plugin_id,
 };
-use tokio::sync::{Mutex, RwLock, oneshot, watch};
+use tokio::sync::{Mutex, oneshot, watch};
 
 use super::PluginError;
 use super::config::{load_plugins_file, resolve_source};
 use super::manifest::read_manifest;
 use super::materializer::{NullStore, PluginMaterializer};
 use super::package;
+use super::registry::PluginRegistry;
 use crate::actor::{self, FleetHandle, Msg, Ports, READY_EVENT, Shared};
 use crate::daemon::DaemonError;
 
@@ -65,7 +66,9 @@ pub struct PluginHost {
     materializer: Arc<PluginMaterializer>,
     handle: FleetHandle,
     clock: Arc<dyn Clock>,
-    listen: RwLock<BTreeMap<AgentName, String>>,
+    /// Where each plugin listens, whether it is ready, and its activation
+    /// rows: the daemon and the host share one registry.
+    registry: Arc<PluginRegistry>,
     /// One sync at a time; a second `plugin sync` waits.
     syncing: Mutex<()>,
 }
@@ -73,7 +76,12 @@ pub struct PluginHost {
 impl PluginHost {
     /// Spawns the `hecaton` fleet's actor with an empty spec. Nothing runs
     /// until the first `sync`.
-    pub fn start(config: PluginHostConfig, agent_ports: &Ports, shared: Shared) -> Arc<Self> {
+    pub fn start(
+        config: PluginHostConfig,
+        agent_ports: &Ports,
+        shared: Shared,
+        registry: Arc<PluginRegistry>,
+    ) -> Arc<Self> {
         let materializer = Arc::new(PluginMaterializer::new(agent_ports.materializer.clone()));
         let ports = Arc::new(Ports {
             materializer: materializer.clone(),
@@ -87,12 +95,50 @@ impl PluginHost {
         let name = RESERVED_FLEET.parse().unwrap_or_else(|_| unreachable!());
         let record = FleetRecord::new(plugin_fleet(&[]).into());
         let handle = actor::spawn(name, record, FleetSecrets::default(), ports, shared, false);
+        // The way down: a plugin that exits, restarts or is removed stops
+        // being called. Only *transitions* count — a record the actor
+        // publishes can still predate a `hello` that already marked the
+        // plugin ready (the `hello` event reaches the actor behind the
+        // pass), and taking readiness back on one of those would silence
+        // a plugin that is up.
+        let mut rx = handle.status.clone();
+        let reg = registry.clone();
+        tokio::spawn(async move {
+            let mut ready: BTreeSet<AgentName> = BTreeSet::new();
+            loop {
+                {
+                    let record = rx.borrow_and_update();
+                    let mut seen = BTreeSet::new();
+                    for (id, st) in &record.status.agents {
+                        let Ok(id) = id.parse::<AgentId>() else {
+                            continue;
+                        };
+                        seen.insert(id.agent.clone());
+                        if st.phase == AgentPhase::Ready {
+                            reg.set_ready(&id.agent, true);
+                            ready.insert(id.agent);
+                        } else if ready.remove(&id.agent) {
+                            reg.set_ready(&id.agent, false);
+                        }
+                    }
+                    // A plugin the record no longer holds is gone too.
+                    let gone: Vec<AgentName> = ready.difference(&seen).cloned().collect();
+                    for name in gone {
+                        ready.remove(&name);
+                        reg.set_ready(&name, false);
+                    }
+                }
+                if rx.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
         Arc::new(Self {
             config,
             materializer,
             handle,
             clock: agent_ports.clock.clone(),
-            listen: RwLock::new(BTreeMap::new()),
+            registry,
             syncing: Mutex::new(()),
         })
     }
@@ -194,10 +240,7 @@ impl PluginHost {
             }
         }
         self.materializer.replace(resolved.clone());
-        self.listen
-            .write()
-            .await
-            .retain(|n, _| report.unchanged.iter().any(|u| u == n.as_str()));
+        self.registry.replace_plugins(&resolved, &report.unchanged);
         let spec: FleetSpec = plugin_fleet(&resolved).into();
         let (reply, rx) = oneshot::channel();
         self.handle
@@ -246,10 +289,7 @@ impl PluginHost {
                 "hello.listen: must be a loopback address".into(),
             ));
         }
-        self.listen
-            .write()
-            .await
-            .insert(name.clone(), req.listen.clone());
+        self.registry.set_listen(name, req.listen.clone());
         self.handle
             .tx
             .send(Msg::Event {
@@ -267,19 +307,30 @@ impl PluginHost {
     /// One row per declared plugin, sorted by name.
     pub async fn list(&self) -> Vec<PluginStatus> {
         let record = self.record();
-        let listen = self.listen.read().await;
         self.materializer
             .all()
             .into_iter()
             .map(|p| {
                 let st = record.status.agents.get(&p.id().to_string());
+                let info = self.registry.plugin(&p.name);
+                // The actor's own message wins; otherwise the health
+                // poller's verdict, if any (§16.5).
+                let message = match st.map(|s| s.message.clone()).filter(|m| !m.is_empty()) {
+                    Some(m) => m,
+                    None => info
+                        .as_ref()
+                        .and_then(|i| i.degraded.as_ref())
+                        .map(|d| format!("degraded: {d}"))
+                        .unwrap_or_default(),
+                };
                 PluginStatus {
                     name: p.name.to_string(),
                     version: p.manifest.version.clone(),
                     phase: st.map_or(AgentPhase::Pending, |s| s.phase),
-                    listen: listen.get(&p.name).cloned(),
+                    listen: info.as_ref().and_then(|i| i.listen.clone()),
                     routes: p.manifest.routes,
-                    message: st.map(|s| s.message.clone()).unwrap_or_default(),
+                    active_agents: self.registry.active_agents(&p.name),
+                    message,
                 }
             })
             .collect()

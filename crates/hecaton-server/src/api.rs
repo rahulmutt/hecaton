@@ -3,6 +3,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
@@ -72,15 +73,28 @@ impl From<DaemonError> for ApiError {
 
 impl From<PluginError> for ApiError {
     fn from(e: PluginError) -> Self {
+        // A KV failure names the daemon's own on-disk path; the body goes
+        // to a sandboxed plugin, which has no business learning it. The
+        // operator gets the real one in the log.
+        if let PluginError::Kv { path, message } = &e {
+            tracing::warn!(path = %path.display(), "plugin kv storage error: {message}");
+            return Self::new(StatusCode::INTERNAL_SERVER_ERROR, "kv: storage error");
+        }
         let status = match &e {
             PluginError::Config { .. }
             | PluginError::Manifest(_)
             | PluginError::ManifestParse(_)
             | PluginError::Digest { .. }
             | PluginError::Package(_)
-            | PluginError::StillDeclared(_) => StatusCode::BAD_REQUEST,
+            | PluginError::StillDeclared(_)
+            | PluginError::Activation { .. }
+            | PluginError::KvKey(_) => StatusCode::BAD_REQUEST,
             PluginError::Fetch { .. } => StatusCode::BAD_GATEWAY,
-            PluginError::Io { .. } | PluginError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            PluginError::Capability(_) => StatusCode::FORBIDDEN,
+            PluginError::NotActive(_) => StatusCode::NOT_FOUND,
+            PluginError::Io { .. } | PluginError::Internal(_) | PluginError::Kv { .. } => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         };
         Self::new(status, e.to_string())
     }
@@ -115,12 +129,14 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
     let plugins = Router::new()
         .route("/v1/plugin-host/hello", post(plugin_hello))
         .layer(DefaultBodyLimit::max(64 << 10));
+    let plugin_host = crate::plugin_api::router().layer(DefaultBodyLimit::max(1 << 20));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/metrics", get(metrics))
         .merge(admin)
         .merge(agents)
         .merge(plugins)
+        .merge(plugin_host)
         .with_state(state)
 }
 
@@ -145,14 +161,48 @@ async fn require_admin(State(state): State<AppState>, req: Request, next: Next) 
     }
 }
 
+/// Per-plugin `/v1/metrics` scrape budget (plugins spec §9).
+const SCRAPE_TIMEOUT: Duration = Duration::from_millis(500);
+
 async fn metrics(State(state): State<AppState>) -> Response {
     let snapshots = state.daemon.snapshots().await;
     state.daemon.metrics().set_gauges(&snapshots);
-    (
-        [(CONTENT_TYPE, "text/plain; version=0.0.4")],
-        state.daemon.metrics().encode(),
-    )
-        .into_response()
+    let mut body = state.daemon.metrics().encode();
+    let registry = state.daemon.registry().clone();
+    // The plugin name lives outside the spawned task (not inside its
+    // returned value) so a panicked or cancelled scrape is still
+    // attributable: a bare `JoinError` carries no payload to recover it
+    // from. Every task is spawned before any is awaited, so this keeps
+    // the scrapes running in parallel despite the sequential awaits below.
+    let mut scrapes = Vec::new();
+    for name in registry.names() {
+        let Some(listen) = registry.ready_listen(&name) else {
+            continue;
+        };
+        let client = state.daemon.client().clone();
+        let handle = tokio::spawn(async move { client.metrics(&listen, SCRAPE_TIMEOUT).await });
+        scrapes.push((name, handle));
+    }
+    for (name, handle) in scrapes {
+        match handle.await {
+            Ok(Ok(text)) if crate::plugin_api::families_ok(&text, name.as_str()) => {
+                body.push_str(&text);
+                if !text.ends_with('\n') {
+                    body.push('\n');
+                }
+            }
+            Ok(Ok(_)) => state.daemon.metrics().scrape_failure(name.as_str()),
+            Ok(Err(e)) => {
+                tracing::debug!(plugin = %name, "metrics scrape failed: {e}");
+                state.daemon.metrics().scrape_failure(name.as_str());
+            }
+            Err(e) => {
+                tracing::warn!(plugin = %name, "metrics scrape task failed: {e}");
+                state.daemon.metrics().scrape_failure(name.as_str());
+            }
+        }
+    }
+    ([(CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }
 
 fn fleet_name(s: &str) -> Result<FleetName, ApiError> {
@@ -293,4 +343,23 @@ async fn purge_plugin(
         .map_err(|e: NameError| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
     state.daemon.plugins().purge(&name).await?;
     Ok(Json(json!({})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A KV failure must not render the daemon's on-disk path into a body
+    /// a sandboxed plugin reads.
+    #[test]
+    fn a_kv_storage_error_is_a_fixed_500() {
+        let e = ApiError::from(PluginError::Kv {
+            path: "/home/op/.local/share/hecaton/plugins/flow/kv/k".into(),
+            message: "permission denied".into(),
+        });
+        assert_eq!(
+            (e.status, e.message.as_str()),
+            (StatusCode::INTERNAL_SERVER_ERROR, "kv: storage error")
+        );
+    }
 }

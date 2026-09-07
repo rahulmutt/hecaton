@@ -9,6 +9,8 @@ use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder,
 };
 
+use crate::plugins::wire_label as label;
+
 #[derive(Clone)]
 pub struct Metrics {
     inner: Arc<Inner>,
@@ -23,18 +25,13 @@ struct Inner {
     agent_restarts: IntCounterVec,
     hook_events: IntCounterVec,
     hook_handle_duration: HistogramVec,
-    /// Always zero until Spec B ships actions; registered so dashboards
-    /// can be built now.
-    #[allow(dead_code)]
     hook_actions: IntCounterVec,
-}
-
-/// Lowercase phase label, the same spelling as the wire form.
-fn label<T: serde::Serialize>(v: T) -> String {
-    serde_json::to_value(v)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_default()
+    plugin_events: IntCounterVec,
+    plugin_intercept_duration: HistogramVec,
+    plugin_intercept_failures: IntCounterVec,
+    plugin_events_dropped: IntCounterVec,
+    plugin_actions: IntCounterVec,
+    plugin_metrics_scrape_failures: IntCounterVec,
 }
 
 impl Metrics {
@@ -81,6 +78,48 @@ impl Metrics {
             ),
             &["fleet", "crew", "agent", "action"],
         )?;
+        let plugin_events = IntCounterVec::new(
+            Opts::new(
+                "hecaton_plugin_events_total",
+                "Hook events handed to plugins",
+            ),
+            &["plugin", "event", "mode"],
+        )?;
+        let plugin_intercept_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "hecaton_plugin_intercept_duration_seconds",
+                "Interceptor call latency",
+            ),
+            &["plugin", "event"],
+        )?;
+        let plugin_intercept_failures = IntCounterVec::new(
+            Opts::new(
+                "hecaton_plugin_intercept_failures_total",
+                "Interceptor calls skipped",
+            ),
+            &["plugin", "reason"],
+        )?;
+        let plugin_events_dropped = IntCounterVec::new(
+            Opts::new(
+                "hecaton_plugin_events_dropped_total",
+                "Observer events dropped on overflow",
+            ),
+            &["plugin"],
+        )?;
+        let plugin_actions = IntCounterVec::new(
+            Opts::new(
+                "hecaton_plugin_actions_total",
+                "Actions requested by plugins",
+            ),
+            &["plugin", "action"],
+        )?;
+        let plugin_metrics_scrape_failures = IntCounterVec::new(
+            Opts::new(
+                "hecaton_plugin_metrics_scrape_failures_total",
+                "Plugin /v1/metrics bodies dropped",
+            ),
+            &["plugin"],
+        )?;
         for c in [
             Box::new(fleets.clone()) as Box<dyn prometheus::core::Collector>,
             Box::new(agents.clone()),
@@ -90,12 +129,15 @@ impl Metrics {
             Box::new(hook_events.clone()),
             Box::new(hook_handle_duration.clone()),
             Box::new(hook_actions.clone()),
+            Box::new(plugin_events.clone()),
+            Box::new(plugin_intercept_duration.clone()),
+            Box::new(plugin_intercept_failures.clone()),
+            Box::new(plugin_events_dropped.clone()),
+            Box::new(plugin_actions.clone()),
+            Box::new(plugin_metrics_scrape_failures.clone()),
         ] {
             registry.register(c)?;
         }
-        // Instantiate hook_actions to ensure it appears in the output, even though
-        // it's unused until Spec B.
-        let _ = hook_actions.with_label_values(&["", "", "", ""]);
         Ok(Self {
             inner: Arc::new(Inner {
                 registry,
@@ -107,6 +149,12 @@ impl Metrics {
                 hook_events,
                 hook_handle_duration,
                 hook_actions,
+                plugin_events,
+                plugin_intercept_duration,
+                plugin_intercept_failures,
+                plugin_events_dropped,
+                plugin_actions,
+                plugin_metrics_scrape_failures,
             }),
         })
     }
@@ -171,6 +219,63 @@ impl Metrics {
             .hook_handle_duration
             .with_label_values(&[event])
             .observe(secs);
+    }
+
+    pub fn plugin_event(&self, plugin: &str, event: &str, mode: &str) {
+        self.inner
+            .plugin_events
+            .with_label_values(&[plugin, event, mode])
+            .inc();
+    }
+
+    /// One interceptor call; `failure` is the `reason` label when it failed.
+    pub fn intercept(&self, plugin: &str, event: &str, secs: f64, failure: Option<&str>) {
+        self.inner
+            .plugin_intercept_duration
+            .with_label_values(&[plugin, event])
+            .observe(secs);
+        if let Some(reason) = failure {
+            self.inner
+                .plugin_intercept_failures
+                .with_label_values(&[plugin, reason])
+                .inc();
+        }
+    }
+
+    pub fn events_dropped(&self, plugin: &str, n: u64) {
+        self.inner
+            .plugin_events_dropped
+            .with_label_values(&[plugin])
+            .inc_by(n);
+    }
+
+    pub fn plugin_action(&self, plugin: &str, action: &str) {
+        self.inner
+            .plugin_actions
+            .with_label_values(&[plugin, action])
+            .inc();
+    }
+
+    pub fn hook_action(&self, id: &AgentId, action: &str) {
+        self.inner
+            .hook_actions
+            .with_label_values(&[
+                id.fleet.as_str(),
+                id.crew.as_str(),
+                id.agent.as_str(),
+                action,
+            ])
+            .inc();
+    }
+
+    /// Bumped only after `encode()` already rendered this scrape's body
+    /// (§9), so a failure here is reflected in the *next* `/metrics`
+    /// response, not this one.
+    pub fn scrape_failure(&self, plugin: &str) {
+        self.inner
+            .plugin_metrics_scrape_failures
+            .with_label_values(&[plugin])
+            .inc();
     }
 }
 
@@ -237,6 +342,31 @@ mod tests {
         assert!(
             text.contains("hecaton_hook_handle_duration_seconds_count{event=\"Notification\"} 2")
         );
+        m.plugin_event("flow", "PreToolUse", "intercept");
+        m.intercept("flow", "PreToolUse", 0.01, None);
+        m.intercept("flow", "PreToolUse", 1.5, Some("timeout"));
+        m.events_dropped("web", 3);
+        m.plugin_action("flow", "send_text");
+        m.hook_action(&id, "send_text");
+        m.scrape_failure("web");
+        let text = m.encode();
+        assert!(text.contains(
+            "hecaton_plugin_events_total{event=\"PreToolUse\",mode=\"intercept\",plugin=\"flow\"} 1"
+        ));
+        assert!(text.contains(
+            "hecaton_plugin_intercept_duration_seconds_count{event=\"PreToolUse\",plugin=\"flow\"} 2"
+        ));
+        assert!(text.contains(
+            "hecaton_plugin_intercept_failures_total{plugin=\"flow\",reason=\"timeout\"} 1"
+        ));
+        assert!(text.contains("hecaton_plugin_events_dropped_total{plugin=\"web\"} 3"));
+        assert!(
+            text.contains("hecaton_plugin_actions_total{action=\"send_text\",plugin=\"flow\"} 1")
+        );
+        assert!(text.contains(
+            "hecaton_hook_actions_total{action=\"send_text\",agent=\"a\",crew=\"c\",fleet=\"f\"} 1"
+        ));
+        assert!(text.contains("hecaton_plugin_metrics_scrape_failures_total{plugin=\"web\"} 1"));
         for name in [
             "hecaton_fleets",
             "hecaton_agents",
@@ -246,6 +376,12 @@ mod tests {
             "hecaton_hook_events_total",
             "hecaton_hook_handle_duration_seconds",
             "hecaton_hook_actions_total",
+            "hecaton_plugin_events_total",
+            "hecaton_plugin_intercept_duration_seconds",
+            "hecaton_plugin_intercept_failures_total",
+            "hecaton_plugin_events_dropped_total",
+            "hecaton_plugin_actions_total",
+            "hecaton_plugin_metrics_scrape_failures_total",
         ] {
             assert!(text.contains(&format!("# TYPE {name} ")), "{name} missing");
         }

@@ -23,6 +23,9 @@ a repository.
    package <dir>` builds the tarball and prints the `sha256` a `plugins.yaml`
    entry needs. `https://` sources are part of the file format but rejected
    until a TLS-enabled build — package the plugin and point at the tarball.
+   `plugin list` shows each plugin's phase and how many agents it is active
+   for; an agent opts into a plugin with `plugins: { <name>: { …config… } }`
+   in its settings block and `up` waits until the plugin has accepted it.
 8. `mise x -- cargo run -q -p hecaton -- dev materialize examples/payments.yaml backend/bob --no-host-defaults`
    — renders bob's generated files into a temp dir without launching anything.
 
@@ -31,11 +34,14 @@ a repository.
 - `AGENTS.md` — conventions and gotchas for contributors (human or agent).
 - `docs/superpowers/specs/` — the design; `docs/superpowers/plans/` — how it is being built.
 - `docs/THREAT-MODEL.md` — what is protected, from whom, and what is out of scope.
+- `docs/plugin-protocol.md` — the wire contract for plugins in any language.
 
 ## Status
-Spec A is complete. Spec B (plugins) is in progress: phase 1, plugin
-workloads, is done — packages, `plugins.yaml`, the sandboxed plugin fleet and
-`hello`; the event protocol and the `flow` plugin are next.
+Spec A is complete. Spec B (plugins) is in progress: phase 1 (plugin
+workloads) and phase 2a (the event protocol: activation, the interceptor
+chain, observers, actions, the `fleets`/`actions`/`kv` routes, the full SDK,
+`docs/plugin-protocol.md`) are done; phase 2b, the `flow` plugin, is next,
+then the proxy and `web`.
 
 ### Upgrading to Spec B phase 1
 - Fleet files rename the reserved `flow: {}` settings block to `plugins: {}`
@@ -45,3 +51,10 @@ workloads, is done — packages, `plugins.yaml`, the sandboxed plugin fleet and
   spec hash changed with the block.
 - A stored fleet named `hecaton` is ignored, with an error in the daemon log —
   the name is now reserved for the plugin fleet.
+
+### Upgrading to Spec B phase 2a
+- `status` gains a `PLUGINS` column and `plugin list` an `ACTIVE` column.
+- `fleet.json` gains an empty `stopped` list.
+- An agent naming a plugin that is not in `plugins.yaml` now fails `up` with
+  `crews.<c>.agents.<a>.plugins.<p>: no plugin "<p>" is installed` (phase 1
+  ignored the block).

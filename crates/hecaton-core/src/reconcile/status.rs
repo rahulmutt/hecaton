@@ -19,6 +19,7 @@ pub fn apply(
         (Step::Stop(id), Ok(())) => {
             if let Some(a) = status.agents.get_mut(&id.to_string()) {
                 a.phase = AgentPhase::Stopped;
+                a.next_restart_at = None;
             }
         }
         (Step::RemoveAgent(id), Ok(())) => {
@@ -129,7 +130,9 @@ fn derive_fleet_phase(status: &FleetStatus, terminating: bool, all_ok: bool) -> 
         )
     }) {
         FleetPhase::Reconciling
-    } else if !status.agents.is_empty() && phases().all(|p| p == AgentPhase::Ready) {
+    } else if !status.agents.is_empty()
+        && phases().all(|p| matches!(p, AgentPhase::Ready | AgentPhase::Stopped))
+    {
         FleetPhase::Ready
     } else if status.agents.is_empty() {
         FleetPhase::Pending
@@ -341,6 +344,48 @@ mod tests {
             Timestamp(0),
         );
         assert_eq!(s.agents.keys().collect::<Vec<_>>(), vec!["f/d/x"]);
+    }
+
+    #[test]
+    fn a_stop_clears_the_pending_restart_and_counts_as_settled() {
+        let mut s = FleetStatus::default();
+        apply(
+            &mut s,
+            &Step::Start(id("f/c/a"), h("x")),
+            &Ok(()),
+            &policy(),
+            Timestamp(0),
+        );
+        apply(
+            &mut s,
+            &Step::NoteExit(id("f/c/a"), Some(1)),
+            &Ok(()),
+            &policy(),
+            Timestamp(10),
+        );
+        assert!(s.agents["f/c/a"].next_restart_at.is_some());
+        apply(
+            &mut s,
+            &Step::Stop(id("f/c/a")),
+            &Ok(()),
+            &policy(),
+            Timestamp(11),
+        );
+        let a = &s.agents["f/c/a"];
+        assert_eq!(
+            (a.phase, a.next_restart_at, a.restarts),
+            (AgentPhase::Stopped, None, 1)
+        );
+        s.entry("f/c/b").phase = AgentPhase::Ready;
+        finish_pass(&mut s, false, true);
+        assert_eq!(
+            s.phase,
+            FleetPhase::Ready,
+            "stopped agents do not hold the fleet"
+        );
+        s.entry("f/c/b").phase = AgentPhase::Starting;
+        finish_pass(&mut s, false, true);
+        assert_eq!(s.phase, FleetPhase::Reconciling);
     }
 
     #[test]
