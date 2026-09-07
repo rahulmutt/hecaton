@@ -5,7 +5,7 @@
 use std::future::{Future, IntoFuture};
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{StatusCode, header::CONTENT_TYPE};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -70,6 +70,11 @@ pub fn router<P: Plugin>(plugin: Arc<P>) -> Router {
         .route("/v1/health", get(health::<P>))
         .route("/v1/metrics", get(metrics::<P>))
         .with_state(plugin)
+        // daemon → plugin request bodies are capped at 1 MiB (plugin-protocol
+        // §1), matching the daemon's own `plugin_api::router` layer
+        // (`hecaton-server/src/api.rs`); axum's default (2 MiB) is otherwise
+        // silently more permissive than the spec promises.
+        .layer(DefaultBodyLimit::max(1 << 20))
 }
 
 fn error(status: StatusCode, message: impl Into<String>) -> Response {

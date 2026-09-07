@@ -123,6 +123,11 @@ async fn the_host_sends_every_plugin_to_daemon_fixture_and_reads_the_answer() {
     let record: FleetRecord = serde_json::from_value(fx["fleets"]["response"][0].clone()).unwrap();
     let fake = FakeHost::start("tok", json!({ "greeting": "hi" }), vec![record]).await;
     let host = Host::new(fake.env("flow", Path::new("/s"))).unwrap();
+    // A raw client for asserting a fixture's exact recorded status and body
+    // beyond what the typed `Host` API surfaces (e.g. `Result<(), _>` calls
+    // collapse a 200 and its `{}` body to `Ok(())`; `SdkError::Status` keeps
+    // only the message, not the numeric code as read from the fixture).
+    let c = reqwest::Client::builder().no_proxy().build().unwrap();
 
     let r = host.hello("0.1.0", "127.0.0.1:4000").await.unwrap();
     assert_eq!(serde_json::to_value(&r).unwrap(), fx["hello"]["response"]);
@@ -144,6 +149,23 @@ async fn the_host_sends_every_plugin_to_daemon_fixture_and_reads_the_answer() {
             fx["hello-bad-token"]["response"]["error"].as_str().unwrap()
         )
     );
+    // `Display` above only proves the message; check the fixture's exact
+    // recorded status and body on the wire.
+    let resp = c
+        .post(format!("{}/v1/plugin-host/hello", fake.url))
+        .bearer_auth(fx["hello-bad-token"]["token"].as_str().unwrap())
+        .json(&fx["hello-bad-token"]["request"])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        fx["hello-bad-token"]["status"].as_u64().unwrap() as u16
+    );
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        fx["hello-bad-token"]["response"]
+    );
 
     let fleets = host.fleets().await.unwrap();
     assert_eq!(
@@ -151,6 +173,22 @@ async fn the_host_sends_every_plugin_to_daemon_fixture_and_reads_the_answer() {
         fx["fleets"]["response"]
     );
     assert_eq!(host.fleet("nope").await.unwrap(), None);
+    // `Host::fleet` collapses every non-2xx to `None`; check the fixture's
+    // exact recorded status and body on the wire.
+    let resp = c
+        .get(format!("{}/v1/plugin-host/fleets/nope", fake.url))
+        .bearer_auth("tok")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        fx["fleet-missing"]["status"].as_u64().unwrap() as u16
+    );
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        fx["fleet-missing"]["response"]
+    );
 
     let action: PluginAction = serde_json::from_value(fx["action"]["request"].clone()).unwrap();
     host.action("payments/backend/bob", &action).await.unwrap();

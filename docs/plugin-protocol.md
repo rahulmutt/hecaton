@@ -16,7 +16,14 @@ body is a JSON object, except the routes stated to carry a raw byte body
 (`GET`/`PUT /v1/plugin-host/kv/{key}`, `GET /v1/health`, `GET /v1/metrics`).
 Every non-2xx response is `{ "error": "<message>" }`
 (`hello-bad-token.json`, `fleet-missing.json`, `activate-rejected.json`).
-Every body, either direction, is capped at 1 MiB.
+Body size caps differ by direction and route: plugin → daemon bodies are
+capped at 1 MiB, except `hello`, capped at 64 KiB
+(`hecaton-server/src/api.rs`'s `plugins`/`plugin_host` router layers);
+daemon → plugin request bodies are capped at 1 MiB by the SDK's `router`
+(`hecaton-plugin-sdk/src/plugin.rs`); a plugin's response body over 1 MiB is
+rejected by the daemon before it is parsed and counted as a `body` failure
+— for `intercept`, the interceptor chain's fail-open (§4) —
+(`hecaton-server/src/plugins/client.rs`).
 
 ## 2. Environment
 
@@ -36,7 +43,11 @@ Base `HECATON_API_URL`, path prefix `/v1/plugin-host/`, bearer
 `HECATON_PLUGIN_TOKEN` on every call. Each route beyond `hello` is gated by
 a capability the manifest's `needs` must declare (`fleets`, `actions`,
 `attach`, `kv`); a call outside what is declared is rejected before the
-route runs, with a client error naming the missing capability.
+route runs, 403 `{ "error": "capability \"<cap>\" not declared in
+hecaton-plugin.yaml" }`. No fixture carries this status: `FakeHost` (the
+SDK's test double, §6) does not gate capabilities, so it cannot be
+exercised through the SDK conformance test; it is asserted against the real
+daemon by `crates/hecaton-server/tests/events_it.rs` (§6).
 
 | Route | Capability | Request | Response | Status | Fixture |
 |---|---|---|---|---|---|
@@ -46,10 +57,10 @@ route runs, with a client error naming the missing capability.
 | `GET fleets/{name}` | `fleets` | — | `FleetRecord` | 200 | (shape as in `fleets.json`'s `response[0]`) |
 | `GET fleets/{name}`, unknown name | `fleets` | — | `{ error }` | 404 | `fleet-missing.json` |
 | `POST agents/{fleet}/{crew}/{agent}/actions` | `actions` | one of the three action shapes below | `{}` | 200 | `action.json` |
-| `POST agents/…/actions`, agent not active for this plugin | `actions` | — | `{ error }` | 404 | (same status as `fleet-missing.json`) |
+| `POST agents/…/actions`, agent not active for this plugin | `actions` | — | `{ "error": "plugin is not active for agent <id>" }` | 404 | (same status as `fleet-missing.json`; asserted by `events_it.rs`, §6) |
 | `GET kv?prefix=` | `kv` | — | `{ keys }` | 200 | `kv-list.json` |
 | `GET kv/{key}` | `kv` | — | raw bytes | 200 | `kv-get.json` |
-| `GET kv/{key}`, unknown key | `kv` | — | `{ error }` | 404 | (same status as `fleet-missing.json`) |
+| `GET kv/{key}`, unknown key | `kv` | — | `{ "error": "no such key" }` | 404 | (same status as `fleet-missing.json`) |
 | `PUT kv/{key}?secret=<bool>` | `kv` | raw bytes | `{}` | 200 | `kv-put.json` |
 | `DELETE kv/{key}` | `kv` | — | `{}` | 200 | (same success shape as `PUT`) |
 
@@ -65,7 +76,8 @@ shape for one fleet.
 - `{ "action": "restart" }`
 - `{ "action": "stop" }`
 
-**KV**: keys match `[A-Za-z0-9._/-]{1,200}` with no `..` segment. `PUT` and
+**KV**: keys match `[A-Za-z0-9._/-]{1,200}`, with no empty segment and no
+bare `.` or `..` segment. `PUT` and
 `GET` bodies are raw bytes, content-type `application/octet-stream`;
 `?secret=true` on `PUT` stores the value through the daemon's vault.
 `?prefix=` on the list route filters returned `keys` by prefix
@@ -154,3 +166,9 @@ Two tests replay every fixture:
   `intercept` fixtures' `request` bodies to
   `hecaton_server::testing::stub_plugin` and checks the bytes it recorded,
   and that the parsed verdict matches the fixture's `response`.
+
+Two statuses no fixture carries because `hecaton_plugin_sdk::testing::FakeHost`
+does not gate capabilities or activation the way the real daemon does — the
+403 capability gate and the 404 `plugin is not active for agent …` on
+`agents/…/actions` (§3) — are asserted against the real daemon by
+`crates/hecaton-server/tests/events_it.rs`.
