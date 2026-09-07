@@ -15,6 +15,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 
 use crate::api::ApiError;
 use crate::plugins::PluginAddr;
+use crate::sessions::MOUNT_PREFIX;
 
 pub type HttpClient = Client<HttpConnector, Body>;
 
@@ -80,10 +81,37 @@ pub fn response_headers(src: &HeaderMap, upgraded: bool) -> HeaderMap {
     filtered(src, &DROPPED_RESPONSE, upgraded)
 }
 
+/// The `<rest>` of `/v1/plugins/<name>/<rest>`, taken from the request's
+/// raw path and left percent-encoded. axum's `Path` extractor decodes
+/// what it captures, and a decoded segment spliced back into a URI means
+/// something else: `%3F` would start a query, `%2F` would split a
+/// segment, `%20` would not parse at all. The mount therefore takes the
+/// path apart itself and forwards the bytes the client actually sent.
+pub fn forwarded_rest(path: &str) -> &str {
+    path.strip_prefix(MOUNT_PREFIX)
+        .and_then(|s| s.split_once('/'))
+        .map_or("", |(_name, rest)| rest)
+}
+
+/// A segment that means `.` or `..`, its `%2e` spellings included — RFC
+/// 3986 normalization decodes those before it removes dot segments, so a
+/// plugin that normalizes would resolve them out of `/v1/routes` while
+/// holding its own bearer.
+fn dot_segment(segment: &str) -> bool {
+    matches!(
+        segment.to_ascii_lowercase().replace("%2e", ".").as_str(),
+        "." | ".."
+    )
+}
+
 /// `http://<listen>/v1/routes` for an empty `rest` (axum answers a nested
-/// router's `/` there, not at `/v1/routes/`), else `/v1/routes/<rest>`,
-/// with the query string as it came.
+/// router's `/` there, not at `/v1/routes/`), else `/v1/routes/<rest>`
+/// with `rest` as the client encoded it, and the query string as it came.
+/// A `.` or `..` segment is refused rather than forwarded.
 pub fn upstream_uri(listen: &str, rest: &str, query: Option<&str>) -> Result<Uri, String> {
+    if rest.split('/').any(dot_segment) {
+        return Err("path: . and .. segments are not forwarded".to_string());
+    }
     let path = if rest.is_empty() {
         "/v1/routes".to_string()
     } else {
@@ -102,7 +130,6 @@ pub async fn forward(
     client: &HttpClient,
     addr: &PluginAddr,
     name: &str,
-    rest: &str,
     mut req: Request,
 ) -> Response {
     // Taken before the request is consumed: hyper stores the client
@@ -116,6 +143,7 @@ pub async fn forward(
                 .into_response();
         }
     };
+    let rest = forwarded_rest(parts.uri.path());
     let uri = match upstream_uri(&addr.listen, rest, parts.uri.query()) {
         Ok(u) => u,
         Err(e) => return ApiError::new(StatusCode::BAD_REQUEST, e).into_response(),
@@ -264,7 +292,48 @@ mod tests {
                 .to_string(),
             "http://127.0.0.1:4000/v1/routes/agents/f/c/a/ws?cols=80"
         );
+        // what the client encoded is what the plugin receives: a `%3F`
+        // stays one path byte instead of starting a query, and a `%20`
+        // parses where a decoded space would not
+        assert_eq!(
+            upstream_uri("127.0.0.1:4000", "a%20b%3Fx=1%2Fy", None)
+                .unwrap()
+                .to_string(),
+            "http://127.0.0.1:4000/v1/routes/a%20b%3Fx=1%2Fy"
+        );
         assert!(upstream_uri("127.0.0.1:4000", "a b", None).is_err());
+        for rest in [
+            "..",
+            "../hook",
+            "a/../../hook",
+            "%2e%2e/hook",
+            "a/%2E%2e",
+            ".",
+            "a/./b",
+        ] {
+            assert_eq!(
+                upstream_uri("127.0.0.1:4000", rest, None),
+                Err("path: . and .. segments are not forwarded".to_string()),
+                "{rest}"
+            );
+        }
+        // only a whole segment is a dot segment
+        assert!(upstream_uri("127.0.0.1:4000", "..a/b..", None).is_ok());
+    }
+
+    #[test]
+    fn the_rest_is_taken_from_the_raw_path_undecoded() {
+        assert_eq!(forwarded_rest("/v1/plugins/web/"), "");
+        assert_eq!(forwarded_rest("/v1/plugins/web/a/b"), "a/b");
+        assert_eq!(
+            forwarded_rest("/v1/plugins/web/a%20b%3Fx=1"),
+            "a%20b%3Fx=1",
+            "axum's Path would have decoded these"
+        );
+        assert_eq!(forwarded_rest("/v1/plugins/web/../hook"), "../hook");
+        // never reached through the mount's routes, but never a panic
+        assert_eq!(forwarded_rest("/v1/plugins/web"), "");
+        assert_eq!(forwarded_rest("/v1/fleets"), "");
     }
 
     proptest! {

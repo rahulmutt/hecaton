@@ -157,6 +157,11 @@ async fn routes_plugin(expect: String) -> String {
                     }
                 })
             }),
+        )
+        // anything else echoes the raw path, so a test can see exactly what
+        // the proxy put on the wire
+        .fallback(
+            |req: axum::extract::Request| async move { format!("path={}", req.uri().path()) },
         );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listen = listener.local_addr().unwrap().to_string();
@@ -254,6 +259,33 @@ async fn the_mount_proxies_plain_requests_and_websockets_and_filters_headers() {
         .raw("POST", "/v1/plugins/web/post", &admin, Some(&big[..]));
     assert_eq!(s, 413);
 
+    // the rest of the path crosses as the client encoded it, and a dot
+    // segment is refused rather than resolved by the plugin
+    let (s, _, text) = w
+        .api
+        .raw("GET", "/v1/plugins/web/a%20b%3Fx=1%2Fy", &admin, None);
+    assert_eq!(
+        (s, text.as_str()),
+        (200, "path=/v1/routes/a%20b%3Fx=1%2Fy"),
+        "axum's Path would have decoded this into a query and a separator"
+    );
+    for bad in [
+        "/v1/plugins/web/../hook",
+        "/v1/plugins/web/%2e%2e/hook",
+        "/v1/plugins/web/a/%2E%2E/b",
+        "/v1/plugins/web/./a",
+    ] {
+        let (s, _, text) = w.api.raw("GET", bad, &admin, None);
+        assert_eq!(
+            (s, text.as_str()),
+            (
+                400,
+                "{\"error\":\"path: . and .. segments are not forwarded\"}"
+            ),
+            "{bad}"
+        );
+    }
+
     // a WebSocket through the mount: upgraded on both sides, bytes copied
     let url = format!(
         "{}/v1/plugins/web/echo",
@@ -348,6 +380,10 @@ async fn the_mount_proxies_plain_requests_and_websockets_and_filters_headers() {
     let (s, _, _) = w.api.raw("GET", "/v1/fleets", &[("Cookie", &cookie)], None);
     assert_eq!(s, 401, "the cookie opens the mount and nothing else");
 
+    // an unauthenticated guess mints no label of its own
+    let (s, _, _) = w.api.raw("GET", "/v1/plugins/guessed-name/", &[], None);
+    assert_eq!(s, 401);
+
     let (_, m) = w.api.call("GET", "/metrics", None, None);
     let m = m.as_str().unwrap();
     assert!(
@@ -359,8 +395,22 @@ async fn the_mount_proxies_plain_requests_and_websockets_and_filters_headers() {
         "{m}"
     );
     assert!(
-        m.contains("hecaton_plugin_proxy_requests_total{plugin=\"unknown\",status=\"404\"}")
-            || m.contains("hecaton_plugin_proxy_requests_total{plugin=\"nope\",status=\"404\"} 1"),
+        m.contains("hecaton_plugin_proxy_requests_total{plugin=\"web\",status=\"400\"} 4"),
         "{m}"
+    );
+    // every name the caller made up, every routeless plugin and every
+    // request that never authenticated land on the one `unknown` series
+    // (`flow` has no routes, `nope` and `guessed-name` do not exist)
+    assert!(
+        m.contains("hecaton_plugin_proxy_requests_total{plugin=\"unknown\",status=\"404\"} 2"),
+        "{m}"
+    );
+    assert!(
+        m.contains("hecaton_plugin_proxy_requests_total{plugin=\"unknown\",status=\"401\"} 5"),
+        "{m}"
+    );
+    assert!(
+        !m.contains("plugin=\"nope\"") && !m.contains("plugin=\"guessed-name\""),
+        "an unauthenticated or unknown name never becomes a label: {m}"
     );
 }

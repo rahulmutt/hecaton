@@ -153,8 +153,10 @@ A manifest with `routes: true` mounts the plugin's own HTTP surface at
 `/v1/plugins/<name>/…` on the daemon's listener, authenticated by the
 admin bearer or a browser session cookie (plugins spec §18.2). The daemon
 forwards `/v1/plugins/<name>/` to `GET|POST|… http://<listen>/v1/routes`
-and `/v1/plugins/<name>/<rest>?<query>` to `/v1/routes/<rest>?<query>`,
-with the method, the body (1 MiB cap, 413 beyond), and the request
+and `/v1/plugins/<name>/<rest>?<query>` to `/v1/routes/<rest>?<query>`
+— `<rest>` crosses percent-encoded exactly as the client wrote it, and a
+`.` or `..` segment (its `%2e` spellings included) is refused with 400
+rather than forwarded — with the method, the body (1 MiB cap, 413 beyond), and the request
 headers minus `Authorization`, `Cookie`, `Host` and the hop-by-hop set
 (`Connection` and `Upgrade` are kept on an upgrade request). Two headers
 are added: `Authorization: Bearer <HECATON_PLUGIN_TOKEN>` (§2) and
