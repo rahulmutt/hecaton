@@ -161,11 +161,9 @@ credentials, hook input, or sandbox rules.
 - Flow's state is KV `state/<agent>` (`plugins/flow/kv/state/<fleet>/<crew>/<agent>`
   on disk). A plugin or daemon restart resumes it; `down`, a config change
   or dropping the block resets it (`deactivate` deletes the key). To reset
-  by hand: `down` and `up`. A rejected `update` also resets it: `Daemon::apply`
-  deactivates a changed pair before offering the new config to the plugin
-  (§16.2), so a bad config that gets rejected still comes back through
-  `restore_pairs` with the key already gone, and the old config resumes at
-  `initial`.
+  by hand: `down` and `up`. A changed config arrives as an `activate` in
+  place, with no `deactivate` before it, and resets through the hash check;
+  a rejected `update` therefore changes nothing (§17.9).
 - `Plugin::metrics` returns `Option<&Metrics>`; register families through
   `Metrics` (short names, the SDK adds `hecaton_plugin_<name>_`). A plugin
   in another language must apply the prefix itself or its whole scrape is

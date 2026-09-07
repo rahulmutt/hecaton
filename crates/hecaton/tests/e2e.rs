@@ -1126,13 +1126,14 @@ fn flow_journey() {
         hecaton_api::ActivationState::Active,
         "the rejected update leaves the activation row unchanged"
     );
-    // but the flow state itself is not preserved: Daemon::apply deactivates
-    // the changed pair (deleting the KV key) before offering the new config
-    // to the plugin (§16.2 order x §17.3 delete-on-deactivate), so
-    // restore_pairs brings the old config back with no stored state to
-    // resume and it starts over at `initial`
-    let stored = wait_file_until(&kv, |s| s.contains("\"working\""));
-    assert!(stored.contains("\"state\":\"working\""), "{stored}");
+    // and the flow state too: the changed pair was offered its new config by
+    // an `activate` in place, no `deactivate` before it (§16.2), so the
+    // rejection touched neither the plugin's entry nor the KV key
+    let stored = fs::read_to_string(&kv).unwrap();
+    assert!(
+        stored.contains("\"state\":\"review\""),
+        "a rejected update keeps the flow state: {stored}"
+    );
 
     // down deactivates: the key is deleted
     let out = w.ok(&["down", "e2e", "--keep", "--timeout", "60s"]);
