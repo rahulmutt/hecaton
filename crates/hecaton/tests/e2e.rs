@@ -162,15 +162,20 @@ impl Drop for World {
     }
 }
 
-fn fleet_yaml(bare: &Path, bob_model: Option<&str>) -> String {
+fn fleet_yaml(bare: &Path, bob_model: Option<&str>, plugins: Option<&str>) -> String {
     let bob = match bob_model {
         Some(m) => {
             format!("      bob: {{ claude: {{ resume: true, settings: {{ model: {m} }} }} }}\n")
         }
         None => "      bob: { claude: { resume: true } }\n".to_string(),
     };
+    // only alice takes plugins; bob is the pass-through control
+    let alice = match plugins {
+        Some(p) => format!("      alice: {{ plugins: {p} }}\n"),
+        None => "      alice: {}\n".to_string(),
+    };
     format!(
-        "apiVersion: hecaton/v1\nkind: Fleet\nname: e2e\ndefaults:\n  claude:\n    binary: \"{HECATON}\"\n    args: [dev, fake-claude, \"--verbose\"]\n    settings: {{ model: sonnet }}\n  tools: {{}}\ncrews:\n  c:\n    repo: \"file://{}\"\n    ref: main\n    git: {{ push: false, auth: none }}\n    agents:\n      alice: {{}}\n{bob}",
+        "apiVersion: hecaton/v1\nkind: Fleet\nname: e2e\ndefaults:\n  claude:\n    binary: \"{HECATON}\"\n    args: [dev, fake-claude, \"--verbose\"]\n    settings: {{ model: sonnet }}\n  tools: {{}}\ncrews:\n  c:\n    repo: \"file://{}\"\n    ref: main\n    git: {{ push: false, auth: none }}\n    agents:\n{alice}{bob}",
         bare.display()
     )
 }
@@ -186,6 +191,26 @@ fn hook_secrets(w: &World) -> Vec<String> {
     }
     assert!(!out.is_empty());
     out
+}
+
+/// Polls for a file to exist and be non-empty, up to 30 s. The plugin
+/// protocol writes these files after the call that triggered them has
+/// already returned, so a single read races the writer.
+fn wait_file(path: &Path) -> String {
+    let start = Instant::now();
+    loop {
+        if let Ok(s) = fs::read_to_string(path)
+            && !s.trim().is_empty()
+        {
+            return s;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "{} never appeared",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 #[test]
@@ -237,8 +262,8 @@ fn serve_up_update_down_journey() {
     );
     let v1 = root.join("fleet.yaml");
     let v2 = root.join("fleet2.yaml");
-    fs::write(&v1, fleet_yaml(&bare, None)).unwrap();
-    fs::write(&v2, fleet_yaml(&bare, Some("opus"))).unwrap();
+    fs::write(&v1, fleet_yaml(&bare, None, None)).unwrap();
+    fs::write(&v2, fleet_yaml(&bare, Some("opus"), None)).unwrap();
 
     // serve -d
     let out = w.ok(&[
@@ -405,11 +430,13 @@ fn serve_up_update_down_journey() {
     );
 }
 
-fn plugin_package(dir: &Path) {
+fn plugin_package(dir: &Path, manifest_extra: &str) {
     fs::create_dir_all(dir).unwrap();
     fs::write(
         dir.join("hecaton-plugin.yaml"),
-        "apiVersion: hecaton/v1\nkind: Plugin\nname: hello\nversion: 0.1.0\nprotocol: 1\nstart: serve\nroutes: false\n",
+        format!(
+            "apiVersion: hecaton/v1\nkind: Plugin\nname: hello\nversion: 0.1.0\nprotocol: 1\nstart: serve\nroutes: false\n{manifest_extra}"
+        ),
     )
     .unwrap();
     // an empty tool table (nothing to download) and a task that runs this
@@ -419,6 +446,29 @@ fn plugin_package(dir: &Path) {
         format!("[tools]\n\n[tasks.serve]\nrun = \"'{HECATON}' dev fake-plugin\"\n"),
     )
     .unwrap();
+}
+
+/// Waits (up to 180 s, the toolchain install is real) for `plugin list` to
+/// show `name` in phase `ready`, and returns that listing. On timeout it
+/// prints the plugin's own logs — the sandbox is where a start fails.
+fn wait_plugin_ready(w: &World, name: &str, plugin_dir: &Path) -> String {
+    let start = Instant::now();
+    loop {
+        let list = w.ok(&["plugin", "list"]);
+        if list
+            .lines()
+            .any(|l| l.starts_with(name) && l.contains("ready"))
+        {
+            return list;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(180),
+            "plugin never became ready; last list:\n{list}\nnono.log:\n{}\nmise.toolchain.log:\n{}",
+            fs::read_to_string(plugin_dir.join("logs/nono.log")).unwrap_or_default(),
+            fs::read_to_string(plugin_dir.join("logs/mise.toolchain.log")).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 /// Plugins spec §13 item 1, "done when": a trivial SDK plugin reaches
@@ -452,7 +502,7 @@ fn plugin_hello_journey() {
     fs::create_dir_all(&cfg).unwrap();
     fs::write(cfg.join("mise.toml"), "[tools]\n").unwrap();
     let pkg = root.join("hello-pkg");
-    plugin_package(&pkg);
+    plugin_package(&pkg, "");
     fs::write(
         cfg.join("plugins.yaml"),
         format!(
@@ -478,20 +528,7 @@ fn plugin_hello_journey() {
     let plugin_dir = w.state().join("plugins/hello");
 
     // Ready through hello, with a real loopback listen address
-    let start = Instant::now();
-    let list = loop {
-        let list = w.ok(&["plugin", "list"]);
-        if list.contains("ready") {
-            break list;
-        }
-        assert!(
-            start.elapsed() < Duration::from_secs(180),
-            "plugin never became ready; last list:\n{list}\nnono.log:\n{}\nmise.toolchain.log:\n{}",
-            fs::read_to_string(plugin_dir.join("logs/nono.log")).unwrap_or_default(),
-            fs::read_to_string(plugin_dir.join("logs/mise.toolchain.log")).unwrap_or_default()
-        );
-        std::thread::sleep(Duration::from_millis(250));
-    };
+    let list = wait_plugin_ready(&w, "hello", &plugin_dir);
     assert!(list.contains("hello  0.1.0    ready"), "{list}");
     assert!(list.contains("127.0.0.1:"), "{list}");
     assert!(
@@ -499,7 +536,7 @@ fn plugin_hello_journey() {
         "spec §11.1 row 1 FAILED: a sandboxed plugin could not bind a loopback listener; record the verdict and take the Unix-socket fallback in phase 2: {}",
         fs::read_to_string(plugin_dir.join("scratch/fake-plugin.bind-failed")).unwrap_or_default()
     );
-    let hello = fs::read_to_string(plugin_dir.join("scratch/fake-plugin.hello")).unwrap();
+    let hello = wait_file(&plugin_dir.join("scratch/fake-plugin.hello"));
     assert!(hello.contains("\"greeting\": \"hi\""), "{hello}");
     let rec: FleetRecord = serde_json::from_str(&w.ok(&["status", "hecaton", "--json"])).unwrap();
     assert_eq!(
@@ -614,5 +651,230 @@ fn plugin_hello_journey() {
     let out = w.ok(&["plugin", "remove", "hello", "--purge"]);
     assert!(out.contains("purged"), "{out}");
     assert!(!plugin_dir.exists(), "purge deletes plugins/hello");
+    drop(w);
+}
+
+/// Plugins spec §13 item 2a, "done when": through a real daemon, nono and
+/// tmux, the SDK plugin blocks a PreToolUse and sends text to fake-claude;
+/// activation is pending until the plugin says hello, then active.
+#[test]
+fn plugin_protocol_journey() {
+    let Some(nono) = tool("nono") else {
+        assert!(!require_or_skip("nono", false));
+        return;
+    };
+    for t in ["git", "gh", "mise", "tmux"] {
+        if !require_or_skip(t, tool(t).is_some()) {
+            return;
+        }
+    }
+    let root =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("e2e-protocol-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    if !require_or_skip("landlock", landlock_works(&nono, &root)) {
+        return;
+    }
+    let w = World {
+        home: root.join("home"),
+        socket: format!("hecaton-e2e-protocol-{}", std::process::id()),
+        tmux: tool("tmux").unwrap(),
+    };
+    fs::create_dir_all(&w.home).unwrap();
+    let cfg = w.home.join(".config/hecaton");
+    fs::create_dir_all(&cfg).unwrap();
+    fs::write(cfg.join("mise.toml"), "[tools]\n").unwrap();
+    let pkg = root.join("fake-pkg");
+    plugin_package(
+        &pkg,
+        "hooks:\n  intercept: [PreToolUse, Stop]\n  observe: [SessionStart, Notification, PreToolUse, Stop]\nneeds: [actions, kv]\n",
+    );
+    // the package's manifest names the plugin `fake`
+    let manifest = fs::read_to_string(pkg.join("hecaton-plugin.yaml"))
+        .unwrap()
+        .replace("name: hello", "name: fake");
+    fs::write(pkg.join("hecaton-plugin.yaml"), manifest).unwrap();
+    fs::write(
+        cfg.join("plugins.yaml"),
+        format!(
+            "plugins:\n  - name: fake\n    source: \"{}\"\n",
+            pkg.display()
+        ),
+    )
+    .unwrap();
+
+    // the same bare repo recipe as the first journey
+    let work = root.join("work");
+    fs::create_dir_all(&work).unwrap();
+    git(&work, &["init", "-q", "-b", "main"]);
+    fs::write(work.join("README"), "hi\n").unwrap();
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-q", "-m", "init"]);
+    let bare = root.join("repo.git");
+    git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            &work.display().to_string(),
+            &bare.display().to_string(),
+        ],
+    );
+    let fleet = root.join("fleet.yaml");
+    fs::write(&fleet, fleet_yaml(&bare, None, Some("{ fake: {} }"))).unwrap();
+
+    let out = w.ok(&[
+        "serve",
+        "-d",
+        "--bind",
+        "127.0.0.1:0",
+        "--tmux-socket",
+        &w.socket,
+    ]);
+    assert!(out.contains("http://127.0.0.1:"), "{out}");
+    let plugin_dir = w.state().join("plugins/fake");
+
+    // The plugin has to be `Ready` before `up`: `Daemon::apply` activates
+    // the pair inline only against a plugin that is already listening, and
+    // fake-claude posts its PreToolUse moments after alice starts. A pair
+    // left pending would activate at the next hello — too late to block.
+    wait_plugin_ready(&w, "fake", &plugin_dir);
+
+    // up waits for the plugin's activation too: the plugin must reach
+    // hello (under nono, via mise run) for alice's row to turn active
+    let out = w.ok(&[
+        "up",
+        &fleet.display().to_string(),
+        "--no-host-defaults",
+        "--timeout",
+        "180s",
+    ]);
+    assert!(out.contains("e2e  ready"), "{out}");
+    assert!(out.contains("fake=active"), "{out}");
+    let rec = w.status();
+    assert_eq!(
+        rec.status.agents["e2e/c/alice"].plugins["fake"].state,
+        hecaton_api::ActivationState::Active
+    );
+    assert!(rec.status.agents["e2e/c/bob"].plugins.is_empty());
+    let list = w.ok(&["plugin", "list"]);
+    assert!(list.contains("fake  ") && list.contains("ready"), "{list}");
+    assert!(
+        list.lines()
+            .nth(1)
+            .is_some_and(|l| l.split_whitespace().nth(5) == Some("1")),
+        "ACTIVE column: {list}"
+    );
+    let activations = fs::read_to_string(plugin_dir.join("scratch/activations.jsonl")).unwrap();
+    assert!(
+        activations.contains("\"agent\":\"e2e/c/alice\""),
+        "{activations}"
+    );
+
+    // the PreToolUse block came back to fake-claude through the HTTP hook
+    let reply = wait_file(
+        &w.agent_dir("alice")
+            .join("home/fake-claude.PreToolUse.reply"),
+    );
+    assert!(reply.contains("\"decision\":\"block\""), "{reply}");
+    assert!(
+        reply.contains("fake-plugin: no recursive deletes"),
+        "{reply}"
+    );
+    let bob_reply = wait_file(&w.agent_dir("bob").join("home/fake-claude.PreToolUse.reply"));
+    assert_eq!(bob_reply.trim(), "{}", "bob has no plugin: pass-through");
+
+    // the Stop verdict's send_text reached alice's stdin through tmux
+    let stdin = wait_file(&w.agent_dir("alice").join("home/fake-claude.stdin"));
+    assert!(stdin.contains("fake-plugin says hi"), "{stdin}");
+
+    // observers saw alice's events, in order, and none of bob's
+    let events = wait_file(&plugin_dir.join("scratch/events.jsonl"));
+    let names: Vec<String> = events
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .map(|v| {
+            format!(
+                "{} {}",
+                v["agent"].as_str().unwrap(),
+                v["name"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert!(
+        names.iter().all(|n| n.starts_with("e2e/c/alice ")),
+        "{names:?}"
+    );
+    let idx = |name: &str| {
+        names
+            .iter()
+            .position(|n| n.ends_with(name))
+            .unwrap_or_else(|| panic!("{name} missing in {names:?}"))
+    };
+    assert!(idx(" SessionStart") < idx(" PreToolUse") && idx(" PreToolUse") < idx(" Stop"));
+
+    // metrics: the chain ran, the action ran, nothing failed
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let url = fs::read_to_string(w.state().join("server/endpoint"))
+        .unwrap()
+        .trim()
+        .to_string();
+    let metrics = agent
+        .get(format!("{url}/metrics"))
+        .call()
+        .unwrap()
+        .body_mut()
+        .read_to_string()
+        .unwrap();
+    assert!(
+        metrics.contains(
+            "hecaton_plugin_events_total{event=\"PreToolUse\",mode=\"intercept\",plugin=\"fake\"} 1"
+        ),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("hecaton_plugin_actions_total{action=\"send_text\",plugin=\"fake\"} 1"),
+        "{metrics}"
+    );
+    assert!(
+        !metrics.contains("hecaton_plugin_intercept_failures_total{plugin=\"fake\""),
+        "{metrics}"
+    );
+
+    // no token leaks (the plugin's, the agents', the admin's)
+    let profile = fs::read_to_string(plugin_dir.join("nono-profile.json")).unwrap();
+    let token = profile
+        .split("\"HECATON_PLUGIN_TOKEN\": \"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap()
+        .to_string();
+    let log = fs::read_to_string(w.state().join("server/server.log")).unwrap();
+    assert!(!log.contains(&token));
+    for s in hook_secrets(&w) {
+        assert!(!log.contains(&s), "hook secret in server.log");
+    }
+
+    // removing the plugin while the fleet runs: alice's row disappears with the plugin
+    w.ok(&["plugin", "remove", "fake"]);
+    let start = Instant::now();
+    loop {
+        let rec = w.status();
+        if rec.status.agents["e2e/c/alice"].plugins.is_empty() {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "row still there: {rec:?}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    w.ok(&["down", "e2e", "--purge", "--timeout", "60s"]);
     drop(w);
 }
