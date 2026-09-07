@@ -31,15 +31,17 @@ against what was declared.
   `FileFleetStore` with an encrypted `secrets.enc`, axum routes, hook ingress,
   `/metrics`, `plugins/`: `plugins.yaml` sync, package install, `PluginHost`,
   `PluginRegistry` (activations, interceptor order), `PluginEventHandler` (the
-  chain), `PluginKv`. Depends on `core` + `api` only; the binary hands it the
-  runtime.
+  chain), `PluginKv`, `sessions.rs` (login codes and cookies), `proxy.rs` (the
+  mount), `attach.rs` and `watch.rs` (the two streams). Depends on `core` +
+  `api` only; the binary hands it the runtime.
 - `hecaton` — the binary, and the only crate allowed to see both ports and
   adapters; it does the wiring.
 - `hecaton-runtime` — driven adapters over git, gh, mise, nono, tmux. One
   module per materialization step; every path from StateLayout, every binary
   from ToolPaths; never reads the process environment.
 - `hecaton-plugin-sdk` — the plugin side of the host protocol; depends on
-  `api` only. `Host` (async, one method per route), the `Plugin` trait and
+  `api` only. `Host` (async, one method per route, including
+  `Host::attach`/`watch_fleets`), the `Plugin` trait (`Plugin::routes`) and
   `serve`, `testing::FakeHost`, `Metrics` (the prefixing registry) and
   `testing::Harness`.
 - `hecaton-plugin-flow` — the first in-tree plugin, on the SDK: a per-agent
@@ -47,6 +49,10 @@ against what was declared.
   `plugins.flow` block, `machine.rs` is the pure step, `plugin.rs` owns the
   agents, the KV-mirrored state and the metrics). Plugin crates depend on
   the SDK and `api` only.
+- `hecaton-plugin-web` — the second in-tree plugin: a per-agent `enabled`
+  flag (`config.rs`), a cache fed by `fleets/watch` (`state.rs`), the
+  index, terminal page and the bridge to the daemon's attach on a
+  vendored xterm.js (`routes.rs`, `assets/`).
 
 ## How it flows
 **Config (Phase 1):** `read` (file.rs) → `resolve` (resolve.rs): for each agent fold
@@ -109,6 +115,21 @@ hold sets the verdict's keys, carries `send`/`action` as verdict actions,
 and moves the state — written back to KV before the verdict returns.
 `mise run package-plugins` assembles `target/plugins/flow/`, the directory
 source the e2e loads.
+
+**Proxy, attach, watch, web (Spec B, phase 3):** a manifest with `routes:
+true` mounts the plugin under `/v1/plugins/<name>/`: the daemon forwards
+to `<listen>/v1/routes[/<rest>]` with the plugin's own token and
+`X-Hecaton-Forwarded-Prefix`, strips credentials and hop-by-hop headers,
+and passes a 101 through as raw bytes. A browser gets in through `hecaton
+plugin open <name>`: a 60 s single-use code becomes a 12 h in-memory
+session cookie, accepted on the mount from the daemon's origin only.
+Every daemon → plugin call now carries the plugin's own token and the SDK
+router checks it. `GET /v1/plugin-host/agents/{id}/attach` bridges a
+WebSocket to `AgentRunner::attach` — on tmux a throwaway session grouped
+with the crew's, in a `portable-pty` PTY — and `fleets/watch` sends the
+whole fleets list on every actor snapshot or activation change. `web`
+lists the agents whose `plugins.web` block enables it, with phases from a
+`fleets/watch`-fed cache, and bridges each browser tab to one attach.
 
 ## Non-obvious decisions
 - **Merge is a left fold, not associative.** `null` means "delete relative to the
@@ -206,3 +227,27 @@ source the e2e loads.
 - **Plugin metrics are re-exported only under `hecaton_plugin_<name>_`.** A
   body with any other family is dropped whole, so a plugin cannot spoof the
   daemon's own series.
+- **The proxy is a byte-level passthrough.** hyper's legacy client
+  forwards any method and streams responses; a 101 is upgraded on both
+  sides and `copy_bidirectional` does the rest, so the daemon parses no
+  WebSocket frame it does not itself terminate and any subprotocol works
+  (§18.1). The root of a mount forwards to `/v1/routes` without a slash:
+  axum answers a nested router's `/` there.
+- **The admin token never enters the browser.** A single-use login code,
+  an in-memory session, an `HttpOnly; SameSite=Strict` cookie scoped to
+  `/v1/plugins/`, and a same-origin check on every cookie request (§18.2).
+- **The daemon presents the plugin's own token.** A plugin's listener is
+  a loopback port any local process can reach; the token it already holds
+  is what tells the daemon apart (§18.3). Still protocol 1.
+- **An attach is a grouped tmux session, set `destroy-unattached` after
+  the client is on it.** Attaching the crew session would flip the
+  operator's current window; a grouped session has its own. tmux 3.7c
+  destroys a detached session the instant the option lands, so the
+  create, select, set sequence runs in the PTY with the client attached.
+  `kill-session` on the crew alone leaves windows alive in the group, so
+  `stop_crew` kills the group (§18.4).
+- **`fleets/watch` frames are the whole list.** A consumer replaces its
+  state and never diffs or handles removals; the daemon sends only when
+  the list differs from the last frame (§18.4).
+- **The web plugin never calls `GET fleets`.** Its index comes from the
+  watch-fed cache alone, so a correct index is the watch's test (§18.5).

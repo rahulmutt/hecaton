@@ -470,9 +470,9 @@ brainstorm" line is left as history.
 | Assumption | Fallback |
 |---|---|
 | a nono profile can let the plugin bind a loopback listener (`network.open_port` or a listen-side equivalent) | **Verified 2026-09-06** (nono 0.75.0, e2e plugin_hello_journey): dev fake-plugin binds 127.0.0.1:0 inside the profile and reports it in hello; the Unix-socket fallback is not needed. |
-| `ttyd --base-path` works behind two WebSocket proxies | `web` embeds xterm.js and a WS bridge and drops `ttyd` |
-| tmux `attach-session` on the private socket gives a clean PTY for `attach` (via `portable-pty` or `openpty`) | `pipe-pane` for output and `send-keys` for input, no resize |
-| hecaton's `hyper`/`hyper-util` WebSocket upgrade passthrough works for `axum`'s upgrade path | `tokio-tungstenite` on both sides with frame-level copying |
+| `ttyd --base-path` works behind two WebSocket proxies | **Not used** (2026-09-07): the web plugin serves a vendored xterm.js and bridges the attach itself (§18.5). |
+| tmux `attach-session` on the private socket gives a clean PTY for `attach` (via `portable-pty` or `openpty`) | **Verified 2026-09-07 (the day Task 4's test first passed)** (tmux 3.7c, portable-pty 0.9.0, `tmux_it::attach_streams_the_pane…`): a grouped session attached in a PTY streams the pane, takes input and resizes, and dies with the stream. |
+| hecaton's `hyper`/`hyper-util` WebSocket upgrade passthrough works for `axum`'s upgrade path | **Verified 2026-09-07 (the day Task 3's test first passed)** (hyper-util 0.1.20, `browser_it::the_mount_proxies…`): a WebSocket echo through the mount round-trips. |
 
 ## 12. Corrections to earlier specs
 
@@ -1172,3 +1172,70 @@ as "not used, xterm.js chosen".
 **Out of scope, stated.** No `hecaton attach` CLI, no persistent sessions,
 no logout route, no browser launch, no TLS, no live-push index. A plugin's
 `/v1/routes/*` is the only browser surface.
+
+### 18.7 Refinements from the phase 3 plan (2026-09-07)
+
+Where the phase 3 implementation plan refined this section:
+
+- **`PluginAddr { listen, token }`** replaces the bare listen address in
+  every daemon → plugin call; the registry learns the token at `hello`
+  (`set_listen(name, listen, token)`), `ready_addr` hands both out, and
+  `Debug` redacts the token (§18.3).
+- **The root of a mount forwards to `/v1/routes`, no trailing slash**:
+  axum's `nest` answers the nested `/` at `/v1/routes` and 404s
+  `/v1/routes/`; `/v1/plugins/<name>` without a slash stays the purge
+  route (§18.2).
+- **`destroy-unattached` is set after the client is attached**, in one
+  command sequence inside the PTY (`new-session -t =<crew> -s
+  hecaton-attach-<hex> ; select-window -t =<agent> ; set-option
+  destroy-unattached on ; set-option status off`): tmux 3.7c destroys a
+  detached session the moment the option lands (§18.4).
+- **`FleetWatch::next` returns `Vec<FleetRecord>` and never ends**;
+  drop the watch to stop (§18.4). **`Host` is `Clone`**; **`Plugin::routes`
+  defaults to `None`**.
+- **The login `to` path is `[A-Za-z0-9/._~-]` under `/v1/plugins/`**, so
+  the login URL carries it unencoded (§18.2).
+- **The proxy's status counter labels an unparseable plugin name
+  `unknown`** so guesses cannot grow the series.
+- **Eighteen fixtures**: `activate-bad-token` (Task 1), `routes`,
+  `attach-resize` and `fleets-watch` (Task 6); the last two carry
+  `transport: "websocket"` and one `frame`, and are asserted by the SDK's
+  stream test rather than replayed over HTTP.
+- **`StubScript.expect_token`** makes the server's stub plugin refuse the
+  wrong bearer, so `protocol_it` proves the daemon sends it.
+- **The web plugin's index polls every 2 s** and renders polled rows with
+  `textContent`; the terminal page sends a resize on open, on fit and on
+  window resize (§18.5).
+- **`hecaton plugin open` prints only.** No browser is launched.
+- **The §18.6 watch property test is not written**: with every frame the
+  whole list, "a consumer that replaces its state ends equal to `GET
+  fleets`" holds by construction; `streams_it` asserts the frames the
+  daemon sends and `state.rs` the cache that replaces on each.
+- **The login `to` path rejects any `.` or `..` segment** (a browser
+  normalizes them out of the `Location` path per RFC 3986 and could walk
+  the redirect back out of the mount).
+- **The proxy forwards `<rest>` from the raw request path, encoding
+  preserved** (`%20`, `%2F`, `%3F` cross verbatim), and answers 400 to any
+  `.`/`..` segment including `%2e` spellings; axum's decoded path capture
+  is used for routing only.
+- **`hecaton_plugin_proxy_requests_total{plugin}` is labelled with the
+  registry-resolved name only for an authenticated request to an
+  installed `routes: true` plugin**; every other request (unauthenticated,
+  unknown, unparseable, `routes: false`) is counted under
+  `plugin="unknown"`, so an unauthenticated caller cannot mint labels.
+- **`apply`'s rejection path bumps the watch tick after `restore_pairs`
+  writes the rolled-back rows**, so a rejected activation is a watch
+  frame.
+- **The attach bridge performs the PTY write on `spawn_blocking`** (a PTY
+  master write blocks when the tmux client stops draining) and drops the
+  stream on a blocking thread; the resize ioctl stays inline.
+- **`FleetWatch` backs off on every reconnect** — a lost socket as well as
+  a refused handshake — and resets the backoff only after a list frame is
+  received.
+- **The terminal page never sends a resize with a zero dimension**
+  (xterm.js's fit addon reports 0 when its container is hidden, and the
+  daemon closes 1003 on it); the bridge filters non-resize text frames
+  itself.
+- **`hecaton_server::sessions` and the SDK each carry their own
+  `constant_time_eq`/`bearer`**: the SDK depends on `hecaton-api` only, so
+  the copy is forced by the dependency direction.

@@ -22,6 +22,9 @@ credentials, hook input, or sandbox rules.
   (`scripts/verify-claude.sh`); `HECATON_VERIFY_FAKE=1` self-tests it with
   `dev fake-claude`.
 - `lint`, `test`, `fmt`, `precommit`, `audit` — defined in `mise.toml`.
+- `vendor-xterm` is a script, not a task: `scripts/vendor-xterm.sh` re-fetches
+  and verifies the web plugin's assets against
+  `crates/hecaton-plugin-web/assets/VENDOR.md`.
 
 ## Conventions
 - Ports (`Materializer`, `AgentRunner`, `Clock`, `FleetStore`, `EventHandler`)
@@ -174,3 +177,39 @@ credentials, hook input, or sandbox rules.
 - `target/plugins/<name>/` is the *development* package layout (binary in
   `bin/`). A release package pins the binary as a mise tool and ships no
   binary (`docs/plugin-protocol.md` §7).
+- `TmuxRunner::stop_crew` lists sessions with `#{session_group}` and kills
+  every session of the crew's group: an attach (`hecaton-attach-<hex>`)
+  is a session grouped with the crew's, and `kill-session` on the crew
+  alone would leave its windows — and the agents — alive in the group.
+- Never set `destroy-unattached` on an attach session before its client
+  is attached: tmux 3.7c destroys a detached session the moment the option
+  lands. `TmuxRunner::attach` runs create, select-window and both
+  set-options as one command sequence inside the PTY.
+- Every daemon → plugin call carries the plugin's own token; the SDK
+  router 401s without it. A test plugin outside the SDK (a raw axum
+  router) must be given the token or check nothing; `StubScript
+  { expect_token: Some(..) }` makes the server's stub demand it.
+- The root of a plugin mount forwards to `/v1/routes` (no slash); axum's
+  `nest` answers the nested `/` there and 404s `/v1/routes/`. A plugin's
+  `routes()` router registers `/`, not `/index`.
+- Cookie-authenticated proxy requests need `Sec-Fetch-Site: same-origin`
+  or an `Origin` equal to the exact `http://127.0.0.1:<port>` of the login
+  URL; `localhost` is another origin. A test client that sends neither
+  passes (a navigation sends neither).
+- `hecaton plugin open <name>` prints a URL valid for 60 s, once. Opening
+  it twice is a 404 by design.
+- The web plugin's assets are `include_bytes!` of `assets/`; the crate
+  does not build without them. Run `scripts/vendor-xterm.sh` after a
+  fresh clone only if the files are missing — they are committed.
+- `FleetWatch::next` never returns: a plugin that stops wanting frames
+  drops the watch (the web plugin aborts its task at exit).
+- A tmux command sequence inherits the previous command's target, so the
+  attach sequence must never name the crew session; a `select-window -t
+  =f/c:…` in it would make `set-option destroy-unattached on` land on
+  the crew session and destroy it.
+- Enter on the attach PTY is `\r` (what a terminal and xterm.js send);
+  tmux treats `\n` as `C-j`. The `tmux_it` attach test writes `\r`.
+- The vendored minified `xterm.js` trips gitleaks' `generic-api-key` rule
+  on `…Key=void 0`; `.gitleaks.toml` keeps the default ruleset and
+  allowlists exactly the three vendored files by anchored path. Anything
+  else under `assets/` is still scanned.
