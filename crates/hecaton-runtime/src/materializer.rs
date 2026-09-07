@@ -185,7 +185,7 @@ const RM_RF_STEP: Duration = Duration::from_millis(100);
 /// walk started can refill under it. `NotFound` is success; every other
 /// error is returned at once, since only a concurrent writer is worth
 /// waiting for.
-fn retry_rmdir(
+pub(crate) fn retry_rmdir(
     path: &std::path::Path,
     window: Duration,
     step: Duration,

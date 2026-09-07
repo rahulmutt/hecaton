@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 
 use hecaton_api::{AgentPhase, FleetPhase};
 use hecaton_core::FleetRecord;
+use hecaton_runtime::testing::{
+    TempRoot, processes_with_arg_pair, reap_dead_sessions, terminate, tmux_socket_dir,
+};
 
 const HECATON: &str = env!("CARGO_BIN_EXE_hecaton");
 
@@ -140,25 +143,26 @@ impl World {
 }
 
 impl Drop for World {
+    /// Stops the daemon and the tmux server whether or not the pid file is
+    /// still there: a daemon that removed it and then hung in shutdown is
+    /// found by its `--tmux-socket` argument and killed like any other.
     fn drop(&mut self) {
+        let mut pids = processes_with_arg_pair("--tmux-socket", &self.socket);
         let pid_file = self.state().join("server").join("hecaton.pid");
-        if let Ok(pid) = fs::read_to_string(&pid_file) {
-            let pid = pid.trim().to_string();
-            let _ = Command::new("kill").args(["-TERM", &pid]).status();
-            let start = Instant::now();
-            while pid_file.exists() && start.elapsed() < Duration::from_secs(5) {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            // Only escalate if the TERM wait timed out with the daemon
-            // still up; a clean shutdown removes the pid file and there is
-            // nothing left to kill.
-            if pid_file.exists() {
-                let _ = Command::new("kill").args(["-KILL", &pid]).status();
-            }
+        if let Some(pid) = fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+        {
+            pids.push(pid);
         }
+        pids.sort_unstable();
+        pids.dedup();
+        terminate(&pids, Duration::from_secs(5));
         let _ = Command::new(&self.tmux)
             .args(["-L", &self.socket, "kill-server"])
             .status();
+        // `kill-server` leaves the socket file behind; so would we.
+        let _ = fs::remove_file(tmux_sockets().join(&self.socket));
     }
 }
 
@@ -224,6 +228,29 @@ fn wait_file_until(path: &Path, pred: impl Fn(&str) -> bool) -> String {
     }
 }
 
+/// What an interrupted earlier run left behind — a detached daemon, its
+/// tmux server, its socket file, its root under `target/tmp` — is reaped
+/// here, by the pid in each name being dead. A test process nextest or
+/// Ctrl-C kills never runs `World::drop`; this is the net under it.
+fn tmux_sockets() -> PathBuf {
+    tmux_socket_dir(
+        std::env::var_os("TMUX_TMPDIR")
+            .map(PathBuf::from)
+            .as_deref(),
+    )
+}
+
+fn reap_earlier_runs() {
+    let Some(tmux) = tool("tmux") else {
+        return;
+    };
+    for prefix in ["hecaton-e2e", "hecaton-test"] {
+        for name in reap_dead_sessions(&tmux, &tmux_sockets(), prefix) {
+            eprintln!("reaped {name} from an earlier run");
+        }
+    }
+}
+
 #[test]
 fn serve_up_update_down_journey() {
     let Some(nono) = tool("nono") else {
@@ -235,9 +262,8 @@ fn serve_up_update_down_journey() {
             return;
         }
     }
-    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("e2e-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).unwrap();
+    reap_earlier_runs();
+    let root = TempRoot::new(Path::new(env!("CARGO_TARGET_TMPDIR")), "e2e");
     if !require_or_skip("landlock", landlock_works(&nono, &root)) {
         return;
     }
@@ -496,10 +522,8 @@ fn plugin_hello_journey() {
             return;
         }
     }
-    let root =
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("e2e-plugins-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).unwrap();
+    reap_earlier_runs();
+    let root = TempRoot::new(Path::new(env!("CARGO_TARGET_TMPDIR")), "e2e-plugins");
     if !require_or_skip("landlock", landlock_works(&nono, &root)) {
         return;
     }
@@ -679,10 +703,8 @@ fn plugin_protocol_journey() {
             return;
         }
     }
-    let root =
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("e2e-protocol-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).unwrap();
+    reap_earlier_runs();
+    let root = TempRoot::new(Path::new(env!("CARGO_TARGET_TMPDIR")), "e2e-protocol");
     if !require_or_skip("landlock", landlock_works(&nono, &root)) {
         return;
     }
@@ -948,10 +970,8 @@ fn flow_journey() {
         ));
         return;
     };
-    let root =
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("e2e-flow-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).unwrap();
+    reap_earlier_runs();
+    let root = TempRoot::new(Path::new(env!("CARGO_TARGET_TMPDIR")), "e2e-flow");
     if !require_or_skip("landlock", landlock_works(&nono, &root)) {
         return;
     }

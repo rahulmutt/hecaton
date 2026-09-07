@@ -1,7 +1,7 @@
 //! Shared helpers for the integration tests that drive real tools.
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use hecaton_runtime::{StateLayout, ToolPaths};
 
@@ -29,12 +29,8 @@ pub fn require_or_skip(name: &str, present: bool) -> bool {
 /// A fresh directory under `target/tmp`. Deliberately not `/tmp`: nono's
 /// built-in groups grant `/tmp`, so a sandbox-escape assertion there would
 /// pass vacuously.
-pub fn temp_root(test: &str) -> PathBuf {
-    let root =
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{test}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
-    root
+pub fn temp_root(test: &str) -> hecaton_runtime::testing::TempRoot {
+    hecaton_runtime::testing::TempRoot::new(Path::new(env!("CARGO_TARGET_TMPDIR")), test)
 }
 
 pub fn layout(root: &Path) -> StateLayout {

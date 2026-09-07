@@ -11,6 +11,7 @@ pub mod materializer;
 pub mod plugin;
 pub mod quote;
 pub mod sandbox;
+pub mod testing;
 pub mod tmux;
 pub mod toolchain;
 pub mod tools;

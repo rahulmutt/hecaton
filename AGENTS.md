@@ -88,10 +88,17 @@ credentials, hook input, or sandbox rules.
 - Hook secrets live in `secrets.enc` (vault), the agent's `settings.json` (HTTP
   header) and `nono-profile.json` (`HECATON_HOOK_SECRET` for the relay), all 0600.
 - `hecaton-server` and `hecaton` integration tests (`api_it`, `cli_serve`,
-  `cli_fleet`, `e2e`) bind port 0 and use private tmux sockets; if a run is
-  interrupted, kill leftovers via `server/hecaton.pid` under the test's temp
-  HOME and `tmux -L hecaton-e2e-<pid> kill-server` (the plugin e2e uses
-  socket `hecaton-e2e-plugins-<pid>`).
+  `cli_fleet`, `e2e`) bind port 0 and use private tmux sockets named after
+  the test's pid, and every test root under `target/tmp` is
+  `<prefix>-<pid>` (`hecaton_runtime::testing::TempRoot`). A root removes
+  itself when the test passes and stays for reading when it fails; a run
+  that nextest or Ctrl-C kills (the `.config/nextest.toml` slow-timeout
+  terminates a hung test after three minutes) leaves its detached daemon,
+  tmux server and socket alive, and the next e2e run reaps them by the dead
+  pid in the socket name (`reap_earlier_runs`). To reap by hand:
+  `tmux -L hecaton-e2e-<pid> kill-server` and `kill` the `hecaton serve`
+  whose argv carries that `--tmux-socket` (the plugin e2e uses socket
+  `hecaton-e2e-plugins-<pid>`, the flow e2e `hecaton-e2e-flow-<pid>`).
 - `hecaton` is a reserved fleet name (the plugin fleet). `FleetName` still
   parses it — the reservation lives in `Daemon::apply`/`down` and
   `hecaton_config::resolve`.
