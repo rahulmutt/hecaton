@@ -244,8 +244,9 @@ pub fn fake_plugin_command() -> Result<String> {
             (None, "127.0.0.1:0".to_string())
         }
     };
-    let host = Host::new(env);
-    let resp = host.hello(env!("CARGO_PKG_VERSION"), &listen)?;
+    let host = Host::new(env)?;
+    let rt = tokio::runtime::Runtime::new()?;
+    let resp = rt.block_on(host.hello(env!("CARGO_PKG_VERSION"), &listen))?;
     std::fs::write(
         scratch.join("fake-plugin.hello"),
         serde_json::to_string_pretty(&resp.config)?,
