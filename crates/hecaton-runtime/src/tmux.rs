@@ -13,12 +13,16 @@
 //! one, removes the race (a dead pane refuses `pipe-pane` outright).
 
 use std::collections::BTreeMap;
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use hecaton_core::{
     AgentId, AgentName, AgentRunner, CrewName, CrewRef, FleetName, LaunchPlan, ObservedState,
-    ProcessState, RunnerError,
+    ProcessState, PtyStream, RunnerError,
 };
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 use crate::tools::Cmd;
 
@@ -30,6 +34,89 @@ const WINDOW_FORMAT: &str = "#{window_name}\t#{pane_dead}\t#{pane_pid}\t#{pane_d
 /// agent's window between creation and its first `respawn-window` into the
 /// real script.
 const IDLE_ARGV: [&str; 3] = ["/bin/sh", "-c", "while :; do sleep 3600; done"];
+/// Prefix of the throwaway grouped session one attach creates (plugins
+/// spec §18.4); `observe` ignores it, `stop_crew` kills it with the crew.
+pub const ATTACH_SESSION_PREFIX: &str = "hecaton-attach-";
+const ATTACH_TERM: &str = "xterm-256color";
+static ATTACH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// `hecaton-attach-<8 hex>`, unique per process: the clock, a counter and
+/// the pid folded into 32 bits.
+fn attach_session_name() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    let seq = ATTACH_SEQ.fetch_add(1, Ordering::Relaxed);
+    let mixed = nanos ^ (seq << 32) ^ u64::from(std::process::id());
+    let low = u32::try_from(mixed & 0xffff_ffff).unwrap_or(0);
+    format!("{ATTACH_SESSION_PREFIX}{low:08x}")
+}
+
+/// The session names of `crew`'s group: itself and every session grouped
+/// with it. An ungrouped session's `session_group` is empty.
+pub(crate) fn sessions_in_group(text: &str, crew: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|l| {
+            let (name, group) = l.split_once('\t')?;
+            (name == crew || group == crew).then(|| name.to_string())
+        })
+        .collect()
+}
+
+/// One attached client: a tmux client in a PTY on a throwaway session
+/// grouped with the crew's, so viewers never fight the operator's own
+/// client over the current window. Drop kills the client and the
+/// session; if the daemon dies first, the PTY closes, the client detaches
+/// and tmux's `destroy-unattached` finishes the job.
+pub struct TmuxAttach {
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    /// The port says the writer is taken once; enforced here rather than
+    /// relying on what `portable-pty` does on a second `take_writer`.
+    writer_taken: std::sync::atomic::AtomicBool,
+    tmux: PathBuf,
+    socket: String,
+    session: String,
+}
+
+impl PtyStream for TmuxAttach {
+    fn reader(&self) -> io::Result<Box<dyn Read + Send>> {
+        self.master.try_clone_reader().map_err(io::Error::other)
+    }
+    fn writer(&self) -> io::Result<Box<dyn Write + Send>> {
+        if self.writer_taken.swap(true, Ordering::SeqCst) {
+            return Err(io::Error::other("the writer was already taken"));
+        }
+        self.master.take_writer().map_err(io::Error::other)
+    }
+    fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(io::Error::other)
+    }
+}
+
+impl Drop for TmuxAttach {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = Cmd::new(&self.tmux)
+            .args([
+                "-L".to_string(),
+                self.socket.clone(),
+                "kill-session".to_string(),
+                "-t".to_string(),
+                format!("={}", self.session),
+            ])
+            .run();
+    }
+}
 
 pub struct TmuxRunner {
     pub tmux: PathBuf,
@@ -289,11 +376,21 @@ impl AgentRunner for TmuxRunner {
     }
 
     fn stop_crew(&self, crew: &CrewRef) -> Result<(), RunnerError> {
-        self.run_optional(
-            &crew.to_string(),
-            &["kill-session", "-t", &Self::session_target(crew)],
-        )
-        .map(|_| ())
+        let name = crew.to_string();
+        // `kill-session` on the crew session alone would leave its
+        // windows alive in any grouped attach session (§18.4): every
+        // session of the group goes.
+        let Some(text) = self.run_optional(
+            &name,
+            &["list-sessions", "-F", "#{session_name}\t#{session_group}"],
+        )?
+        else {
+            return Ok(());
+        };
+        for session in sessions_in_group(&text, &name) {
+            self.run_optional(&name, &["kill-session", "-t", &format!("={session}")])?;
+        }
+        Ok(())
     }
 
     fn observe(&self, fleet: &FleetName) -> Result<ObservedState, RunnerError> {
@@ -330,6 +427,74 @@ impl AgentRunner for TmuxRunner {
         }
         Ok(())
     }
+
+    fn attach(&self, agent: &AgentId) -> Result<Box<dyn PtyStream>, RunnerError> {
+        let id = agent.to_string();
+        let crew = agent.crew_ref();
+        let session = attach_session_name();
+        let fail = |stderr: String| RunnerError::Tool {
+            id: id.clone(),
+            subcommand: "attach-session".into(),
+            args: vec![session.clone()],
+            stderr,
+        };
+        // The window must exist: `select-window` on a missing one would
+        // leave the client on the anchor.
+        let known = self
+            .windows(&crew)?
+            .is_some_and(|w| w.contains_key(&agent.agent));
+        if !known {
+            return Err(fail(format!("no window for {agent}")));
+        }
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| fail(format!("openpty: {e}")))?;
+        // One command sequence, with the client attached before
+        // `destroy-unattached` is set: tmux destroys a detached session the
+        // moment that option lands on it.
+        let mut cmd = CommandBuilder::new(&self.tmux);
+        cmd.args([
+            "-L".to_string(),
+            self.socket.clone(),
+            "new-session".to_string(),
+            "-t".to_string(),
+            Self::session_target(&crew),
+            "-s".to_string(),
+            session.clone(),
+            ";".to_string(),
+            "select-window".to_string(),
+            "-t".to_string(),
+            format!("={}", agent.agent),
+            ";".to_string(),
+            "set-option".to_string(),
+            "destroy-unattached".to_string(),
+            "on".to_string(),
+            ";".to_string(),
+            "set-option".to_string(),
+            "status".to_string(),
+            "off".to_string(),
+        ]);
+        cmd.env("TERM", ATTACH_TERM);
+        cmd.cwd("/");
+        let child = pty
+            .slave
+            .spawn_command(cmd)
+            .map_err(|e| fail(format!("spawn: {e}")))?;
+        drop(pty.slave);
+        Ok(Box::new(TmuxAttach {
+            master: pty.master,
+            child,
+            writer_taken: std::sync::atomic::AtomicBool::new(false),
+            tmux: self.tmux.clone(),
+            socket: self.socket.clone(),
+            session,
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -357,6 +522,24 @@ mod tests {
                 .to_string()
                 .contains("expected 4 columns")
         );
+    }
+
+    #[test]
+    fn a_crew_group_is_the_crew_session_and_everything_grouped_with_it() {
+        let text =
+            "f/c\tf/c\nhecaton-attach-1a2b3c4d\tf/c\nf/d\t\ng/c\tg/c\nhecaton-attach-9\tg/c\n";
+        assert_eq!(
+            sessions_in_group(text, "f/c"),
+            vec!["f/c", "hecaton-attach-1a2b3c4d"]
+        );
+        assert_eq!(
+            sessions_in_group(text, "f/d"),
+            vec!["f/d"],
+            "ungrouped: itself"
+        );
+        assert!(sessions_in_group(text, "f/e").is_empty());
+        assert!(attach_session_name().starts_with(ATTACH_SESSION_PREFIX));
+        assert_ne!(attach_session_name(), attach_session_name());
     }
 
     #[test]
