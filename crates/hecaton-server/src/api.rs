@@ -7,22 +7,25 @@ use std::time::Duration;
 
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
+use axum::http::header::{CONTENT_TYPE, LOCATION, SET_COOKIE};
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use hecaton_api::{
     DownQuery, ErrorBody, FleetRequest, FleetSummary, HelloRequest, HelloResponse, PluginStatus,
-    SyncReport,
+    SessionRequest, SessionResponse, SyncReport,
 };
 use hecaton_core::{AgentName, FleetName, FleetRecord, Keep, NameError};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::auth::{RateLimiter, bearer, constant_time_eq};
 use crate::daemon::{Daemon, DaemonError};
 use crate::hooks;
 use crate::plugins::PluginError;
+use crate::sessions::{MOUNT_PREFIX, login_target, set_cookie};
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -118,6 +121,7 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
         .route("/v1/plugins", get(list_plugins))
         .route("/v1/plugins/sync", post(sync_plugins))
         .route("/v1/plugins/{name}", delete(purge_plugin))
+        .route("/v1/sessions", post(create_session))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin))
         .layer(DefaultBodyLimit::max(4 << 20));
     let agents = Router::new()
@@ -133,6 +137,7 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/metrics", get(metrics))
+        .route("/v1/login/{code}", get(login))
         .merge(admin)
         .merge(agents)
         .merge(plugins)
@@ -343,6 +348,67 @@ async fn purge_plugin(
         .map_err(|e: NameError| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
     state.daemon.plugins().purge(&name).await?;
     Ok(Json(json!({})))
+}
+
+/// `POST /v1/sessions`: a single-use login URL for the admin's browser
+/// (plugins spec §18.2). The admin token itself never enters the browser.
+async fn create_session(
+    State(state): State<AppState>,
+    b: Result<Json<SessionRequest>, JsonRejection>,
+) -> Result<Json<SessionResponse>, ApiError> {
+    let req = b
+        .map(|Json(r)| r)
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))?;
+    let to = login_target(req.to.as_deref()).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("to: must be a path under {MOUNT_PREFIX}"),
+        )
+    })?;
+    let code = state.daemon.sessions().issue_code();
+    Ok(Json(SessionResponse {
+        login_url: format!("{}/v1/login/{code}?to={to}", state.daemon.origin()),
+    }))
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct LoginQuery {
+    to: Option<String>,
+}
+
+/// `GET /v1/login/{code}`: the browser's end. A live code becomes a session
+/// cookie and a 303 to `to`; anything else is a plain-text 404 — the page
+/// is for a human who pasted a stale URL, not for a client parsing JSON.
+async fn login(
+    State(state): State<AppState>,
+    code: Result<Path<String>, PathRejection>,
+    q: Result<Query<LoginQuery>, QueryRejection>,
+) -> Response {
+    let to = match q {
+        Ok(Query(q)) => match login_target(q.to.as_deref()) {
+            Some(to) => to,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("to: must be a path under {MOUNT_PREFIX}"),
+                )
+                    .into_response();
+            }
+        },
+        Err(e) => return (StatusCode::BAD_REQUEST, e.body_text()).into_response(),
+    };
+    let Ok(Path(code)) = code else {
+        return (StatusCode::NOT_FOUND, "unknown or expired login code").into_response();
+    };
+    match state.daemon.sessions().redeem(&code) {
+        Some(id) => (
+            StatusCode::SEE_OTHER,
+            [(LOCATION, to), (SET_COOKIE, set_cookie(&id))],
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "unknown or expired login code").into_response(),
+    }
 }
 
 #[cfg(test)]

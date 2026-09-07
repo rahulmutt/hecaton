@@ -25,6 +25,7 @@ use crate::plugins::{
     ActivationRow, CallFailure, PluginClient, PluginError, PluginHost, PluginHostConfig, PluginKv,
     PluginRegistry,
 };
+use crate::sessions::Sessions;
 
 /// The chain handler's hello hook; `PassThrough` has nothing to clear.
 pub trait HelloObserver: Send + Sync {
@@ -58,6 +59,7 @@ pub struct Daemon {
     registry: Arc<PluginRegistry>,
     client: PluginClient,
     kv: Arc<PluginKv>,
+    sessions: Sessions,
     /// One `apply` or `down` at a time *per fleet*: activation and the
     /// actor message must not interleave with another apply of the same
     /// fleet. Every other fleet runs on its own lock — an apply waits for
@@ -150,6 +152,7 @@ impl Daemon {
             registry,
             client,
             kv,
+            sessions: Sessions::new(),
             applying: std::sync::Mutex::new(BTreeMap::new()),
         });
         tokio::spawn(Self::forget_purged(Arc::downgrade(&daemon), purged));
@@ -215,6 +218,16 @@ impl Daemon {
 
     pub fn kv(&self) -> &Arc<PluginKv> {
         &self.kv
+    }
+
+    pub fn sessions(&self) -> &Sessions {
+        &self.sessions
+    }
+
+    /// The daemon's own origin, `http://127.0.0.1:<port>`: the login URL's
+    /// host and the only `Origin` a cookie request may carry (§18.2).
+    pub fn origin(&self) -> &str {
+        &self.ports.hook_url
     }
 
     /// Activation state is a read-time overlay (§16.3): the actor never
