@@ -24,6 +24,7 @@ pub async fn bridge(mut socket: WebSocket, stream: Box<dyn PtyStream>) {
         (Ok(r), Ok(w)) => (r, w),
         (Err(e), _) | (_, Err(e)) => {
             close(&mut socket, CLOSE_ERROR, &format!("attach: {e}")).await;
+            let _ = tokio::task::spawn_blocking(move || drop(stream)).await;
             return;
         }
     };
@@ -47,9 +48,21 @@ pub async fn bridge(mut socket: WebSocket, stream: Box<dyn PtyStream>) {
             },
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Binary(bytes))) => {
-                    if writer.write_all(&bytes).and_then(|()| writer.flush()).is_err() {
-                        close(&mut socket, CLOSE_ERROR, "the window closed").await;
-                        break;
+                    // The writer is a blocking handle on the PTY master: a
+                    // full slave buffer (a stopped client and a paste) would
+                    // pin a tokio worker, so the write waits off the runtime
+                    // and the writer comes back with its result.
+                    match tokio::task::spawn_blocking(move || {
+                        let result = writer.write_all(&bytes).and_then(|()| writer.flush());
+                        (writer, result)
+                    })
+                    .await
+                    {
+                        Ok((w, Ok(()))) => writer = w,
+                        Ok((_, Err(_))) | Err(_) => {
+                            close(&mut socket, CLOSE_ERROR, "the window closed").await;
+                            break;
+                        }
                     }
                 }
                 Some(Ok(Message::Text(text))) => match ResizeFrame::parse(text.as_str()) {

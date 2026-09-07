@@ -5,7 +5,7 @@
 mod support;
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -106,8 +106,27 @@ fn spec(agents: &[(&str, &[(&str, Value)])]) -> FleetSpec {
     }
 }
 
-/// Starts a silent SDK plugin under `name` and says hello with its token.
-async fn start_silent(w: &World, name: &str) -> Host {
+/// Refuses `activate` for a config carrying `reject`, and stays refusing
+/// afterwards — so an apply's rollback cannot re-activate the pair it had
+/// already accepted either, and that pair's row is written `rejected`.
+#[derive(Default)]
+struct Rejecting {
+    poisoned: Mutex<bool>,
+}
+
+impl Plugin for Rejecting {
+    async fn activate(&self, agent: &str, config: Value) -> Result<(), String> {
+        let refuse = config.get("reject").is_some() || *self.poisoned.lock().unwrap();
+        if refuse {
+            *self.poisoned.lock().unwrap() = true;
+            return Err(format!("rejected for {agent}"));
+        }
+        Ok(())
+    }
+}
+
+/// Starts an SDK plugin under `name` and says hello with its token.
+async fn start_plugin<P: Plugin + 'static>(w: &World, name: &str, plugin: Arc<P>) -> Host {
     let env = Env {
         api_url: w.api.base.clone(),
         name: name.into(),
@@ -116,10 +135,15 @@ async fn start_silent(w: &World, name: &str) -> Host {
     };
     let (listener, listen) = bind().await.unwrap();
     let tok = env.token.clone();
-    tokio::spawn(async move { run(listener, Arc::new(Silent), &tok).await });
+    tokio::spawn(async move { run(listener, plugin, &tok).await });
     let host = Host::new(env).unwrap();
     host.hello("0.1.0", &listen).await.unwrap();
     host
+}
+
+/// Starts a silent SDK plugin under `name` and says hello with its token.
+async fn start_silent(w: &World, name: &str) -> Host {
+    start_plugin(w, name, Arc::new(Silent)).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -177,6 +201,56 @@ async fn fleets_watch_sends_the_full_list_on_every_change() {
     );
     assert_eq!(st, 200);
     wait_frame(&mut s, |v| v.as_array().is_some_and(Vec::is_empty)).await;
+    s.close(None).await.unwrap();
+}
+
+/// A rejected apply rolls its activations back and writes the rows itself;
+/// no actor snapshot is behind that, so it has to tick the change counter
+/// like any other registry write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rejected_activation_is_a_watch_frame() {
+    let w = world().await;
+    let _flow = start_plugin(&w, "flow", Arc::new(Rejecting::default())).await;
+    let req = json!(FleetRequest {
+        spec: spec(&[
+            ("a", &[("flow", json!({ "v": 1 }))]),
+            ("b", &[("flow", json!({ "v": 1 }))]),
+        ]),
+        credentials: Default::default()
+    });
+    let (st, v) = w.api.admin("POST", "/v1/fleets", Some(&req));
+    assert_eq!(st, 200, "{v}");
+
+    let mut s = ws(
+        &ws_url(&w, "/v1/plugin-host/fleets/watch"),
+        &token(&w, "web").await,
+    )
+    .await
+    .unwrap();
+    let active = |v: &Value, agent: &str| {
+        v[0]["status"]["agents"][agent]["plugins"]["flow"]["state"] == "active"
+    };
+    wait_frame(&mut s, |v| active(v, "f/c/a") && active(v, "f/c/b")).await;
+
+    // `a` takes its new config, `b` refuses, and the rollback of `a` is
+    // refused too: its row becomes `rejected` and the apply fails.
+    let bad = json!(FleetRequest {
+        spec: spec(&[
+            ("a", &[("flow", json!({ "v": 2 }))]),
+            ("b", &[("flow", json!({ "reject": true }))]),
+        ]),
+        credentials: Default::default()
+    });
+    let (st, v) = w.api.admin("PUT", "/v1/fleets/f", Some(&bad));
+    assert_eq!(st, 400, "{v}");
+    let frame = wait_frame(&mut s, |v| {
+        v[0]["status"]["agents"]["f/c/a"]["plugins"]["flow"]["state"] == "rejected"
+    })
+    .await;
+    assert_eq!(
+        frame[0]["status"]["agents"]["f/c/a"]["plugins"]["flow"]["message"],
+        "rejected for f/c/a"
+    );
     s.close(None).await.unwrap();
 }
 

@@ -504,6 +504,10 @@ impl Daemon {
                                 }
                             }
                             self.restore_pairs(&restore).await;
+                            // The rollback may have written rows of its own
+                            // and this apply returns before the tick at the
+                            // end: no actor snapshot is behind it either.
+                            self.bump();
                             return Err(DaemonError::Invalid(format!(
                                 "{}: {}",
                                 activation::config_path(&p.agent, &p.plugin),
