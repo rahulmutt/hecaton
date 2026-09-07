@@ -785,6 +785,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "hecaton-plugin-web"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "futures-util",
+ "hecaton-api",
+ "hecaton-plugin-sdk",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+]
+
+[[package]]
 name = "hecaton-runtime"
 version = "0.1.0"
 dependencies = [

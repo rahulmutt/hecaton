@@ -1,0 +1,31 @@
+[package]
+name = "hecaton-plugin-web"
+description = "The web plugin: agents' terminals in a browser (plugins spec §18.5)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "hecaton-plugin-web"
+path = "src/main.rs"
+
+[dependencies]
+hecaton-api = { workspace = true }
+hecaton-plugin-sdk = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_path_to_error = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+
+[lints]
+workspace = true
