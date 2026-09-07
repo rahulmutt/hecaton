@@ -10,12 +10,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use hecaton_core::{FleetStore, PassThrough, ReconcilePolicy};
+use hecaton_core::{FleetStore, ReconcilePolicy};
 use hecaton_runtime::{Runtime, StateLayout, TmuxRunner};
 use hecaton_server::{
-    Daemon, FileFleetStore, Metrics, PluginClient, PluginHostConfig, PluginKv, PluginRegistry,
-    Ports, ServerPaths, Vault, load_or_create_token, read_endpoint, remove_if_exists, router,
-    serve, write_endpoint, write_pid,
+    Daemon, FileFleetStore, Metrics, PluginClient, PluginEventHandler, PluginHostConfig, PluginKv,
+    PluginRegistry, Ports, ServerPaths, Vault, load_or_create_token, read_endpoint,
+    remove_if_exists, router, serve, write_endpoint, write_pid,
 };
 use serde::Deserialize;
 
@@ -168,19 +168,26 @@ fn run(
             resync: RESYNC,
         };
         let fleets = existing.len();
+        // One `Metrics` for the daemon and the chain: the handler's counters
+        // are the ones `/metrics` encodes (plugins spec §12).
+        let metrics = Metrics::new()?;
+        let registry = PluginRegistry::new();
+        let client = PluginClient::new().map_err(|e| anyhow!("plugins: {e}"))?;
+        let kv = Arc::new(PluginKv::new(layout.plugins_state_dir(), vault.clone()));
+        let handler = PluginEventHandler::new(registry.clone(), client.clone(), metrics.clone());
         let daemon = Daemon::start(
             ports,
-            Arc::new(PassThrough),
-            Metrics::new()?,
+            handler,
+            metrics,
             token,
             existing,
             PluginHostConfig {
                 plugins_file: layout.config_root.join("plugins.yaml"),
                 install_root: layout.plugins_data_dir(),
             },
-            PluginRegistry::new(),
-            PluginClient::new()?,
-            Arc::new(PluginKv::new(layout.plugins_state_dir(), vault)),
+            registry,
+            client,
+            kv,
         );
         let plugins = daemon
             .sync_plugins()
