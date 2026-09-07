@@ -197,16 +197,27 @@ fn hook_secrets(w: &World) -> Vec<String> {
 /// protocol writes these files after the call that triggered them has
 /// already returned, so a single read races the writer.
 fn wait_file(path: &Path) -> String {
+    wait_file_until(path, |s| !s.trim().is_empty())
+}
+
+/// Polls (200 ms, 30 s cap) until the file's whole content satisfies
+/// `pred`. A file the writer appends to line by line is read while it is
+/// still being written: "non-empty" is not "complete", and an unbuffered
+/// `writeln!` can even be caught mid-line, so the caller says what it
+/// needs to see before the content is worth parsing.
+fn wait_file_until(path: &Path, pred: impl Fn(&str) -> bool) -> String {
     let start = Instant::now();
+    let mut last = String::new();
     loop {
-        if let Ok(s) = fs::read_to_string(path)
-            && !s.trim().is_empty()
-        {
-            return s;
+        if let Ok(s) = fs::read_to_string(path) {
+            if pred(&s) {
+                return s;
+            }
+            last = s;
         }
         assert!(
             start.elapsed() < Duration::from_secs(30),
-            "{} never appeared",
+            "{} never arrived complete; last content:\n{last}",
             path.display()
         );
         std::thread::sleep(Duration::from_millis(200));
@@ -789,8 +800,23 @@ fn plugin_protocol_journey() {
     let stdin = wait_file(&w.agent_dir("alice").join("home/fake-claude.stdin"));
     assert!(stdin.contains("fake-plugin says hi"), "{stdin}");
 
-    // observers saw alice's events, in order, and none of bob's
-    let events = wait_file(&plugin_dir.join("scratch/events.jsonl"));
+    // Observers saw alice's events, in order, and none of bob's. The
+    // delivery task batches 100 ms after the *first* event is enqueued, so
+    // `SessionStart` can be flushed on its own and Stop's intercept
+    // (proven above) says nothing about its observe batch: wait until every
+    // line parses and alice's `Stop` has landed, or a torn append and a
+    // half-written file would panic in the parse below.
+    let events = wait_file_until(&plugin_dir.join("scratch/events.jsonl"), |s| {
+        let mut lines = s.lines().filter(|l| !l.trim().is_empty()).peekable();
+        lines.peek().is_some()
+            && lines
+                .map(serde_json::from_str::<serde_json::Value>)
+                .collect::<Result<Vec<_>, _>>()
+                .is_ok_and(|vs| {
+                    vs.iter()
+                        .any(|v| v["agent"] == "e2e/c/alice" && v["name"] == "Stop")
+                })
+    });
     let names: Vec<String> = events
         .lines()
         .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
