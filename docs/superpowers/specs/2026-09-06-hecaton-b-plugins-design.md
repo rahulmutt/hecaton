@@ -184,7 +184,8 @@ protocol conformance test (§10).
 ### 4.1 Plugin → daemon
 
 Base `HECATON_API_URL` (the daemon's `http://127.0.0.1:<port>`), bearer
-`HECATON_PLUGIN_TOKEN`: 32 random bytes hex, minted per launch, delivered
+`HECATON_PLUGIN_TOKEN`: 32 random bytes hex, minted when the plugin is added
+and rotated on remove + re-add (a restart reuses it), delivered
 through the nono profile environment exactly like an agent's hook secret,
 constant-time compared, 401 for unknown token or unknown plugin alike. Routes
 under `/v1/plugin-host/`, each gated by the manifest's `needs`; a call outside
@@ -425,7 +426,7 @@ config-path style.
 
 **Threat model** (`docs/THREAT-MODEL.md`) gains a row: *plugin ↔ daemon*,
 trust "operator-installed, sandboxed"; controls: nono profile from the base
-plus the manifest's `sandbox`, `needs` enforced per route, per-launch token
+plus the manifest's `sandbox`, `needs` enforced per route, per-plugin token
 carried only in the 0600 profile and the `Authorization` header, admin token
 required on the proxy, 1 MiB bodies, KV secrets through the vault, no grant on
 `kv/`, `server/token` or the state root. Accepted risks recorded: a plugin with
@@ -522,5 +523,6 @@ Three mergeable phases, each fully tested before the next:
 - `plugin install` syncs only when a daemon is running; `plugin remove --purge` requires one.
 - Unpacked package directories are 0755 (files 0444/0555) so `--purge` is a plain `remove_dir_all`.
 - `plugins.yaml` is written atomically by `plugin install|remove` (temp file + rename).
+- The plugin token is minted on the `Apply` that first declares the plugin and rotates on remove + re-add; the actor reuses an existing secret, so a restart keeps the token (§4.1).
 - `PluginError::Fetch` carries `url`, not `source`.
 - URL sources are rejected at load and at `plugin install` until a TLS-enabled build (§2.1); a pinned URL whose digest is already unpacked is answered from `install_root` without fetching.

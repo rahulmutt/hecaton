@@ -20,7 +20,7 @@ phases; the rest exist in code today.
 - **Daemon ↔ external tools** — argv/config handed to `git`, `gh`, `mise`, `nono`, `tmux`, `claude`.
 - **Cloned repositories** — a repo's own `.claude/` settings, hooks and scripts are attacker-controlled content.
 - **Supply chain** — crates and pinned tools.
-- **Plugin ↔ daemon** — operator-installed packages running sandboxed; `hello` and (later) the host protocol cross it over loopback HTTP with a per-launch token.
+- **Plugin ↔ daemon** — operator-installed packages running sandboxed; `hello` and (later) the host protocol cross it over loopback HTTP with a per-plugin token.
 
 ## Adversaries
 - **A compromised or misbehaving agent** — can run any command the sandbox allows, emit arbitrary hook payloads, write anything into its worktree and the shared crew `.git`. Wants: credentials, other agents' data, host access.
@@ -46,6 +46,7 @@ phases; the rest exist in code today.
 - **No TLS on loopback** — an unprivileged local process cannot read loopback traffic; TLS arrives with the remote control plane (Phase 3 spec P3-1).
 - **The hecaton and mise binaries are readable inside the sandbox** (`mise exec` is the launcher; mise-action puts `mise` under `$HOME` on CI runners) (it is the `SessionStart` relay); the admin token and the state root are not granted, so an agent cannot drive the fleet API. `hook-relay` lets an agent post events as itself, which it could already do over HTTP.
 - **A plugin can read its package and the shared mise install dir** — both are read-only grants; a package is operator-installed, digest-checked content.
+- **A malicious package is trusted at install time** — `mise trust` + `mise install` run outside the sandbox as the daemon user (`crates/hecaton-runtime/src/plugin.rs::install_plugin_tools`), and the manifest's `sandbox` block may widen the plugin's own grants; the sandbox defends against a plugin compromised at runtime, not against installing a hostile package. Packages are operator-declared and digest-pinned.
 
 ## Mitigations
 | Threat | Control | Where |
@@ -63,6 +64,6 @@ phases; the rest exist in code today.
 | Hook secret at rest on the agent side | `settings.json` (HTTP header) and `nono-profile.json` (`HECATON_HOOK_SECRET`) are 0600 inside a 0700 agent dir; the secret authenticates only that agent; `nono-profile.json` also carries `MISE_CEILING_PATHS`/`MISE_GLOBAL_CONFIG_FILE` (not secrets, just noting the file is the sandbox boundary) | `crates/hecaton-runtime/src/home.rs`, `sandbox.rs` |
 | Supply chain | exact-pinned `mise.toml`; committed `Cargo.lock`; `cargo audit` + `cargo deny` (`mise run audit`); `gitleaks` in `mise run precommit` | `mise.toml`, `deny.toml` |
 | Package unpacking | digest verified before unpacking; absolute paths, `..`, symlinks, hard links and special entries rejected; files land 0444/0555 | `crates/hecaton-server/src/plugins/package.rs` |
-| Plugin token | 32 random bytes per launch, only in the 0600 `nono-profile.json` (`HECATON_PLUGIN_TOKEN`) and the `Authorization` header; constant-time compare, unknown plugin and bad token answer alike; the SDK redacts it in `Debug` | `daemon.rs::plugin_hello`, `hecaton-plugin-sdk/src/lib.rs` |
+| Plugin token | 32 random bytes, minted when the plugin is first declared and rotated on remove + re-add (the actor reuses an existing secret on every later `Apply`, so a restart keeps it), only in the 0600 `nono-profile.json` (`HECATON_PLUGIN_TOKEN`) and the `Authorization` header; constant-time compare, unknown plugin and bad token answer alike; the SDK redacts it in `Debug` | `daemon.rs::plugin_hello`, `hecaton-plugin-sdk/src/lib.rs` |
 | Plugin sandbox | read: system dirs, shared mise dir, the package, the hecaton and mise binaries; read-write: `home/` and `scratch/` only; `kv/` is never granted; `nono profile validate` before launch; manifest `sandbox` conflicts rejected | `crates/hecaton-runtime/src/plugin.rs` |
 | Reserved fleet | `hecaton` refused for user fleets at the API and client-side, so no user spec can shadow the plugin fleet's ids or secrets | `daemon.rs::reject_reserved`, `hecaton-config/src/resolve.rs` |

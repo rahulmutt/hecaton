@@ -158,7 +158,7 @@ pub trait Materializer: Send + Sync {
     fn remove_crew(&self, crew: &CrewRef, keep: Keep) -> Result<(), MaterializeError>;
     /// Files for one plugin (plugins spec §5.1): `home/`, profile,
     /// `launch.sh`, tools installed. `host` carries the daemon URL and the
-    /// plugin's per-launch token.
+    /// plugin's token.
     fn materialize_plugin(
         &self,
         plugin: &ResolvedPlugin,

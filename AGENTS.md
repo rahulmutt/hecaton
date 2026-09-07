@@ -90,7 +90,9 @@ credentials, hook input, or sandbox rules.
   `hecaton_config::resolve`.
 - A plugin's token is the hook secret the fleet actor mints for
   `hecaton/plugins/<name>`; it lives in `nono-profile.json` as
-  `HECATON_PLUGIN_TOKEN` and nowhere else.
+  `HECATON_PLUGIN_TOKEN` and nowhere else. It is minted when the plugin is
+  added and rotates on remove + re-add, not on every restart: `Actor::apply`
+  reuses an existing secret and only drops the ones the spec no longer wants.
 - Plugin packages: `plugins.yaml` directory sources are used in place with no
   digest (development and the e2e); tarballs and URLs need `sha256` and
   unpack read-only under `$XDG_DATA_HOME/hecaton/plugins/<name>/<digest12>/`.
