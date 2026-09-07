@@ -180,6 +180,11 @@ impl PluginEventHandler {
             match self.client.intercept(&listen, &req, remaining).await {
                 Ok(verdict) => {
                     outcome.response = verdict.response;
+                    // A merged chain no longer says who asked for what, so
+                    // the actions are attributed here (§16.4).
+                    for a in &verdict.actions {
+                        self.metrics.plugin_action(name.as_str(), a.label());
+                    }
                     outcome.actions.extend(verdict.actions);
                     self.metrics.intercept(
                         name.as_str(),
@@ -413,6 +418,10 @@ mod tests {
         assert!(text.contains(
             "hecaton_plugin_events_total{event=\"PreToolUse\",mode=\"intercept\",plugin=\"first\"} 1"
         ));
+        assert!(
+            text.contains("hecaton_plugin_actions_total{action=\"stop\",plugin=\"first\"} 1"),
+            "{text}"
+        );
         assert!(
             !text.contains("plugin=\"bystander\""),
             "not subscribed to this event"

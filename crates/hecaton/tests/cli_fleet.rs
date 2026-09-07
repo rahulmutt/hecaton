@@ -10,7 +10,7 @@ use hecaton_api::AgentPhase;
 use hecaton_core::FleetRecord;
 use hecaton_core::{AgentId, PassThrough};
 use hecaton_server::testing::Harness;
-use hecaton_server::{Daemon, Metrics, Ports, router, serve};
+use hecaton_server::{Daemon, router, serve};
 use predicates::prelude::*;
 
 const PAYMENTS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/payments.yaml");
@@ -30,25 +30,9 @@ struct Stub {
 fn stub() -> Stub {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let h = Harness::new(Duration::from_secs(3600));
-    let ports = Ports {
-        materializer: h.materializer.clone(),
-        runner: h.runner.clone(),
-        clock: h.clock.clone(),
-        store: h.store.clone(),
-        policy: Default::default(),
-        hook_url: "http://127.0.0.1:1".into(),
-        resync: Duration::from_secs(3600),
-    };
     let plugin_dir = tempfile::tempdir().unwrap();
     let (daemon, url, stop) = rt.block_on(async {
-        let daemon = Daemon::start(
-            ports,
-            Arc::new(PassThrough),
-            Metrics::new().unwrap(),
-            "tok".into(),
-            Vec::new(),
-            hecaton_server::testing::plugin_config_in(plugin_dir.path()),
-        );
+        let daemon = h.daemon_with_token(Arc::new(PassThrough), plugin_dir.path(), "tok");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();

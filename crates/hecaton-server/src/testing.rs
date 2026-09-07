@@ -2,7 +2,8 @@
 //! bundle over the `hecaton-core` fakes.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::path::Path;
+use std::sync::{Arc, Mutex, Mutex as StdMutex};
 use std::time::Duration;
 
 use hecaton_api::Timestamp;
@@ -10,6 +11,10 @@ use hecaton_core::fakes::{FakeClock, FakeMaterializer, FakeRunner};
 use hecaton_core::{FleetName, FleetRecord, FleetSecrets, FleetStore, ReconcilePolicy, StoreError};
 
 use crate::actor::Ports;
+use crate::daemon::{Daemon, DaemonHandler};
+use crate::metrics::Metrics;
+use crate::plugins::{PluginClient, PluginKv, PluginRegistry};
+use crate::vault::Vault;
 
 #[derive(Default)]
 pub struct MemoryStore {
@@ -53,6 +58,11 @@ pub struct Harness {
     pub clock: Arc<FakeClock>,
     pub store: Arc<MemoryStore>,
     pub ports: Arc<Ports>,
+    pub registry: Arc<PluginRegistry>,
+    pub client: PluginClient,
+    /// Owns the `kv` store's directory: dropped with the harness.
+    pub kv_dir: tempfile::TempDir,
+    pub kv: Arc<PluginKv>,
 }
 
 impl Harness {
@@ -74,13 +84,56 @@ impl Harness {
             hook_url: "http://127.0.0.1:1".to_string(),
             resync,
         });
+        let kv_dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let kv = Arc::new(PluginKv::new(
+            kv_dir.path().join("plugins"),
+            Vault::from_key([7u8; 32]),
+        ));
         Self {
             materializer,
             runner,
             clock,
             store,
             ports,
+            registry: PluginRegistry::new(),
+            client: PluginClient::new().unwrap_or_else(|e| panic!("http client: {e}")),
+            kv_dir,
+            kv,
         }
+    }
+
+    /// A daemon over these fakes with an empty fleet set.
+    pub fn daemon(&self, handler: Arc<dyn DaemonHandler>, plugin_dir: &Path) -> Arc<Daemon> {
+        self.daemon_with_token(handler, plugin_dir, "admin-tok")
+    }
+
+    /// The same, with the admin token the test's client presents.
+    pub fn daemon_with_token(
+        &self,
+        handler: Arc<dyn DaemonHandler>,
+        plugin_dir: &Path,
+        token: &str,
+    ) -> Arc<Daemon> {
+        let ports = Ports {
+            materializer: self.materializer.clone(),
+            runner: self.runner.clone(),
+            clock: self.clock.clone(),
+            store: self.store.clone(),
+            policy: self.ports.policy.clone(),
+            hook_url: self.ports.hook_url.clone(),
+            resync: self.ports.resync,
+        };
+        Daemon::start(
+            ports,
+            handler,
+            Metrics::new().unwrap_or_else(|e| panic!("metrics: {e}")),
+            token.to_string(),
+            Vec::new(),
+            plugin_config_in(plugin_dir),
+            self.registry.clone(),
+            self.client.clone(),
+            self.kv.clone(),
+        )
     }
 }
 
@@ -91,4 +144,140 @@ pub fn plugin_config_in(dir: &std::path::Path) -> crate::plugins::PluginHostConf
         plugins_file: dir.join("plugins.yaml"),
         install_root: dir.join("plugins"),
     }
+}
+
+/// A scripted plugin endpoint for daemon tests: records every call,
+/// rejects activation for agents named in `reject` with that message,
+/// answers intercepts with `verdict` (merged over `response_so_far`).
+#[derive(Clone, Default)]
+pub struct StubScript {
+    pub reject: BTreeMap<String, String>,
+    pub verdict: serde_json::Value,
+    pub actions: Vec<hecaton_api::PluginAction>,
+    pub health_ok: bool,
+    pub metrics_body: String,
+}
+
+#[derive(Clone)]
+pub struct StubPlugin {
+    pub listen: String,
+    pub calls: Arc<StdMutex<Vec<(String, serde_json::Value)>>>,
+}
+
+impl StubPlugin {
+    pub fn calls(&self) -> Vec<(String, serde_json::Value)> {
+        self.calls.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+    pub fn calls_named(&self, route: &str) -> Vec<serde_json::Value> {
+        self.calls()
+            .into_iter()
+            .filter(|(r, _)| r == route)
+            .map(|(_, v)| v)
+            .collect()
+    }
+}
+
+pub async fn stub_plugin(script: StubScript) -> StubPlugin {
+    use axum::extract::State;
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+    use serde_json::{Value, json};
+    let calls = Arc::new(StdMutex::new(Vec::new()));
+    #[derive(Clone)]
+    struct S {
+        script: StubScript,
+        calls: Arc<StdMutex<Vec<(String, Value)>>>,
+    }
+    let record = |s: &S, route: &str, v: Value| {
+        s.calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((route.to_string(), v));
+    };
+    let app = Router::new()
+        .route(
+            "/v1/activate",
+            post(move |State(s): State<S>, Json(v): Json<Value>| async move {
+                record(&s, "activate", v.clone());
+                let agent = v["agent"].as_str().unwrap_or_default();
+                match s.script.reject.get(agent) {
+                    Some(msg) => (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": msg })),
+                    ),
+                    None => (axum::http::StatusCode::OK, Json(json!({}))),
+                }
+            }),
+        )
+        .route(
+            "/v1/deactivate",
+            post(move |State(s): State<S>, Json(v): Json<Value>| async move {
+                record(&s, "deactivate", v);
+                Json(json!({}))
+            }),
+        )
+        .route(
+            "/v1/events",
+            post(move |State(s): State<S>, Json(v): Json<Value>| async move {
+                record(&s, "events", v);
+                Json(json!({}))
+            }),
+        )
+        .route(
+            "/v1/intercept",
+            post(move |State(s): State<S>, Json(v): Json<Value>| async move {
+                record(&s, "intercept", v.clone());
+                let mut r = v["response_so_far"].clone();
+                if let (Some(dst), Some(src)) = (r.as_object_mut(), s.script.verdict.as_object()) {
+                    for (k, val) in src {
+                        dst.insert(k.clone(), val.clone());
+                    }
+                }
+                Json(json!({ "response": r, "actions": s.script.actions }))
+            }),
+        )
+        .route(
+            "/v1/health",
+            get(move |State(s): State<S>| async move {
+                record(&s, "health", json!({}));
+                if s.script.health_ok {
+                    axum::http::StatusCode::OK
+                } else {
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        )
+        .route(
+            "/v1/metrics",
+            get(move |State(s): State<S>| async move { s.script.metrics_body.clone() }),
+        )
+        .with_state(S {
+            script,
+            calls: calls.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap_or_else(|e| panic!("bind: {e}"));
+    let listen = listener
+        .local_addr()
+        .unwrap_or_else(|e| panic!("addr: {e}"))
+        .to_string();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    StubPlugin { listen, calls }
+}
+
+/// A package directory for tests: `hecaton-plugin.yaml` with the given
+/// extra lines (hooks, needs) and a `mise.toml` whose start task is `true`.
+pub fn write_plugin_package(dir: &Path, name: &str, manifest_extra: &str) {
+    let _ = std::fs::create_dir_all(dir);
+    let manifest = format!(
+        "apiVersion: hecaton/v1\nkind: Plugin\nname: {name}\nversion: 0.1.0\nprotocol: 1\nstart: serve\n{manifest_extra}"
+    );
+    let _ = std::fs::write(dir.join("hecaton-plugin.yaml"), manifest);
+    let _ = std::fs::write(
+        dir.join("mise.toml"),
+        "[tools]\n[tasks.serve]\nrun = \"true\"\n",
+    );
 }

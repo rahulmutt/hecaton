@@ -13,9 +13,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use hecaton_core::{FleetStore, PassThrough, ReconcilePolicy};
 use hecaton_runtime::{Runtime, StateLayout, TmuxRunner};
 use hecaton_server::{
-    Daemon, FileFleetStore, Metrics, PluginHostConfig, Ports, ServerPaths, Vault,
-    load_or_create_token, read_endpoint, remove_if_exists, router, serve, write_endpoint,
-    write_pid,
+    Daemon, FileFleetStore, Metrics, PluginClient, PluginHostConfig, PluginKv, PluginRegistry,
+    Ports, ServerPaths, Vault, load_or_create_token, read_endpoint, remove_if_exists, router,
+    serve, write_endpoint, write_pid,
 };
 use serde::Deserialize;
 
@@ -150,7 +150,7 @@ fn run(
     let tools = tool_paths()?;
     let token = load_or_create_token(&paths.token())?;
     let vault = Vault::load_or_create(&paths.vault_key())?;
-    let store = FileFleetStore::new(layout.fleets_dir(), vault);
+    let store = FileFleetStore::new(layout.fleets_dir(), vault.clone());
     let existing = store.load_all()?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -178,6 +178,9 @@ fn run(
                 plugins_file: layout.config_root.join("plugins.yaml"),
                 install_root: layout.plugins_data_dir(),
             },
+            PluginRegistry::new(),
+            PluginClient::new()?,
+            Arc::new(PluginKv::new(layout.plugins_state_dir(), vault)),
         );
         let plugins = daemon
             .sync_plugins()

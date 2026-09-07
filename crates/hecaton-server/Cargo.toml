@@ -26,9 +26,11 @@ flate2 = { workspace = true }
 ureq = { workspace = true }
 reqwest = { workspace = true }
 tracing = { workspace = true }
+# `testing.rs` is a library module (integration tests and the daemon's own
+# tests share it) and its harness owns temporary directories.
+tempfile = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 proptest = { workspace = true }
 
 [lints]

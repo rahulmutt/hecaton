@@ -82,23 +82,7 @@ async fn plugins_sync_hello_list_and_purge() {
     .unwrap();
 
     let h = Harness::new(Duration::from_secs(3600));
-    let ports = hecaton_server::Ports {
-        materializer: h.materializer.clone(),
-        runner: h.runner.clone(),
-        clock: h.clock.clone(),
-        store: h.store.clone(),
-        policy: Default::default(),
-        hook_url: "http://127.0.0.1:1".into(),
-        resync: Duration::from_secs(3600),
-    };
-    let daemon = Daemon::start(
-        ports,
-        Arc::new(PassThrough),
-        Metrics::new().unwrap(),
-        "admin-tok".into(),
-        Vec::new(),
-        plugin_config_in(dir.path()),
-    );
+    let daemon = h.daemon(Arc::new(PassThrough), dir.path());
     let report = daemon.sync_plugins().await.unwrap();
     assert_eq!(report.installed, vec!["hello"]);
     assert!(report.stopped.is_empty() && report.unchanged.is_empty());
@@ -374,6 +358,8 @@ async fn a_stored_fleet_under_the_reserved_name_is_ignored() {
         hook_url: "http://127.0.0.1:1".into(),
         resync: Duration::from_secs(3600),
     };
+    // Not `Harness::daemon`: this test needs a *stored* record, which only
+    // `Daemon::start` takes.
     let daemon = Daemon::start(
         ports,
         Arc::new(PassThrough),
@@ -381,6 +367,9 @@ async fn a_stored_fleet_under_the_reserved_name_is_ignored() {
         "admin-tok".into(),
         vec![(record, Default::default())],
         plugin_config_in(dir.path()),
+        h.registry.clone(),
+        h.client.clone(),
+        h.kv.clone(),
     );
     daemon.sync_plugins().await.unwrap();
 

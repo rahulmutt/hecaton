@@ -19,7 +19,7 @@ pub mod vault;
 pub use actor::{FleetHandle, Msg, Ports, READY_EVENT, SecretIndex, Shared};
 pub use api::{ApiError, router, serve};
 pub use auth::{RateLimiter, bearer, constant_time_eq};
-pub use daemon::{Daemon, DaemonError};
+pub use daemon::{Daemon, DaemonError, DaemonHandler, HEALTH_INTERVAL, HelloObserver};
 pub use hooks::{ParsedEvent, parse_event};
 pub use lifecycle::{
     LifecycleError, ServerPaths, load_or_create_token, read_endpoint, read_pid, remove_if_exists,
