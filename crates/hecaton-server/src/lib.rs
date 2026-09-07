@@ -11,6 +11,7 @@ pub mod fsutil;
 pub mod hooks;
 pub mod lifecycle;
 pub mod metrics;
+pub mod plugin_api;
 pub mod plugins;
 pub mod store;
 pub mod testing;

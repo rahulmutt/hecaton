@@ -3,6 +3,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
@@ -121,12 +122,14 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
     let plugins = Router::new()
         .route("/v1/plugin-host/hello", post(plugin_hello))
         .layer(DefaultBodyLimit::max(64 << 10));
+    let plugin_host = crate::plugin_api::router().layer(DefaultBodyLimit::max(1 << 20));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/metrics", get(metrics))
         .merge(admin)
         .merge(agents)
         .merge(plugins)
+        .merge(plugin_host)
         .with_state(state)
 }
 
@@ -151,14 +154,42 @@ async fn require_admin(State(state): State<AppState>, req: Request, next: Next) 
     }
 }
 
+/// Per-plugin `/v1/metrics` scrape budget (plugins spec §9).
+const SCRAPE_TIMEOUT: Duration = Duration::from_millis(500);
+
 async fn metrics(State(state): State<AppState>) -> Response {
     let snapshots = state.daemon.snapshots().await;
     state.daemon.metrics().set_gauges(&snapshots);
-    (
-        [(CONTENT_TYPE, "text/plain; version=0.0.4")],
-        state.daemon.metrics().encode(),
-    )
-        .into_response()
+    let mut body = state.daemon.metrics().encode();
+    let registry = state.daemon.registry().clone();
+    let mut scrapes = tokio::task::JoinSet::new();
+    for name in registry.names() {
+        let Some(listen) = registry.ready_listen(&name) else {
+            continue;
+        };
+        let client = state.daemon.client().clone();
+        scrapes.spawn(async move {
+            let r = client.metrics(&listen, SCRAPE_TIMEOUT).await;
+            (name, r)
+        });
+    }
+    while let Some(joined) = scrapes.join_next().await {
+        let Ok((name, result)) = joined else { continue };
+        match result {
+            Ok(text) if crate::plugin_api::families_ok(&text, name.as_str()) => {
+                body.push_str(&text);
+                if !text.ends_with('\n') {
+                    body.push('\n');
+                }
+            }
+            Ok(_) => state.daemon.metrics().scrape_failure(name.as_str()),
+            Err(e) => {
+                tracing::debug!(plugin = %name, "metrics scrape failed: {e}");
+                state.daemon.metrics().scrape_failure(name.as_str());
+            }
+        }
+    }
+    ([(CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }
 
 fn fleet_name(s: &str) -> Result<FleetName, ApiError> {
