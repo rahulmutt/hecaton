@@ -363,6 +363,7 @@ pub struct Harness {
     host: Host,
     http: reqwest::Client,
     listen: String,
+    token: String,
     server: tokio::task::JoinHandle<Result<(), SdkError>>,
 }
 
@@ -375,11 +376,13 @@ impl Harness {
             .no_proxy()
             .build()
             .unwrap_or_else(|e| panic!("Harness client: {e}"));
-        let (listen, server) = Self::spawn(&host, plugin).await;
+        let token = env.token.clone();
+        let (listen, server) = Self::spawn(&host, plugin, &token).await;
         Harness {
             host,
             http,
             listen,
+            token,
             server,
         }
     }
@@ -387,9 +390,12 @@ impl Harness {
     async fn spawn<P: Plugin>(
         host: &Host,
         plugin: P,
+        token: &str,
     ) -> (String, tokio::task::JoinHandle<Result<(), SdkError>>) {
         let (listener, listen) = bind().await.unwrap_or_else(|e| panic!("Harness bind: {e}"));
-        let server = tokio::spawn(run(listener, Arc::new(plugin)));
+        let plugin = Arc::new(plugin);
+        let token = token.to_string();
+        let server = tokio::spawn(async move { run(listener, plugin, &token).await });
         host.hello("test", &listen)
             .await
             .unwrap_or_else(|e| panic!("Harness hello: {e}"));
@@ -400,13 +406,19 @@ impl Harness {
         &self.listen
     }
 
+    /// The bearer every Harness call sends: the token the plugin was
+    /// started with.
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
     /// Stops the served instance and serves `plugin` in its place, with
     /// a fresh `hello`: the "plugin restarted" case. The `FakeHost` and
     /// its kv are untouched.
     pub async fn restart<P: Plugin>(&mut self, plugin: P) {
         self.server.abort();
         let _ = (&mut self.server).await;
-        let (listen, server) = Self::spawn(&self.host, plugin).await;
+        let (listen, server) = Self::spawn(&self.host, plugin, &self.token).await;
         self.listen = listen;
         self.server = server;
     }
@@ -419,6 +431,7 @@ impl Harness {
         let resp = self
             .http
             .post(self.url(path))
+            .bearer_auth(&self.token)
             .json(body)
             .send()
             .await
@@ -487,6 +500,7 @@ impl Harness {
         let resp = self
             .http
             .get(self.url("/v1/health"))
+            .bearer_auth(&self.token)
             .send()
             .await
             .unwrap_or_else(|e| panic!("Harness GET health: {e}"));
@@ -501,6 +515,7 @@ impl Harness {
     pub async fn metrics(&self) -> String {
         self.http
             .get(self.url("/v1/metrics"))
+            .bearer_auth(&self.token)
             .send()
             .await
             .unwrap_or_else(|e| panic!("Harness GET metrics: {e}"))

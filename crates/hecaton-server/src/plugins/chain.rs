@@ -98,12 +98,12 @@ impl ObserverQueue {
             if batch.is_empty() {
                 continue;
             }
-            let Some(listen) = registry.ready_listen(&self.plugin) else {
+            let Some(addr) = registry.ready_addr(&self.plugin) else {
                 metrics.events_dropped(self.plugin.as_str(), batch.len() as u64);
                 continue;
             };
             let n = batch.len();
-            if let Err(e) = client.events(&listen, &EventBatch { events: batch }).await {
+            if let Err(e) = client.events(&addr, &EventBatch { events: batch }).await {
                 tracing::warn!(plugin = %self.plugin, events = n, "observer batch not acknowledged: {e}");
                 metrics.events_dropped(self.plugin.as_str(), n as u64);
             }
@@ -162,7 +162,7 @@ impl PluginEventHandler {
         };
         let mut outcome = Outcome::allow();
         let deadline = Instant::now() + Duration::from_millis(CHAIN_BUDGET_MS);
-        for (name, listen) in self.registry.interceptors(&agent, &event.name) {
+        for (name, addr) in self.registry.interceptors(&agent, &event.name) {
             self.metrics
                 .plugin_event(name.as_str(), &event.name, "intercept");
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -177,7 +177,7 @@ impl PluginEventHandler {
                 deadline_ms: u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
             };
             let started = Instant::now();
-            match self.client.intercept(&listen, &req, remaining).await {
+            match self.client.intercept(&addr, &req, remaining).await {
                 Ok(verdict) => {
                     outcome.response = verdict.response;
                     // A merged chain no longer says who asked for what, so
@@ -387,7 +387,7 @@ mod tests {
             ("odd", odd),
             ("last", last),
         ] {
-            r.set_listen(&n.parse().unwrap(), l);
+            r.set_listen(&n.parse().unwrap(), l, "t".into());
             active(&r, n);
         }
         let (h, m) = handler(&r);
@@ -443,9 +443,9 @@ mod tests {
         );
         let (slow, _) = stub(Behaviour::Sleep(5_000), 200).await;
         let (ok, _) = stub(Behaviour::Merge("k".into(), 9, vec![]), 200).await;
-        r.set_listen(&"dead".parse().unwrap(), "127.0.0.1:1".into());
-        r.set_listen(&"slow".parse().unwrap(), slow);
-        r.set_listen(&"ok".parse().unwrap(), ok);
+        r.set_listen(&"dead".parse().unwrap(), "127.0.0.1:1".into(), "t".into());
+        r.set_listen(&"slow".parse().unwrap(), slow, "t".into());
+        r.set_listen(&"ok".parse().unwrap(), ok, "t".into());
         for n in ["dead", "slow", "ok"] {
             active(&r, n);
         }
@@ -486,7 +486,7 @@ mod tests {
         let r = PluginRegistry::new();
         r.replace_plugins(&[plugin("web", &[], &["Stop", "Notification"])], &[]);
         let (listen, batches) = stub(Behaviour::Status500, 200).await;
-        r.set_listen(&"web".parse().unwrap(), listen);
+        r.set_listen(&"web".parse().unwrap(), listen, "t".into());
         active(&r, "web");
         let (h, _m) = handler(&r);
         for i in 0..70 {
@@ -566,7 +566,7 @@ mod tests {
                 for (i, (name, fail)) in names.iter().zip(&fails).enumerate() {
                     let behaviour = if *fail { Behaviour::Status500 } else { Behaviour::Merge(name.clone(), i as i64, vec![]) };
                     let (listen, _) = stub(behaviour, 200).await;
-                    r.set_listen(&name.parse().unwrap(), listen);
+                    r.set_listen(&name.parse().unwrap(), listen, "t".into());
                     active(&r, name);
                     if !fail {
                         expected.insert(name.clone(), json!(i));

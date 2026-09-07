@@ -171,10 +171,10 @@ impl Daemon {
     /// degraded message, a success clears it. Never restarts anything.
     pub async fn poll_health(&self) {
         for name in self.registry.names() {
-            let Some(listen) = self.registry.ready_listen(&name) else {
+            let Some(addr) = self.registry.ready_addr(&name) else {
                 continue;
             };
-            match self.client.health(&listen).await {
+            match self.client.health(&addr).await {
                 Ok(()) => self.registry.set_degraded(&name, None),
                 Err(e) => {
                     tracing::warn!(plugin = %name, "health check failed: {e}");
@@ -242,18 +242,18 @@ impl Daemon {
         if !self.verify_secret(&plugin_id(name), token).await {
             return Err(DaemonError::Unauthorized);
         }
-        let response = self.plugins.hello(name, req).await?;
+        let response = self.plugins.hello(name, req, token).await?;
         self.handler.on_hello(name);
         // Restart recovery (§16.2): the plugin knows nothing about the
         // pairs it had; every row is offered again, and a refusal now is
         // the pair's state, not an error for the plugin.
-        if let Some(listen) = self.registry.ready_listen(name) {
+        if let Some(addr) = self.registry.ready_addr(name) {
             for (agent, row) in self.registry.rows_for_plugin(name) {
                 let req = ActivateRequest {
                     agent: agent.to_string(),
                     config: row.config.clone(),
                 };
-                let activation = match self.client.activate(&listen, &req).await {
+                let activation = match self.client.activate(&addr, &req).await {
                     Ok(()) => PluginActivation::active(),
                     Err(e) => {
                         tracing::warn!(plugin = %name, agent = %agent, "activation rejected at hello: {e}");
@@ -283,13 +283,13 @@ impl Daemon {
 
     /// Best effort: a plugin that cannot be told is logged, not an error.
     async fn deactivate_pair(&self, agent: &AgentId, plugin: &AgentName) {
-        let Some(listen) = self.registry.ready_listen(plugin) else {
+        let Some(addr) = self.registry.ready_addr(plugin) else {
             return;
         };
         let req = DeactivateRequest {
             agent: agent.to_string(),
         };
-        if let Err(e) = self.client.deactivate(&listen, &req).await {
+        if let Err(e) = self.client.deactivate(&addr, &req).await {
             tracing::warn!(plugin = %plugin, agent = %agent, "deactivate failed: {e}");
         }
     }
@@ -300,14 +300,14 @@ impl Daemon {
     /// state — the pair really is not active any more.
     async fn restore_pairs(&self, pairs: &[Pair]) {
         for p in pairs {
-            let Some(listen) = self.registry.ready_listen(&p.plugin) else {
+            let Some(addr) = self.registry.ready_addr(&p.plugin) else {
                 continue;
             };
             let req = ActivateRequest {
                 agent: p.agent.to_string(),
                 config: p.config.clone(),
             };
-            if let Err(e) = self.client.activate(&listen, &req).await {
+            if let Err(e) = self.client.activate(&addr, &req).await {
                 tracing::warn!(plugin = %p.plugin, agent = %p.agent, "restoring the previous activation failed: {e}");
                 self.registry.set_state(
                     &p.agent,
@@ -424,13 +424,13 @@ impl Daemon {
         let mut accepted: Vec<Pair> = Vec::new();
         let mut rows: Vec<(Pair, PluginActivation)> = Vec::new();
         for p in &d.activate {
-            match self.registry.ready_listen(&p.plugin) {
-                Some(listen) => {
+            match self.registry.ready_addr(&p.plugin) {
+                Some(addr) => {
                     let req = ActivateRequest {
                         agent: p.agent.to_string(),
                         config: p.config.clone(),
                     };
-                    match self.client.activate(&listen, &req).await {
+                    match self.client.activate(&addr, &req).await {
                         Ok(()) => {
                             accepted.push(p.clone());
                             rows.push((p.clone(), PluginActivation::active()));
@@ -1371,7 +1371,9 @@ mod tests {
             ..StubScript::default()
         })
         .await;
-        w.daemon.registry().set_listen(&flow, good.listen.clone());
+        w.daemon
+            .registry()
+            .set_listen(&flow, good.listen.clone(), "t".into());
         w.daemon
             .apply(&name, s, Default::default(), true)
             .await

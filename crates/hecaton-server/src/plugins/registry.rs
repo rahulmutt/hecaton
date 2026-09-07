@@ -4,21 +4,54 @@
 //! writer of activation state; the fleet actor never sees it.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use hecaton_api::{ActivationState, Capability, PluginActivation, PluginManifest};
 use hecaton_core::{AgentId, AgentName, FleetName, FleetRecord, ResolvedPlugin};
 use serde_json::Value;
 
-#[derive(Debug, Clone, PartialEq)]
+/// Where a ready plugin listens and the bearer the daemon presents to it
+/// (plugins spec §18.3): the plugin's own token, learned at `hello`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PluginAddr {
+    pub listen: String,
+    pub token: String,
+}
+
+impl fmt::Debug for PluginAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PluginAddr")
+            .field("listen", &self.listen)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq)]
 pub struct PluginInfo {
     pub manifest: PluginManifest,
     /// From the last `hello`; kept while the plugin restarts.
     pub listen: Option<String>,
+    /// The token the plugin presented at that `hello`: the bearer on every
+    /// daemon → plugin call (§18.3). Kept with `listen`.
+    pub token: Option<String>,
     /// `Ready` per the plugin fleet's record. Only ready plugins are called.
     pub ready: bool,
     /// The health poller's verdict; `hello` clears it.
     pub degraded: Option<String>,
+}
+
+impl fmt::Debug for PluginInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PluginInfo")
+            .field("manifest", &self.manifest)
+            .field("listen", &self.listen)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("ready", &self.ready)
+            .field("degraded", &self.degraded)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -67,6 +100,7 @@ impl PluginRegistry {
                 PluginInfo {
                     manifest: p.manifest.clone(),
                     listen: prev.and_then(|i| i.listen.clone()),
+                    token: prev.and_then(|i| i.token.clone()),
                     ready: prev.is_some_and(|i| i.ready),
                     degraded: prev.and_then(|i| i.degraded.clone()),
                 },
@@ -76,9 +110,10 @@ impl PluginRegistry {
         w.rows.retain(|(_, p), _| names.contains(p));
     }
 
-    pub fn set_listen(&self, name: &AgentName, listen: String) {
+    pub fn set_listen(&self, name: &AgentName, listen: String, token: String) {
         if let Some(p) = self.write().plugins.get_mut(name) {
             p.listen = Some(listen);
+            p.token = Some(token);
             p.ready = true;
             p.degraded = None;
         }
@@ -116,11 +151,18 @@ impl PluginRegistry {
             .is_some_and(|p| p.manifest.needs.contains(&cap))
     }
 
-    /// `Some(listen)` only while the plugin is ready.
-    pub fn ready_listen(&self, name: &AgentName) -> Option<String> {
+    /// `Some` only while the plugin is ready: where to call it and what
+    /// bearer to present.
+    pub fn ready_addr(&self, name: &AgentName) -> Option<PluginAddr> {
         let r = self.read();
         let p = r.plugins.get(name)?;
-        p.ready.then(|| p.listen.clone()).flatten()
+        if !p.ready {
+            return None;
+        }
+        Some(PluginAddr {
+            listen: p.listen.clone()?,
+            token: p.token.clone()?,
+        })
     }
 
     pub fn set_row(&self, agent: &AgentId, plugin: &AgentName, row: ActivationRow) {
@@ -214,29 +256,30 @@ impl PluginRegistry {
         &self,
         agent: &AgentId,
         pick: impl Fn(&PluginManifest) -> bool,
-    ) -> Vec<(AgentName, String)> {
+    ) -> Vec<(AgentName, PluginAddr)> {
         let r = self.read();
         r.order
             .iter()
             .filter_map(|name| {
                 let p = r.plugins.get(name)?;
                 let listen = p.listen.clone().filter(|_| p.ready)?;
+                let token = p.token.clone()?;
                 let active = r
                     .rows
                     .get(&(agent.clone(), name.clone()))
                     .is_some_and(|row| row.activation.state == ActivationState::Active);
-                (active && pick(&p.manifest)).then(|| (name.clone(), listen))
+                (active && pick(&p.manifest)).then(|| (name.clone(), PluginAddr { listen, token }))
             })
             .collect()
     }
 
     /// Ready plugins intercepting `event` and active for `agent`, in
     /// load-list order, with their listen addresses.
-    pub fn interceptors(&self, agent: &AgentId, event: &str) -> Vec<(AgentName, String)> {
+    pub fn interceptors(&self, agent: &AgentId, event: &str) -> Vec<(AgentName, PluginAddr)> {
         self.subscribed(agent, |m| m.hooks.intercept.contains(event))
     }
 
-    pub fn observers(&self, agent: &AgentId, event: &str) -> Vec<(AgentName, String)> {
+    pub fn observers(&self, agent: &AgentId, event: &str) -> Vec<(AgentName, PluginAddr)> {
         self.subscribed(agent, |m| m.hooks.observe.contains(event))
     }
 
@@ -306,10 +349,10 @@ mod tests {
         assert!(r.has(&name("flow"), Capability::Kv));
         assert!(!r.has(&name("flow"), Capability::Fleets));
         assert!(!r.has(&name("nope"), Capability::Fleets));
-        assert_eq!(r.ready_listen(&name("flow")), None);
-        r.set_listen(&name("flow"), "127.0.0.1:4000".into());
+        assert_eq!(r.ready_addr(&name("flow")), None);
+        r.set_listen(&name("flow"), "127.0.0.1:4000".into(), "tok".into());
         assert_eq!(
-            r.ready_listen(&name("flow")).as_deref(),
+            r.ready_addr(&name("flow")).map(|a| a.listen).as_deref(),
             Some("127.0.0.1:4000")
         );
         r.set_degraded(&name("flow"), Some("HTTP 500".into()));
@@ -318,13 +361,13 @@ mod tests {
             Some("HTTP 500")
         );
         r.set_ready(&name("flow"), false);
-        assert_eq!(r.ready_listen(&name("flow")), None, "not ready: no listen");
+        assert_eq!(r.ready_addr(&name("flow")), None, "not ready: no listen");
         assert_eq!(
             r.plugin(&name("flow")).unwrap().listen.as_deref(),
             Some("127.0.0.1:4000"),
             "the address itself is kept"
         );
-        r.set_listen(&name("flow"), "127.0.0.1:4001".into());
+        r.set_listen(&name("flow"), "127.0.0.1:4001".into(), "tok".into());
         let p = r.plugin(&name("flow")).unwrap();
         assert!(p.ready && p.degraded.is_none(), "hello clears degraded");
         // a re-sync keeps listen only for the names the caller says
@@ -336,13 +379,13 @@ mod tests {
             &["flow".into()],
         );
         assert_eq!(
-            r.ready_listen(&name("flow")).as_deref(),
+            r.ready_addr(&name("flow")).map(|a| a.listen).as_deref(),
             Some("127.0.0.1:4001")
         );
         assert!(r.plugin(&name("web")).is_none());
         r.replace_plugins(&[plugin("flow", &[], &[], &[])], &[]);
         assert_eq!(
-            r.ready_listen(&name("flow")),
+            r.ready_addr(&name("flow")),
             None,
             "changed plugin: forgotten"
         );
@@ -358,8 +401,8 @@ mod tests {
             ],
             &[],
         );
-        r.set_listen(&name("flow"), "127.0.0.1:1".into());
-        r.set_listen(&name("web"), "127.0.0.1:2".into());
+        r.set_listen(&name("flow"), "127.0.0.1:1".into(), "tok".into());
+        r.set_listen(&name("web"), "127.0.0.1:2".into(), "tok".into());
         let a = id("f/c/a");
         let b = id("f/c/b");
         let row = |state: ActivationState| ActivationRow {
@@ -374,19 +417,37 @@ mod tests {
         r.set_row(&b, &name("web"), row(ActivationState::Active));
         assert_eq!(
             r.interceptors(&a, "PreToolUse"),
-            vec![(name("flow"), "127.0.0.1:1".to_string())],
+            vec![(
+                name("flow"),
+                PluginAddr {
+                    listen: "127.0.0.1:1".into(),
+                    token: "tok".into()
+                }
+            )],
             "web is pending for a"
         );
         assert_eq!(r.interceptors(&a, "Stop").len(), 1);
         assert_eq!(r.interceptors(&a, "Notification").len(), 0);
         assert_eq!(
             r.interceptors(&b, "PreToolUse"),
-            vec![(name("web"), "127.0.0.1:2".to_string())]
+            vec![(
+                name("web"),
+                PluginAddr {
+                    listen: "127.0.0.1:2".into(),
+                    token: "tok".into()
+                }
+            )]
         );
         assert_eq!(r.observers(&b, "SessionStart").len(), 1);
         assert_eq!(
             r.observers(&a, "Stop"),
-            vec![(name("flow"), "127.0.0.1:1".to_string())]
+            vec![(
+                name("flow"),
+                PluginAddr {
+                    listen: "127.0.0.1:1".into(),
+                    token: "tok".into()
+                }
+            )]
         );
         r.set_ready(&name("flow"), false);
         assert!(
@@ -446,5 +507,57 @@ mod tests {
         assert_eq!(removed.len(), 2);
         assert!(r.rows_for_plugin(&name("flow")).is_empty());
         assert_eq!(r.active_agents(&name("web")), 0);
+    }
+
+    #[test]
+    fn hello_records_the_token_the_daemon_presents_and_never_prints_it() {
+        let r = PluginRegistry::new();
+        r.replace_plugins(&[plugin("flow", &["Stop"], &[], &[])], &[]);
+        assert_eq!(r.ready_addr(&name("flow")), None);
+        r.set_listen(
+            &name("flow"),
+            "127.0.0.1:4000".into(),
+            "s3cret-token".into(),
+        );
+        let addr = r.ready_addr(&name("flow")).unwrap();
+        assert_eq!(
+            (addr.listen.as_str(), addr.token.as_str()),
+            ("127.0.0.1:4000", "s3cret-token")
+        );
+        let dbg = format!("{addr:?}");
+        assert!(
+            dbg.contains("127.0.0.1:4000") && !dbg.contains("s3cret") && dbg.contains("<redacted>"),
+            "{dbg}"
+        );
+        let dbg = format!("{:?}", r.plugin(&name("flow")).unwrap());
+        assert!(
+            !dbg.contains("s3cret") && dbg.contains("<redacted>"),
+            "{dbg}"
+        );
+        r.set_ready(&name("flow"), false);
+        assert_eq!(r.ready_addr(&name("flow")), None, "not ready: no address");
+        // a re-sync that keeps the plugin keeps its token with the address
+        r.set_ready(&name("flow"), true);
+        r.replace_plugins(&[plugin("flow", &["Stop"], &[], &[])], &["flow".into()]);
+        assert_eq!(r.ready_addr(&name("flow")).unwrap().token, "s3cret-token");
+        let a = id("f/c/a");
+        r.set_row(
+            &a,
+            &name("flow"),
+            ActivationRow {
+                config: json!({}),
+                activation: PluginActivation::active(),
+            },
+        );
+        assert_eq!(
+            r.interceptors(&a, "Stop"),
+            vec![(
+                name("flow"),
+                PluginAddr {
+                    listen: "127.0.0.1:4000".into(),
+                    token: "s3cret-token".into()
+                }
+            )]
+        );
     }
 }

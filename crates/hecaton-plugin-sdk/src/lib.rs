@@ -8,6 +8,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
+pub mod auth;
 pub mod host;
 pub mod metrics;
 pub mod plugin;

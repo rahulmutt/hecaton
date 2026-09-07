@@ -24,7 +24,7 @@ fn fixtures() -> BTreeMap<String, Value> {
     }
     assert_eq!(
         out.len(),
-        14,
+        15,
         "every fixture accounted for: {:?}",
         out.keys()
     );
@@ -105,7 +105,7 @@ impl Plugin for Reference {
 #[tokio::test]
 async fn the_router_answers_every_daemon_to_plugin_fixture() {
     let (listener, listen) = bind().await.unwrap();
-    tokio::spawn(run(listener, Arc::new(Reference::new())));
+    tokio::spawn(run(listener, Arc::new(Reference::new()), "tok"));
     let c = reqwest::Client::builder().no_proxy().build().unwrap();
     for (name, f) in fixtures()
         .iter()
@@ -118,6 +118,12 @@ async fn the_router_answers_every_daemon_to_plugin_fixture() {
             "GET" => c.get(&url),
             _ => unreachable!(),
         };
+        let mut req = req;
+        if let Some(headers) = f["headers"].as_object() {
+            for (k, v) in headers {
+                req = req.header(k.as_str(), v.as_str().unwrap());
+            }
+        }
         let resp = req.send().await.unwrap();
         assert_eq!(
             resp.status().as_u16(),

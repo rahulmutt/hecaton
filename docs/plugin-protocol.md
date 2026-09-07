@@ -34,7 +34,7 @@ profile environment (plugins spec §5.1):
 |---|---|
 | `HECATON_API_URL` | The daemon's base URL, `http://127.0.0.1:<port>`, no trailing slash. Every plugin → daemon route in §3 is relative to it. |
 | `HECATON_PLUGIN_NAME` | This plugin's name, as declared in `hecaton-plugin.yaml` and `plugins.yaml`. |
-| `HECATON_PLUGIN_TOKEN` | The bearer for every plugin → daemon call: `Authorization: Bearer <token>`. A wrong or missing token is 401 `{ "error": "unknown plugin or bad token" }` on every route under `/v1/plugin-host/`, `hello` included (`hello-bad-token.json`). |
+| `HECATON_PLUGIN_TOKEN` | The bearer for every plugin → daemon call: `Authorization: Bearer <token>`. A wrong or missing token is 401 `{ "error": "unknown plugin or bad token" }` on every route under `/v1/plugin-host/`, `hello` included (`hello-bad-token.json`). It is also the bearer the daemon presents on every daemon → plugin call (§4); a plugin must check it and answer 401 `{ "error": "bad daemon token" }` to anything else (`activate-bad-token.json`), since its listener is a loopback port any local process can reach. |
 | `HECATON_PLUGIN_SCRATCH` | A read-write scratch directory; no API call needed. |
 
 ## 3. Plugin → daemon
@@ -88,10 +88,15 @@ bare `.` or `..` segment. `PUT` and
 At the `listen` address the plugin's `hello` gave (§3), plain HTTP, 5 s
 timeout unless stated otherwise.
 
+Every request carries `Authorization: Bearer <HECATON_PLUGIN_TOKEN>` — the
+plugin's own token (§2). The fixtures' `headers` object is what the daemon
+sends; `activate-bad-token.json` records the refusal a plugin must answer.
+
 | Route | Request | Response | Status | Fixture |
 |---|---|---|---|---|
 | `POST /v1/activate` | `{ agent, config }` | `{}` | 200 | `activate.json` |
 | `POST /v1/activate`, rejected | `{ agent, config }` | `{ error }` | 400 | `activate-rejected.json` |
+| `POST /v1/activate`, wrong or missing bearer | same | `{ error }` | 401 | `activate-bad-token.json` |
 | `POST /v1/deactivate` | `{ agent }` | `{}` | 200 | (same success shape as `activate.json`) |
 | `POST /v1/events` | `{ events: [HookEvent] }` | `{}` | 200 | `events.json` |
 | `POST /v1/intercept` | `{ event, response_so_far, deadline_ms }` | `{ response, actions }` | 200 | `intercept.json` |
@@ -165,12 +170,13 @@ never activates simply never runs for that agent.
 
 ## 6. Conformance
 
-`docs/plugin-protocol/*.json` holds fourteen fixtures, one JSON object
+`docs/plugin-protocol/*.json` holds fifteen fixtures, one JSON object
 each: `{ route, direction, request, status, response }` for
 `daemon-to-plugin` and most `plugin-to-daemon` routes; `raw` (base64)
 replaces `request`/`response` for the kv byte bodies, `health.json` and
 `metrics.json`; `hello-bad-token.json` additionally carries a top-level
-`"token"` to send instead of the real one.
+`"token"` to send instead of the real one. daemon-to-plugin fixtures also
+carry `headers`, the request headers the daemon sends.
 
 Two tests replay every fixture:
 

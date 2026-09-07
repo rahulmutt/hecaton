@@ -176,11 +176,11 @@ async fn metrics(State(state): State<AppState>) -> Response {
     // the scrapes running in parallel despite the sequential awaits below.
     let mut scrapes = Vec::new();
     for name in registry.names() {
-        let Some(listen) = registry.ready_listen(&name) else {
+        let Some(addr) = registry.ready_addr(&name) else {
             continue;
         };
         let client = state.daemon.client().clone();
-        let handle = tokio::spawn(async move { client.metrics(&listen, SCRAPE_TIMEOUT).await });
+        let handle = tokio::spawn(async move { client.metrics(&addr, SCRAPE_TIMEOUT).await });
         scrapes.push((name, handle));
     }
     for (name, handle) in scrapes {

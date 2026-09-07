@@ -7,6 +7,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use hecaton_api::{ActivateRequest, EventBatch, InterceptRequest};
+use hecaton_server::PluginAddr;
 use hecaton_server::PluginClient;
 use hecaton_server::testing::{StubScript, stub_plugin};
 use serde_json::{Value, json};
@@ -55,18 +56,23 @@ async fn the_client_sends_the_documented_bodies() {
             submit: true,
         }],
         health_ok: true,
+        expect_token: Some("tok".into()),
     })
     .await;
     let c = PluginClient::new().unwrap();
+    let addr = PluginAddr {
+        listen: stub.listen.clone(),
+        token: "tok".into(),
+    };
 
     let f = fixture("activate");
     let req: ActivateRequest = serde_json::from_value(f["request"].clone()).unwrap();
-    c.activate(&stub.listen, &req).await.unwrap();
+    c.activate(&addr, &req).await.unwrap();
     assert_eq!(stub.calls_named("activate")[0], f["request"]);
 
     let f = fixture("activate-rejected");
     let req: ActivateRequest = serde_json::from_value(f["request"].clone()).unwrap();
-    let e = c.activate(&stub.listen, &req).await.unwrap_err();
+    let e = c.activate(&addr, &req).await.unwrap_err();
     assert_eq!(
         e.to_string(),
         format!("HTTP 400: {}", f["response"]["error"].as_str().unwrap())
@@ -74,13 +80,13 @@ async fn the_client_sends_the_documented_bodies() {
 
     let f = fixture("events");
     let batch: EventBatch = serde_json::from_value(f["request"].clone()).unwrap();
-    c.events(&stub.listen, &batch).await.unwrap();
+    c.events(&addr, &batch).await.unwrap();
     assert_eq!(stub.calls_named("events")[0], f["request"]);
 
     let f = fixture("intercept");
     let req: InterceptRequest = serde_json::from_value(f["request"].clone()).unwrap();
     let v = c
-        .intercept(&stub.listen, &req, Duration::from_secs(1))
+        .intercept(&addr, &req, Duration::from_secs(1))
         .await
         .unwrap();
     assert_eq!(stub.calls_named("intercept")[0], f["request"]);
@@ -90,16 +96,34 @@ async fn the_client_sends_the_documented_bodies() {
     // what the client makes of them is the assertion.
     let f = fixture("health");
     assert_eq!(f["request"], Value::Null);
-    c.health(&stub.listen).await.unwrap();
+    c.health(&addr).await.unwrap();
     assert_eq!(stub.calls_named("health").len(), 1);
 
-    let text = c
-        .metrics(&stub.listen, Duration::from_secs(1))
-        .await
-        .unwrap();
+    let text = c.metrics(&addr, Duration::from_secs(1)).await.unwrap();
     assert_eq!(text, metrics_body);
     assert!(
         text.starts_with("# HELP hecaton_plugin_flow_state"),
         "{text}"
+    );
+
+    // §18.3: a call without the plugin's own token is refused by the plugin
+    let f = fixture("activate-bad-token");
+    let wrong = PluginAddr {
+        listen: stub.listen.clone(),
+        token: f["headers"]["authorization"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches("Bearer ")
+            .to_string(),
+    };
+    let req: ActivateRequest = serde_json::from_value(f["request"].clone()).unwrap();
+    let e = c.activate(&wrong, &req).await.unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "HTTP {}: {}",
+            f["status"].as_u64().unwrap(),
+            f["response"]["error"].as_str().unwrap()
+        )
     );
 }

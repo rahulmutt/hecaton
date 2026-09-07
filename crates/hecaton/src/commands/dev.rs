@@ -301,6 +301,7 @@ pub fn fake_plugin_command() -> Result<String> {
     std::fs::create_dir_all(&scratch)?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
+        let token = env.token.clone();
         let host = Host::new(env)?;
         let (listener, listen) = match bind().await {
             Ok(b) => b,
@@ -312,7 +313,7 @@ pub fn fake_plugin_command() -> Result<String> {
         let plugin = Arc::new(FakePlugin {
             scratch: scratch.clone(),
         });
-        let server = tokio::spawn(run(listener, plugin));
+        let server = tokio::spawn(async move { run(listener, plugin, &token).await });
         let resp = host.hello(env!("CARGO_PKG_VERSION"), &listen).await?;
         std::fs::write(
             scratch.join("fake-plugin.hello"),
