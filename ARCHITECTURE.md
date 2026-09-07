@@ -29,15 +29,18 @@ against what was declared.
   deep-merges settings layers as JSON values, types and validates each agent.
 - `hecaton-server` — the daemon: one actor task per fleet over the reconciler,
   `FileFleetStore` with an encrypted `secrets.enc`, axum routes, hook ingress,
-  `/metrics`, `plugins/`: `plugins.yaml` sync, package install, `PluginHost`.
-  Depends on `core` + `api` only; the binary hands it the runtime.
+  `/metrics`, `plugins/`: `plugins.yaml` sync, package install, `PluginHost`,
+  `PluginRegistry` (activations, interceptor order), `PluginEventHandler` (the
+  chain), `PluginKv`. Depends on `core` + `api` only; the binary hands it the
+  runtime.
 - `hecaton` — the binary, and the only crate allowed to see both ports and
   adapters; it does the wiring.
 - `hecaton-runtime` — driven adapters over git, gh, mise, nono, tmux. One
   module per materialization step; every path from StateLayout, every binary
   from ToolPaths; never reads the process environment.
 - `hecaton-plugin-sdk` — the plugin side of the host protocol; depends on
-  `api` only. Phase 1 ships `Env` and `hello`.
+  `api` only. `Host` (async, one method per route), the `Plugin` trait and
+  `serve`, `testing::FakeHost`.
 
 ## How it flows
 **Config (Phase 1):** `read` (file.rs) → `resolve` (resolve.rs): for each agent fold
@@ -73,6 +76,22 @@ runtime materializes it like an agent under `plugins/<name>/` (`home/`,
 profile, `launch.sh` running `nono run → mise run <start>` from the package
 root). The actor's per-agent hook secret is the plugin's token;
 `POST /v1/plugin-host/hello` verifies it and is the plugin's `SessionStart`.
+
+**Event protocol (Spec B, phase 2a):** `up` resolves the spec and the daemon,
+before its actor sees it, activates every `(agent, plugin)` pair on a `Ready`
+plugin (`POST /v1/activate` at the address the plugin gave in `hello`); a
+rejection is a 400 `crews.<c>.agents.<a>.plugins.<p>: <message>` and nothing
+lands, a plugin that is not ready leaves the pair `pending` until its next
+`hello`. Activation rows are the `PluginRegistry`'s and are overlaid on the
+record at read time, so `up` waits on them and `status` shows them. Every
+hook event runs `PluginEventHandler`: the interceptors that subscribe to it
+and are active for the agent, in `plugins.yaml` order, each given what
+remains of a 1500 ms budget, failures skipped and counted; the last response
+goes to Claude; the verdict's actions run afterwards (`send_text` through the
+runner, `stop`/`restart` through the actor's `SetStopped`). Observers get
+batches from a per-plugin queue. Plugins call back through
+`/v1/plugin-host/{fleets,agents/*/actions,kv}` with their token, gated by the
+manifest's `needs`. `docs/plugin-protocol.md` is the contract.
 
 ## Non-obvious decisions
 - **Merge is a left fold, not associative.** `null` means "delete relative to the
@@ -139,3 +158,22 @@ root). The actor's per-agent hook secret is the plugin's token;
   `MISE_GLOBAL_CONFIG_FILE` inside the sandbox; `MISE_CEILING_PATHS` =
   package parent + plugin home), while the daemon-side `mise trust`/`mise
   install` name it through `MISE_GLOBAL_CONFIG_FILE`.
+- **Activation runs before the actor, and its state is a read-time overlay.**
+  `Daemon::apply` activates first so a rejection can be a 400 with nothing
+  landed; the registry owns the rows and `Daemon::get`/`snapshots` copy them
+  into `AgentStatus.plugins`. Two writers, two records: the actor's is
+  persisted, the registry's is rebuilt from the fleet records at start
+  (§16.2, §16.3).
+- **`stop` and `restart` are per-agent desired state.** `FleetRecord.stopped`
+  is honoured by the planner: stopped if observed, never restarted, counter
+  untouched. A `restart` is stop then resume, two passes; an `Apply` clears
+  the set for every declared agent (§16.4).
+- **The chain fails open.** A dead or slow interceptor is skipped and
+  counted; a dead `flow` plugin stops blocking, which the threat model
+  accepts.
+- **The daemon speaks `reqwest` to plugins, the CLI still speaks `ureq`.**
+  The chain runs on every hook event under a deadline; a blocking client
+  would cost a thread per event (§16.1). No TLS feature on either.
+- **Plugin metrics are re-exported only under `hecaton_plugin_<name>_`.** A
+  body with any other family is dropped whole, so a plugin cannot spoof the
+  daemon's own series.

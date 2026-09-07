@@ -20,7 +20,7 @@ phases; the rest exist in code today.
 - **Daemon ↔ external tools** — argv/config handed to `git`, `gh`, `mise`, `nono`, `tmux`, `claude`.
 - **Cloned repositories** — a repo's own `.claude/` settings, hooks and scripts are attacker-controlled content.
 - **Supply chain** — crates and pinned tools.
-- **Plugin ↔ daemon** — operator-installed packages running sandboxed; `hello` and (later) the host protocol cross it over loopback HTTP with a per-plugin token.
+- **Plugin ↔ daemon** — operator-installed packages running sandboxed; `hello`, the host routes (`fleets`, `actions`, `kv`) and, the other way, `activate`/`deactivate`/`events`/`intercept`/`health`/`metrics` at the address the plugin gave in `hello` cross it over loopback HTTP with a per-plugin token.
 
 ## Adversaries
 - **A compromised or misbehaving agent** — can run any command the sandbox allows, emit arbitrary hook payloads, write anything into its worktree and the shared crew `.git`. Wants: credentials, other agents' data, host access.
@@ -47,6 +47,7 @@ phases; the rest exist in code today.
 - **The hecaton and mise binaries are readable inside the sandbox** (`mise exec` is the launcher; mise-action puts `mise` under `$HOME` on CI runners) (it is the `SessionStart` relay); the admin token and the state root are not granted, so an agent cannot drive the fleet API. `hook-relay` lets an agent post events as itself, which it could already do over HTTP.
 - **A plugin can read its package and the shared mise install dir** — both are read-only grants; a package is operator-installed, digest-checked content.
 - **A malicious package is trusted at install time** — `mise trust` + `mise install` run outside the sandbox as the daemon user (`crates/hecaton-runtime/src/plugin.rs::install_plugin_tools`), and the manifest's `sandbox` block may widen the plugin's own grants; the sandbox defends against a plugin compromised at runtime, not against installing a hostile package. Packages are operator-declared and digest-pinned.
+- **Interceptors fail open**: a dead, slow or misbehaving `flow` plugin stops blocking — hook events are allowed and counted, never held. A plugin with `actions` can stop, restart or type into any agent it is active for; with `fleets` it sees every user fleet's resolved spec (never credentials or hook secrets).
 
 ## Mitigations
 | Threat | Control | Where |
@@ -67,3 +68,7 @@ phases; the rest exist in code today.
 | Plugin token | 32 random bytes, minted when the plugin is first declared and rotated on remove + re-add (the actor reuses an existing secret on every later `Apply`, so a restart keeps it), only in the 0600 `nono-profile.json` (`HECATON_PLUGIN_TOKEN`) and the `Authorization` header; constant-time compare, unknown plugin and bad token answer alike; the SDK redacts it in `Debug` | `daemon.rs::plugin_hello`, `hecaton-plugin-sdk/src/lib.rs` |
 | Plugin sandbox | read: system dirs, shared mise dir, the package, the hecaton and mise binaries; read-write: `home/` and `scratch/` only; `kv/` is never granted; `nono profile validate` before launch; manifest `sandbox` conflicts rejected | `crates/hecaton-runtime/src/plugin.rs` |
 | Reserved fleet | `hecaton` refused for user fleets at the API and client-side, so no user spec can shadow the plugin fleet's ids or secrets | `daemon.rs::reject_reserved`, `hecaton-config/src/resolve.rs` |
+| Plugin host routes | plugin identified by its token alone (constant-time compare against the plugin fleet's index); every route gated by the manifest's `needs` (403); bodies ≤ 1 MiB; `fleets` never returns the `hecaton` fleet; `actions` only for agents the plugin is `Active` for | `plugin_api.rs`, `registry.rs` |
+| Plugin KV | keys validated (`[A-Za-z0-9._/-]{1,200}`, no `..`) before any path; one 0600 file per key under `plugins/<name>/kv/`, never granted to the sandbox; `?secret=true` sealed by the vault with `<plugin>/<key>` as associated data | `plugins/kv.rs` |
+| Plugin responses | `intercept` bodies must be JSON objects, else skipped; rejection messages quoted verbatim into the config-path error and never parsed; metrics bodies dropped whole unless every family carries the plugin's prefix; a plugin's `activate` can only reject its own pair | `plugins/client.rs`, `plugin_api.rs::families_ok` |
+| Loopback only, both ways | the daemon calls a plugin only at a loopback `listen` it validated at `hello`; the client is built with `no_proxy()`; no TLS feature in `reqwest` (P3-1) | `host.rs::hello`, `plugins/client.rs` |

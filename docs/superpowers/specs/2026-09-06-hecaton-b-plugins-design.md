@@ -577,8 +577,13 @@ untouched by activation (PB-5).
 
 `AgentStatus` gains `plugins: BTreeMap<String, PluginActivation>` with
 `state: pending | active | rejected` and a `message`; `PluginStatus` gains
-`active_agents`. `status` prints both. The daemon publishes activation
-changes through the fleet's actor so the snapshot stays single-writer.
+`active_agents`. `status` prints both. Activation state is a read-time
+overlay, not an actor message: the `PluginRegistry` owns the `(agent,
+plugin) → PluginActivation` table, and `Daemon::get`/`snapshots`/`apply`
+copy it into `AgentStatus.plugins` on the way out. The actor never sees
+activations and its persisted record never carries them, so the
+single-writer rule holds for both records — the actor writes the fleet
+record, the registry writes activations.
 
 `hecaton up`/`update` wait for fleet `Ready` **and** every activation of the
 fleet `active`. A `rejected` row fails the command at once with
@@ -634,3 +639,35 @@ Execution is one path, `Daemon::execute_action`, for chain verdicts and for
 - **Protocol doc**: `docs/plugin-protocol.md` states §4.1 and §4.2 as the
   versioned contract; fixtures under `docs/plugin-protocol/` are replayed
   through the SDK router and the server's client by the conformance test.
+
+## Refinements from the phase 2a plan (2026-09-07)
+
+Where the phase 2a implementation plan refined this section:
+
+- **Activation state is a read-time overlay, not an actor message.** §16.3
+  above said the daemon publishes activation changes "through the fleet's
+  actor"; the registry owns the `(agent, plugin) → PluginActivation` table
+  and `Daemon::get`/`snapshots`/`apply` copy it into `AgentStatus.plugins` on
+  the way out. The actor never sees activations, its persisted record never
+  carries them, and the single-writer rule holds for both: the actor writes
+  the record, the registry writes activations. `up` polls `GET
+  /v1/fleets/{name}`, so it sees the overlay.
+- **A plugin is identified by its token alone.** No route under
+  `/v1/plugin-host/` carries the plugin's name (§4.1 specifies only the
+  bearer). `Daemon::plugin_for_token` walks the `hecaton` fleet's entries of
+  the secret index with constant-time compares; plugins are few. `hello`
+  still checks that the body's `name` matches.
+- **`stopped` is keyed by the agent id's display form**, like
+  `FleetStatus.agents`, so a stored `fleet.json` from phase 1 loads with an
+  empty set (`#[serde(default)]`).
+- **Health is polled by a daemon task every 10 s**, and a failure only sets
+  the plugin's status message (`degraded: <reason>`), shown by `plugin
+  list`; the registry keeps that message, the actor's record is untouched.
+- **`fleets/watch` is not built** (§16.5); the `fleets` capability gates
+  `GET fleets` and `GET fleets/{f}` only.
+- **`hecaton_plugin_proxy_requests_total` is not registered**: it has no
+  producer until phase 3.
+- **`FleetRecord`, `Desired` and `Keep` moved to `hecaton-api`** (re-exported
+  by `hecaton-core`) so the SDK's `fleets()` is typed.
+- **The `hecaton` binary depends on `reqwest` only through the SDK**: no
+  direct dependency in `crates/hecaton/Cargo.toml`.
