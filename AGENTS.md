@@ -13,8 +13,9 @@ credentials, hook input, or sandbox rules.
 - `mutants` — nightly tier: mutation-tests `hecaton-core` (the reconciler).
 - `e2e` — the Phase 3 journey against a real daemon; needs the same tools as `test-it`.
 - `package-plugins` — builds the in-tree plugins and assembles each as a
-  directory source under `target/plugins/<name>/`; `test` and `e2e` depend
-  on it, and the flow e2e skips (fails under `HECATON_REQUIRE_TOOLS`) without it.
+  directory source under `target/plugins/<name>/` (under `CARGO_TARGET_DIR`
+  when set); `test` and `e2e` depend on it, and the flow e2e skips (fails
+  under `HECATON_REQUIRE_TOOLS`) without it.
 - `serve` — a foreground daemon under `target/tmp/serve` for poking by hand
   (`HOME` is overridden, so it never touches your real state).
 - `verify-claude` — the interactive spec §8.1 check with a real `claude`
@@ -153,7 +154,11 @@ credentials, hook input, or sandbox rules.
 - Flow's state is KV `state/<agent>` (`plugins/flow/kv/state/<fleet>/<crew>/<agent>`
   on disk). A plugin or daemon restart resumes it; `down`, a config change
   or dropping the block resets it (`deactivate` deletes the key). To reset
-  by hand: `down` and `up`.
+  by hand: `down` and `up`. A rejected `update` also resets it: `Daemon::apply`
+  deactivates a changed pair before offering the new config to the plugin
+  (§16.2), so a bad config that gets rejected still comes back through
+  `restore_pairs` with the key already gone, and the old config resumes at
+  `initial`.
 - `Plugin::metrics` returns `Option<&Metrics>`; register families through
   `Metrics` (short names, the SDK adds `hecaton_plugin_<name>_`). A plugin
   in another language must apply the prefix itself or its whole scrape is

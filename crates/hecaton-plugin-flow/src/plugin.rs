@@ -120,7 +120,11 @@ impl Plugin for FlowPlugin {
             .kv_get(&key)
             .await
             .map_err(|e| format!("kv: {e}"))?
-            .and_then(|bytes| serde_json::from_slice::<Stored>(&bytes).ok());
+            .and_then(|bytes| {
+                serde_json::from_slice::<Stored>(&bytes)
+                    .map_err(|e| eprintln!("flow: bad stored state for {agent}: {e}"))
+                    .ok()
+            });
         let resumed = previous
             .filter(|s| s.config == compiled.hash && compiled.states.contains_key(&s.state))
             .map(|s| s.state);

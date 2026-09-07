@@ -1099,12 +1099,20 @@ fn flow_journey() {
     assert_eq!(
         rec.status.phase,
         FleetPhase::Ready,
-        "the rejected update changed nothing"
+        "the rejected update leaves the fleet phase unchanged"
     );
     assert_eq!(
         rec.status.agents["e2e/c/alice"].plugins["flow"].state,
-        hecaton_api::ActivationState::Active
+        hecaton_api::ActivationState::Active,
+        "the rejected update leaves the activation row unchanged"
     );
+    // but the flow state itself is not preserved: Daemon::apply deactivates
+    // the changed pair (deleting the KV key) before offering the new config
+    // to the plugin (§16.2 order x §17.3 delete-on-deactivate), so
+    // restore_pairs brings the old config back with no stored state to
+    // resume and it starts over at `initial`
+    let stored = wait_file_until(&kv, |s| s.contains("\"working\""));
+    assert!(stored.contains("\"state\":\"working\""), "{stored}");
 
     // down deactivates: the key is deleted
     let out = w.ok(&["down", "e2e", "--keep", "--timeout", "60s"]);

@@ -595,6 +595,10 @@ mod tests {
             h.activate("f/c/bad", json!({})).await,
             Err("initial: no state \"x\" declared".into())
         );
+        // a malformed body (no `config`) never reaches the plugin: the
+        // extractor itself answers 400 (plugin-protocol §4.2)
+        let (status, body) = h.post("/v1/activate", &json!({ "agent": "f/c/a" })).await;
+        assert_eq!(status, 400, "{body}");
         h.deactivate("f/c/a").await;
         h.observe(vec![event("f/c/a", "SessionStart", json!({}))])
             .await;
