@@ -438,22 +438,29 @@ async fn host_routes_are_gated_by_needs_and_kv_and_actions_work() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plugin_metrics_are_re_exported_under_the_prefix_rule() {
     let w = world().await;
-    struct Good;
+    struct Good(hecaton_plugin_sdk::Metrics);
     impl Plugin for Good {
-        async fn metrics(&self) -> String {
-            "hecaton_plugin_flow_state{agent=\"a\"} 1\n".into()
+        fn metrics(&self) -> Option<&hecaton_plugin_sdk::Metrics> {
+            Some(&self.0)
         }
     }
-    struct Bad;
-    impl Plugin for Bad {
-        async fn metrics(&self) -> String {
-            "hecaton_agents{fleet=\"spoof\"} 9\n".into()
-        }
-    }
+    let good = hecaton_plugin_sdk::Metrics::new("flow");
+    good.int_gauge_vec("state", "s", &["agent"])
+        .unwrap()
+        .with_label_values(&["a"])
+        .set(1);
     let (l1, listen1) = bind().await.unwrap();
-    tokio::spawn(run(l1, Arc::new(Good)));
+    tokio::spawn(run(l1, Arc::new(Good(good))));
+    // A plugin outside the SDK answering an unprefixed family: the daemon
+    // must drop the body whole.
+    let bad = axum::Router::new().route(
+        "/v1/metrics",
+        axum::routing::get(|| async { "hecaton_agents{fleet=\"spoof\"} 9\n" }),
+    );
     let (l2, listen2) = bind().await.unwrap();
-    tokio::spawn(run(l2, Arc::new(Bad)));
+    tokio::spawn(async move {
+        let _ = axum::serve(l2, bad).await;
+    });
     for (name, listen) in [("flow", listen1), ("web", listen2)] {
         let env = Env {
             api_url: w.api.base.clone(),

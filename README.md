@@ -26,7 +26,12 @@ a repository.
    `plugin list` shows each plugin's phase and how many agents it is active
    for; an agent opts into a plugin with `plugins: { <name>: { …config… } }`
    in its settings block and `up` waits until the plugin has accepted it.
-8. `mise x -- cargo run -q -p hecaton -- dev materialize examples/payments.yaml backend/bob --no-host-defaults`
+8. `mise run package-plugins` — assembles the in-tree `flow` plugin under
+   `target/plugins/flow/`; point a `plugins.yaml` entry's `source` at that
+   directory and give an agent a `plugins: { flow: … }` block to drive it
+   by rule: block a tool call, send text on `Stop`, move between states.
+   `examples/payments.yaml` shows one.
+9. `mise x -- cargo run -q -p hecaton -- dev materialize examples/payments.yaml backend/bob --no-host-defaults`
    — renders bob's generated files into a temp dir without launching anything.
 
 ## Where to look
@@ -38,10 +43,9 @@ a repository.
 
 ## Status
 Spec A is complete. Spec B (plugins) is in progress: phase 1 (plugin
-workloads) and phase 2a (the event protocol: activation, the interceptor
-chain, observers, actions, the `fleets`/`actions`/`kv` routes, the full SDK,
-`docs/plugin-protocol.md`) are done; phase 2b, the `flow` plugin, is next,
-then the proxy and `web`.
+workloads), phase 2a (the event protocol) and phase 2b (the `flow` plugin,
+`mise run package-plugins`, the SDK's metrics registry and test harness)
+are done; phase 3, the proxy, attach, `fleets/watch` and `web`, is next.
 
 ### Upgrading to Spec B phase 1
 - Fleet files rename the reserved `flow: {}` settings block to `plugins: {}`
@@ -58,3 +62,8 @@ then the proxy and `web`.
 - An agent naming a plugin that is not in `plugins.yaml` now fails `up` with
   `crews.<c>.agents.<a>.plugins.<p>: no plugin "<p>" is installed` (phase 1
   ignored the block).
+
+### Upgrading to Spec B phase 2b
+- `Plugin::metrics` in the SDK returns `Option<&Metrics>` instead of text;
+  register families through `Metrics` and the prefix is applied for you.
+- `mise run test` and `mise run e2e` now run `package-plugins` first.

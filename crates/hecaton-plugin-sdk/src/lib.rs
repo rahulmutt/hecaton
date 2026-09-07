@@ -9,10 +9,12 @@ use std::fmt;
 use std::path::PathBuf;
 
 pub mod host;
+pub mod metrics;
 pub mod plugin;
 pub mod testing;
 
 pub use host::Host;
+pub use metrics::Metrics;
 pub use plugin::{Plugin, bind, router, run, serve};
 
 /// The four `HECATON_*` variables the daemon sets through the nono profile
@@ -47,6 +49,8 @@ pub enum SdkError {
     Status { status: u16, message: String },
     #[error("listen: {0}")]
     Bind(String),
+    #[error("metrics: {0}")]
+    Metrics(String),
 }
 
 impl Env {

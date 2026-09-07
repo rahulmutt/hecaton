@@ -99,7 +99,7 @@ async fn the_client_sends_the_documented_bodies() {
         .unwrap();
     assert_eq!(text, metrics_body);
     assert!(
-        text.starts_with("# TYPE hecaton_plugin_flow_state"),
+        text.starts_with("# HELP hecaton_plugin_flow_state"),
         "{text}"
     );
 }

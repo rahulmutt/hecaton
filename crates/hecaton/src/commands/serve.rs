@@ -198,8 +198,11 @@ fn run(
             unchanged = plugins.unchanged.len(),
             "plugins synced"
         );
-        write_endpoint(&paths.endpoint(), &url)?;
+        // The endpoint file is the readiness signal: `serve -d` returns and
+        // clients connect the moment it appears, so everything they may read
+        // next — the pid file above all — must already be in place.
         write_pid(&paths.pid(), std::process::id())?;
+        write_endpoint(&paths.endpoint(), &url)?;
         tracing::info!(%url, fleets, tmux_socket, "hecaton daemon listening");
         if !detached_child {
             eprintln!("listening on {url}");

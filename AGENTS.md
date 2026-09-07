@@ -12,6 +12,10 @@ credentials, hook input, or sandbox rules.
   instead of skipping.
 - `mutants` — nightly tier: mutation-tests `hecaton-core` (the reconciler).
 - `e2e` — the Phase 3 journey against a real daemon; needs the same tools as `test-it`.
+- `package-plugins` — builds the in-tree plugins and assembles each as a
+  directory source under `target/plugins/<name>/` (under `CARGO_TARGET_DIR`
+  when set); `test` and `e2e` depend on it, and the flow e2e skips (fails
+  under `HECATON_REQUIRE_TOOLS`) without it.
 - `serve` — a foreground daemon under `target/tmp/serve` for poking by hand
   (`HOME` is overridden, so it never touches your real state).
 - `verify-claude` — the interactive spec §8.1 check with a real `claude`
@@ -26,7 +30,8 @@ credentials, hook input, or sandbox rules.
   `hecaton-server` receives `Ports` and never imports `hecaton-runtime`.
   `hecaton-plugin-sdk` depends on `hecaton-api` only. `hecaton-server`'s
   *dev*-dependencies may include `hecaton-plugin-sdk` (in-process plugin
-  tests).
+  tests). Plugin crates (`hecaton-plugin-flow`) depend on `hecaton-plugin-sdk`
+  and `hecaton-api` only.
 - Library crates return `thiserror` errors whose messages start with the config
   path (`crews.backend.agents.bob.tools.node: …`); only the binary uses `anyhow`.
 - Every tool version — `mise.toml` and fleet `tools:` — is exact.
@@ -142,3 +147,25 @@ credentials, hook input, or sandbox rules.
   plugin: `Daemon::apply` only activates a pair inline against a plugin that
   is already listening, and the agent's first `PreToolUse` can fire before a
   pending pair's next `hello`.
+- Flow `match` regexes are full-match (`^(?:…)$`); `"rm -rf"` does not match
+  `rm -rf /x`, `"rm -rf.*"` does. Compiled at `activate` with a 10 KiB size
+  limit; errors carry the path
+  `states.<s>.on[<i>].match.<pointer>: …`.
+- Flow's state is KV `state/<agent>` (`plugins/flow/kv/state/<fleet>/<crew>/<agent>`
+  on disk). A plugin or daemon restart resumes it; `down`, a config change
+  or dropping the block resets it (`deactivate` deletes the key). To reset
+  by hand: `down` and `up`. A rejected `update` also resets it: `Daemon::apply`
+  deactivates a changed pair before offering the new config to the plugin
+  (§16.2), so a bad config that gets rejected still comes back through
+  `restore_pairs` with the key already gone, and the old config resumes at
+  `initial`.
+- `Plugin::metrics` returns `Option<&Metrics>`; register families through
+  `Metrics` (short names, the SDK adds `hecaton_plugin_<name>_`). A plugin
+  in another language must apply the prefix itself or its whole scrape is
+  dropped.
+- Test a plugin through `hecaton_plugin_sdk::testing::Harness`: it serves
+  the real router and speaks to it over HTTP; `restart` swaps the instance
+  against the same `FakeHost` (KV kept).
+- `target/plugins/<name>/` is the *development* package layout (binary in
+  `bin/`). A release package pins the binary as a mise tool and ships no
+  binary (`docs/plugin-protocol.md` §7).

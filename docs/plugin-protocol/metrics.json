@@ -3,5 +3,5 @@
   "direction": "daemon-to-plugin",
   "request": null,
   "status": 200,
-  "raw": "IyBUWVBFIGhlY2F0b25fcGx1Z2luX2Zsb3dfc3RhdGUgZ2F1Z2UKaGVjYXRvbl9wbHVnaW5fZmxvd19zdGF0ZXthZ2VudD0iYm9iIixzdGF0ZT0id29ya2luZyJ9IDEK"
+  "raw": "IyBIRUxQIGhlY2F0b25fcGx1Z2luX2Zsb3dfc3RhdGUgQ3VycmVudCBmbG93IHN0YXRlICgxIGZvciB0aGUgY3VycmVudCBzdGF0ZSkKIyBUWVBFIGhlY2F0b25fcGx1Z2luX2Zsb3dfc3RhdGUgZ2F1Z2UKaGVjYXRvbl9wbHVnaW5fZmxvd19zdGF0ZXthZ2VudD0iYm9iIixzdGF0ZT0id29ya2luZyJ9IDEK"
 }

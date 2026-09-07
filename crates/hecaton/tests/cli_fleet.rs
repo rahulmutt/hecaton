@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,7 +13,42 @@ use hecaton_server::testing::Harness;
 use hecaton_server::{Daemon, router, serve};
 use predicates::prelude::*;
 
-const PAYMENTS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/payments.yaml");
+// Not `examples/payments.yaml`: the example fleet names the `flow` plugin,
+// which this stub daemon does not install, so `up`/`update` would be
+// rejected before any of the CLI mechanics below ran. Same shape (fleet
+// `payments`, crew `backend`, agents `alice` and `bob`) minus the plugin.
+const FLEET_YAML: &str = r#"apiVersion: hecaton/v1
+kind: Fleet
+name: payments
+defaults:
+  claude:
+    settings: { model: sonnet, permissions: { allow: ["Bash(git *)"] } }
+    args: ["--verbose"]
+    resume: true
+  sandbox:
+    network: { mode: allow }
+  tools: { node: "22.11.0" }
+  env: { RUST_LOG: info }
+  runner: { type: tmux }
+  plugins: {}
+crews:
+  backend:
+    repo: acme/payments-api
+    ref: main
+    git: { push: true, auth: gh }
+    defaults:
+      tools: { python: "3.12.8" }
+    agents:
+      alice: {}
+      bob: { claude: { settings: { model: opus } } }
+"#;
+
+/// Writes `FLEET_YAML` under `dir` and returns its path.
+fn fleet_file(dir: &Path) -> PathBuf {
+    let path = dir.join("payments.yaml");
+    fs::write(&path, FLEET_YAML).unwrap();
+    path
+}
 
 /// A daemon on port 0 over the fakes; the binary finds it through the
 /// endpoint and token files under this HOME.
@@ -71,23 +106,25 @@ fn hecaton(home: &Path) -> Command {
 fn up_status_list_update_and_down_through_the_binary() {
     let s = stub();
     let home = s.home.path();
+    let fleet = fleet_file(home);
+    let fleet = fleet.to_str().unwrap();
 
     hecaton(home)
-        .args(["up", PAYMENTS, "--no-host-defaults", "--no-wait"])
+        .args(["up", fleet, "--no-host-defaults", "--no-wait"])
         .assert()
         .success()
         .stdout(predicate::str::contains(
             "payments  pending  generation 1 (observed 0)",
         ));
     hecaton(home)
-        .args(["up", PAYMENTS, "--no-host-defaults", "--no-wait"])
+        .args(["up", fleet, "--no-host-defaults", "--no-wait"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("fleet exists"));
 
     // the fakes start every window but nothing sends SessionStart: up times out
     hecaton(home)
-        .args(["update", PAYMENTS, "--no-host-defaults", "--timeout", "2s"])
+        .args(["update", fleet, "--no-host-defaults", "--timeout", "2s"])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
@@ -133,7 +170,7 @@ fn up_status_list_update_and_down_through_the_binary() {
         assert_eq!(resp.status().as_u16(), 200);
     }
     hecaton(home)
-        .args(["update", PAYMENTS, "--no-host-defaults", "--timeout", "30s"])
+        .args(["update", fleet, "--no-host-defaults", "--timeout", "30s"])
         .assert()
         .success()
         .stdout(predicate::str::contains(
@@ -180,8 +217,15 @@ fn without_a_daemon_the_client_says_how_to_start_one() {
         .stderr(predicate::str::contains(
             "daemon not running; run `hecaton serve -d`",
         ));
+    let fleet = fleet_file(home.path());
     hecaton(home.path())
-        .args(["up", PAYMENTS, "--no-host-defaults", "--timeout", "zz"])
+        .args([
+            "up",
+            fleet.to_str().unwrap(),
+            "--no-host-defaults",
+            "--timeout",
+            "zz",
+        ])
         .assert()
         .failure()
         .stderr(predicate::str::contains("invalid duration"));

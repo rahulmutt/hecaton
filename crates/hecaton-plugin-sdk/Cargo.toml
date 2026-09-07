@@ -1,6 +1,6 @@
 [package]
 name = "hecaton-plugin-sdk"
-description = "Rust SDK for hecaton plugins: environment, hello, and (later) the host protocol"
+description = "Rust SDK for hecaton plugins: environment, the host protocol, metrics, and a test harness"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,6 +15,7 @@ thiserror = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
+prometheus = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

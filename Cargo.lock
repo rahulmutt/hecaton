@@ -657,11 +657,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "hecaton-plugin-flow"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hecaton-api",
+ "hecaton-plugin-sdk",
+ "hex",
+ "proptest",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "sha2",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "hecaton-plugin-sdk"
 version = "0.1.0"
 dependencies = [
  "axum",
  "hecaton-api",
+ "prometheus",
  "reqwest",
  "serde",
  "serde_json",

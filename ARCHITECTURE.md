@@ -40,7 +40,13 @@ against what was declared.
   from ToolPaths; never reads the process environment.
 - `hecaton-plugin-sdk` — the plugin side of the host protocol; depends on
   `api` only. `Host` (async, one method per route), the `Plugin` trait and
-  `serve`, `testing::FakeHost`.
+  `serve`, `testing::FakeHost`, `Metrics` (the prefixing registry) and
+  `testing::Harness`.
+- `hecaton-plugin-flow` — the first in-tree plugin, on the SDK: a per-agent
+  state machine over hook events (`config.rs` parses and compiles the
+  `plugins.flow` block, `machine.rs` is the pure step, `plugin.rs` owns the
+  agents, the KV-mirrored state and the metrics). Plugin crates depend on
+  the SDK and `api` only.
 
 ## How it flows
 **Config (Phase 1):** `read` (file.rs) → `resolve` (resolve.rs): for each agent fold
@@ -92,6 +98,17 @@ runner, `stop`/`restart` through the actor's `SetStopped`). Observers get
 batches from a per-plugin queue. Plugins call back through
 `/v1/plugin-host/{fleets,agents/*/actions,kv}` with their token, gated by the
 manifest's `needs`. `docs/plugin-protocol.md` is the contract.
+
+**Flow (Spec B, phase 2b):** an agent whose settings carry `plugins.flow`
+is activated on the flow plugin with that block; the plugin compiles it
+(full-match regexes, config-path errors the daemon prefixes into
+`crews.<c>.agents.<a>.plugins.flow: …`) and resumes or resets the agent's
+state from KV `state/<agent>`. Every hook event of that agent runs one
+step: the first rule of the current state whose event and `match` entries
+hold sets the verdict's keys, carries `send`/`action` as verdict actions,
+and moves the state — written back to KV before the verdict returns.
+`mise run package-plugins` assembles `target/plugins/flow/`, the directory
+source the e2e loads.
 
 ## Non-obvious decisions
 - **Merge is a left fold, not associative.** `null` means "delete relative to the
@@ -174,6 +191,20 @@ manifest's `needs`. `docs/plugin-protocol.md` is the contract.
 - **The daemon speaks `reqwest` to plugins, the CLI still speaks `ureq`.**
   The chain runs on every hook event under a deadline; a blocking client
   would cost a thread per event (§16.1). No TLS feature on either.
+- **Flow's regexes are full-match.** `match: { /tool_input/command: "rm" }`
+  matches only the command `rm`; write `rm.*`. A pattern silently matching
+  every command containing it is the worse surprise (§17.2).
+- **Flow's state survives restarts and resets on `deactivate`.** Plugin and
+  daemon restarts re-`activate` without a `deactivate`, so the KV state is
+  resumed; `down`, a config change and dropping the block go through
+  `deactivate`, which deletes it (§17.3). A rejected `update` also resets
+  it: the daemon deactivates the changed pair before offering the new
+  config to the plugin (§16.2 order × §17.3 delete-on-deactivate), so
+  restoring the old config after a rejection finds no stored state and
+  starts over at `initial`.
+- **Plugin metrics are registered through the SDK.** `Metrics` prefixes
+  every family, so an SDK plugin cannot trip the daemon's prefix rule
+  (§17.4).
 - **Plugin metrics are re-exported only under `hecaton_plugin_<name>_`.** A
   body with any other family is dropped whole, so a plugin cannot spoof the
   daemon's own series.

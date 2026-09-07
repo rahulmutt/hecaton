@@ -904,3 +904,226 @@ fn plugin_protocol_journey() {
     w.ok(&["down", "e2e", "--purge", "--timeout", "60s"]);
     drop(w);
 }
+
+/// Where `mise run package-plugins` left the flow package: next to this
+/// binary's target dir. `None` when it has not been run.
+fn flow_package() -> Option<PathBuf> {
+    let dir = Path::new(HECATON).parent()?.parent()?.join("plugins/flow");
+    dir.join("bin/hecaton-plugin-flow").exists().then_some(dir)
+}
+
+/// alice's `plugins:` block for the journey, in YAML flow style, with the
+/// `rm -rf` pattern injectable so the rejection case can break it.
+fn flow_block(pattern: &str) -> String {
+    format!(
+        "{{ flow: {{ initial: working, states: {{ \
+           working: {{ on: [ \
+             {{ event: PreToolUse, match: {{ /tool_input/command: \"{pattern}\" }}, \
+                respond: {{ decision: block, reason: \"flow: no recursive deletes\" }} }}, \
+             {{ event: Stop, goto: review, send: {{ text: \"flow says: run the tests\" }} }} ] }}, \
+           review: {{ on: [ {{ event: Stop, goto: done }} ] }}, \
+           done: {{}} }} }} }}"
+    )
+}
+
+/// Plugins spec §13 item 2b, "done when" (§17.7): the packaged flow plugin
+/// through a real daemon, nono and tmux — a block, a send_text, a
+/// transition visible in /metrics and in KV, a rejected `update` that
+/// leaves the fleet running, and a reset on `down`.
+#[test]
+fn flow_journey() {
+    let Some(nono) = tool("nono") else {
+        assert!(!require_or_skip("nono", false));
+        return;
+    };
+    for t in ["git", "gh", "mise", "tmux"] {
+        if !require_or_skip(t, tool(t).is_some()) {
+            return;
+        }
+    }
+    let Some(pkg) = flow_package() else {
+        assert!(!require_or_skip(
+            "target/plugins/flow (run `mise run package-plugins`)",
+            false
+        ));
+        return;
+    };
+    let root =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("e2e-flow-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    if !require_or_skip("landlock", landlock_works(&nono, &root)) {
+        return;
+    }
+    let w = World {
+        home: root.join("home"),
+        socket: format!("hecaton-e2e-flow-{}", std::process::id()),
+        tmux: tool("tmux").unwrap(),
+    };
+    fs::create_dir_all(&w.home).unwrap();
+    let cfg = w.home.join(".config/hecaton");
+    fs::create_dir_all(&cfg).unwrap();
+    fs::write(cfg.join("mise.toml"), "[tools]\n").unwrap();
+    fs::write(
+        cfg.join("plugins.yaml"),
+        format!(
+            "plugins:\n  - name: flow\n    source: \"{}\"\n",
+            pkg.display()
+        ),
+    )
+    .unwrap();
+
+    let work = root.join("work");
+    fs::create_dir_all(&work).unwrap();
+    git(&work, &["init", "-q", "-b", "main"]);
+    fs::write(work.join("README"), "hi\n").unwrap();
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-q", "-m", "init"]);
+    let bare = root.join("repo.git");
+    git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            &work.display().to_string(),
+            &bare.display().to_string(),
+        ],
+    );
+    let fleet = root.join("fleet.yaml");
+    fs::write(
+        &fleet,
+        fleet_yaml(&bare, None, Some(&flow_block("rm -rf.*"))),
+    )
+    .unwrap();
+
+    let out = w.ok(&[
+        "serve",
+        "-d",
+        "--bind",
+        "127.0.0.1:0",
+        "--tmux-socket",
+        &w.socket,
+    ]);
+    assert!(out.contains("http://127.0.0.1:"), "{out}");
+    let url = fs::read_to_string(w.state().join("server/endpoint"))
+        .unwrap()
+        .trim()
+        .to_string();
+    let plugin_dir = w.state().join("plugins/flow");
+    // as in plugin_protocol_journey: the pair must activate inline, before
+    // fake-claude's PreToolUse fires
+    wait_plugin_ready(&w, "flow", &plugin_dir);
+
+    let out = w.ok(&[
+        "up",
+        &fleet.display().to_string(),
+        "--no-host-defaults",
+        "--timeout",
+        "180s",
+    ]);
+    assert!(out.contains("e2e  ready"), "{out}");
+    assert!(out.contains("flow=active"), "{out}");
+
+    // the block came back through the HTTP hook, with flow's reason; bob is pass-through
+    let reply = wait_file(
+        &w.agent_dir("alice")
+            .join("home/fake-claude.PreToolUse.reply"),
+    );
+    assert!(reply.contains("\"decision\":\"block\""), "{reply}");
+    assert!(reply.contains("flow: no recursive deletes"), "{reply}");
+    let bob_reply = wait_file(&w.agent_dir("bob").join("home/fake-claude.PreToolUse.reply"));
+    assert_eq!(bob_reply.trim(), "{}", "bob has no plugin: pass-through");
+
+    // Stop → review carried the send_text to alice's stdin through tmux
+    let stdin = wait_file(&w.agent_dir("alice").join("home/fake-claude.stdin"));
+    assert!(stdin.contains("flow says: run the tests"), "{stdin}");
+
+    // the transition is in the daemon's /metrics (re-exported from the
+    // plugin's scrape) and in KV; poll: the KV put follows the verdict
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let state =
+        "hecaton_plugin_flow_state{agent=\"alice\",crew=\"c\",fleet=\"e2e\",state=\"review\"} 1";
+    let transition = "hecaton_plugin_flow_transitions_total{agent=\"alice\",crew=\"c\",fleet=\"e2e\",from=\"working\",to=\"review\"} 1";
+    let start = Instant::now();
+    let metrics = loop {
+        let m = agent
+            .get(format!("{url}/metrics"))
+            .call()
+            .unwrap()
+            .body_mut()
+            .read_to_string()
+            .unwrap();
+        if m.contains(state) && m.contains(transition) {
+            break m;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "metrics never showed the transition within 10s; last scrape:\n{m}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(
+        !metrics.contains("state=\"working\"} 1"),
+        "the previous state's series is gone: {metrics}"
+    );
+    let kv = plugin_dir.join("kv/state/e2e/c/alice");
+    let stored = wait_file_until(&kv, |s| s.contains("\"review\""));
+    assert!(stored.contains("\"state\":\"review\""), "{stored}");
+
+    // a bad regex is rejected with the full config path and the fleet keeps running
+    fs::write(&fleet, fleet_yaml(&bare, None, Some(&flow_block("[")))).unwrap();
+    let out = w.run(&[
+        "update",
+        &fleet.display().to_string(),
+        "--no-host-defaults",
+        "--timeout",
+        "60s",
+    ]);
+    assert!(!out.status.success(), "update with a bad regex must fail");
+    let err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        err.contains(
+            "crews.c.agents.alice.plugins.flow: states.working.on[0].match./tool_input/command: "
+        ),
+        "{err}"
+    );
+    let rec = w.status();
+    assert_eq!(
+        rec.status.phase,
+        FleetPhase::Ready,
+        "the rejected update leaves the fleet phase unchanged"
+    );
+    assert_eq!(
+        rec.status.agents["e2e/c/alice"].plugins["flow"].state,
+        hecaton_api::ActivationState::Active,
+        "the rejected update leaves the activation row unchanged"
+    );
+    // but the flow state itself is not preserved: Daemon::apply deactivates
+    // the changed pair (deleting the KV key) before offering the new config
+    // to the plugin (§16.2 order x §17.3 delete-on-deactivate), so
+    // restore_pairs brings the old config back with no stored state to
+    // resume and it starts over at `initial`
+    let stored = wait_file_until(&kv, |s| s.contains("\"working\""));
+    assert!(stored.contains("\"state\":\"working\""), "{stored}");
+
+    // down deactivates: the key is deleted
+    let out = w.ok(&["down", "e2e", "--keep", "--timeout", "60s"]);
+    assert!(out.contains("e2e  down"), "{out}");
+    let start = Instant::now();
+    while kv.exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "kv/state/e2e/c/alice still present after down"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    drop(w);
+}

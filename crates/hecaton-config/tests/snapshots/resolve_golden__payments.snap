@@ -33,7 +33,27 @@ crews:
           RUST_LOG: info
         runner:
           type: tmux
-        plugins: {}
+        plugins:
+          flow:
+            initial: working
+            states:
+              done: {}
+              review:
+                "on":
+                  - event: Stop
+                    goto: done
+              working:
+                "on":
+                  - event: PreToolUse
+                    match:
+                      /tool_input/command: rm -rf.*
+                    respond:
+                      decision: block
+                      reason: no recursive deletes
+                  - event: Stop
+                    goto: review
+                    send:
+                      text: Run the tests and fix any failures.
       bob:
         claude:
           settings:

@@ -54,7 +54,26 @@ fn b64(s: &str) -> Vec<u8> {
 }
 
 /// The reference plugin the daemon-to-plugin fixtures describe.
-struct Reference;
+struct Reference {
+    metrics: hecaton_plugin_sdk::Metrics,
+}
+
+impl Reference {
+    fn new() -> Self {
+        let metrics = hecaton_plugin_sdk::Metrics::new("flow");
+        metrics
+            .int_gauge_vec(
+                "state",
+                "Current flow state (1 for the current state)",
+                &["agent", "state"],
+            )
+            .unwrap()
+            .with_label_values(&["bob", "working"])
+            .set(1);
+        Self { metrics }
+    }
+}
+
 impl Plugin for Reference {
     async fn activate(&self, _agent: &str, config: Value) -> Result<(), String> {
         match config["initial"].as_str() {
@@ -78,15 +97,15 @@ impl Plugin for Reference {
             }],
         }
     }
-    async fn metrics(&self) -> String {
-        "# TYPE hecaton_plugin_flow_state gauge\nhecaton_plugin_flow_state{agent=\"bob\",state=\"working\"} 1\n".into()
+    fn metrics(&self) -> Option<&hecaton_plugin_sdk::Metrics> {
+        Some(&self.metrics)
     }
 }
 
 #[tokio::test]
 async fn the_router_answers_every_daemon_to_plugin_fixture() {
     let (listener, listen) = bind().await.unwrap();
-    tokio::spawn(run(listener, Arc::new(Reference)));
+    tokio::spawn(run(listener, Arc::new(Reference::new())));
     let c = reqwest::Client::builder().no_proxy().build().unwrap();
     for (name, f) in fixtures()
         .iter()

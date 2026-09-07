@@ -26,7 +26,12 @@ run = [
 
 [tasks.test]
 description = "Unit + integration tests"
+depends = ["package-plugins"]
 run = "cargo nextest run --workspace"
+
+[tasks.package-plugins]
+description = "Build the in-tree plugins and assemble them as directory sources under target/plugins/<name>/ (the e2e and `plugins.yaml` point at these)"
+run = "scripts/package-plugins.sh"
 
 [tasks.check]
 description = "Everything the PR tier runs"
@@ -57,6 +62,7 @@ run = "cargo nextest run -p hecaton-runtime"
 
 [tasks.e2e]
 description = "End-to-end journey against a real daemon, git, mise, nono and tmux (fails, not skips, without tools)"
+depends = ["package-plugins"]
 env = { HECATON_REQUIRE_TOOLS = "1" }
 run = "cargo nextest run -p hecaton --test e2e"
 

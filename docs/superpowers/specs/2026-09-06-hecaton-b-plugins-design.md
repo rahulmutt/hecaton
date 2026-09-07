@@ -345,7 +345,7 @@ plugins:
             goto: review
             send: { text: "Run the tests and fix any failures.", submit: true }
           - event: PreToolUse
-            match: { /tool_input/command: "^rm -rf" }
+            match: { /tool_input/command: "rm -rf.*" }   # full-match, §17.2
             respond: { decision: block, reason: "no recursive deletes" }
       review:
         on:
@@ -498,10 +498,12 @@ Three mergeable phases, each fully tested before the next:
      conformance test. Ends with `dev fake-plugin` blocking a `PreToolUse`
      and sending text in the e2e.
    - **2b, the flow plugin** — `hecaton-plugin-flow`, `mise run
-     package-plugins`, `fleets/watch`. Ends with the flow e2e assertions.
+     package-plugins`, the SDK's `Metrics` and `testing::Harness`. Ends
+     with the flow e2e assertions. (`fleets/watch` moved to phase 3 on
+     2026-09-07, §17.1.)
 3. **Proxy and attach** — the `/v1/plugins/*` mount with WebSocket passthrough,
-   `AgentRunner::attach` on tmux, `hecaton-plugin-web`. Ends with the web e2e
-   assertions.
+   `AgentRunner::attach` on tmux, `fleets/watch`, `hecaton-plugin-web`. Ends
+   with the web e2e assertions.
 
 ## 14. Done when
 
@@ -677,3 +679,226 @@ Where the phase 2a implementation plan refined this section:
   plugin again by the next `up`/`update` even when its config did not
   change — a ready plugin gets the `activate` (a rejection fails the apply
   like any other), a plugin that is not ready leaves the row pending.
+
+## 17. Refinements from the phase 2b brainstorm (2026-09-07)
+
+Decisions the flow plugin forced on §8.1, §7 and §13. Phase 2b is
+`hecaton-plugin-flow`, `mise run package-plugins`, and the SDK additions the
+plugin needs; nothing in `hecaton-core`, `hecaton-server`, `hecaton-config`
+or `hecaton-runtime` changes beyond adapting the server's in-process plugin
+tests to the SDK's new `metrics` signature.
+
+### 17.1 `fleets/watch` moves to phase 3
+
+Nothing in phase 2b consumes it: `flow` needs `actions` and `kv` only.
+Building it now would add axum's `ws` feature, a WebSocket client in the SDK
+and a daemon-level fan-in of every fleet actor's snapshot channel, all
+testable only in-process until `web` exists. Phase 3 brings the WebSocket
+machinery for the proxy and attach anyway, and `web` is the first consumer,
+so it gets a real end-to-end test there. §13 is corrected in place.
+
+### 17.2 The flow config language
+
+The §8.1 block, made exact. A rule has `event` (required, one of
+`HOOK_EVENTS`) and any of:
+
+- `match`: a map from JSON pointer into the event payload to a regex. The
+  regex is **full-match**: it is compiled as `^(?:pattern)$` with a 10 KiB
+  size limit. §8.1 already said "anchored at both ends"; its example
+  `"^rm -rf"` contradicted that and is now `"rm -rf.*"`. A pattern like `rm`
+  silently matching every command containing it is the worse surprise.
+- `respond`: an object whose top-level keys replace those of the chain's
+  response so far. Nested values are not merged.
+- `send`: `{ text, submit }`, `submit` defaulting to `true`; becomes a
+  `send_text` action.
+- `action`: `stop` or `restart`; becomes the corresponding action. These
+  complete the `send`/`restart`/`stop` mapping §4.3 already names.
+- `goto`: a declared state.
+
+`states.<name>.on` defaults to empty, so `done: {}` is legal. The config is
+`deny_unknown_fields` and is validated **only at `activate`**, in the plugin;
+`hecaton-config` keeps treating plugin blocks as opaque objects (§2.2). Every
+error is one line with the config path, which the daemon prefixes into
+`crews.<c>.agents.<a>.plugins.flow: …`:
+
+```
+initial: no state "foo" declared
+states.working.on[0].event: unknown event "Foo"
+states.working.on[1].goto: no state "foo" declared
+states.working.on[1].match.tool_input: not a JSON pointer (must start with "/")
+states.working.on[1].match./tool_input/command: <regex error>
+states.working.on[1].foo: unknown field
+```
+
+The last shape comes from `serde_path_to_error`, a new exact workspace
+dependency that attaches the path to serde's message; a hand-written walker
+over the raw JSON would duplicate the schema. `regex` (already in the lock
+transitively) becomes a direct exact dependency.
+
+### 17.3 The machine
+
+The plugin holds, per active agent, the compiled config and the current
+state name, in one mutex never held across an await. `intercept` for an
+agent it has no entry for passes the response through unchanged.
+
+A rule fires when the event name equals `event` and every `match` entry
+matches: a string payload value is matched as is, any other present value is
+matched against its JSON text, a missing pointer never matches. The first
+firing rule of the current state wins; none firing means pass-through and
+no transition. The effects of a firing rule, in order: `respond` is merged;
+`send` and `action` are returned as verdict actions for the daemon to
+execute after writing the response (§4.3); `goto` moves the state, counts a
+transition (self-transitions included) and writes the new state to KV before
+the verdict returns. A KV write failure is logged to stderr and the
+in-memory state stands: a hook never fails on it. `deadline_ms` is ignored;
+one loopback KV put is milliseconds.
+
+**Persistence and resets.** KV key `state/<agent>` holds
+`{ "state": "<name>", "config": "<sha256 of the agent's config>" }`. On
+`activate` the plugin compiles the config, reads the key, and resumes the
+stored state when the hash matches and the state is still declared;
+otherwise it starts at `initial` and writes the key. A KV error at
+`activate` rejects the activation with `kv: <error>`: that fails the
+operator's `up` loudly on a daemon-side fault, which is where loud is right.
+`deactivate` removes the entry and deletes the key. Hence:
+
+- a plugin restart or a daemon restart **resumes** the state (neither sends
+  `deactivate`, only a fresh `activate` after `hello`, §16.2);
+- `update` with a changed flow config, `down`, or dropping the plugin from
+  the agent **resets** to `initial` (all go through `deactivate`).
+- Two events for one agent transitioning concurrently could race their KV
+  writes. Claude fires a session's hooks sequentially; noted, not guarded.
+
+### 17.4 Metrics live in the SDK
+
+The daemon drops a whole scrape when one family lacks the
+`hecaton_plugin_<name>_` prefix (§9), and a hand-formatted body is exactly
+how a plugin author trips that rule. So the SDK owns the registry:
+
+- `hecaton_plugin_sdk::Metrics` wraps a `prometheus::Registry` and the
+  plugin name from `Env`. `counter`, `counter_vec`, `gauge`, `gauge_vec`
+  take the short family name (`transitions_total`) and register it as
+  `hecaton_plugin_<name>_transitions_total`. The vector types are
+  re-exported so plugin crates never name `prometheus` themselves.
+- `Plugin::metrics` changes from returning text to
+  `fn metrics(&self) -> Option<&Metrics>`, default `None`; the router
+  encodes it with `TextEncoder`. An empty registry renders an empty body.
+
+Flow registers `state{fleet,crew,agent,state}` (a gauge set to 1 for the
+current state and removed for the previous one on each transition and on
+`deactivate`) and `transitions_total{fleet,crew,agent,from,to}` (a counter,
+empty at each plugin start like any process counter). The three labels are
+the agent id split at its two slashes.
+
+### 17.5 `testing::Harness`
+
+`FakeHost` covers the daemon side only. The SDK gains the plugin side:
+
+- `Harness::start(&fake_host, plugin)` serves the plugin through the real
+  §4.2 router on a loopback port and sends `hello`, so every call crosses
+  the wire exactly as the daemon's would.
+- `activate(agent, config) -> Result<(), String>` maps a 400 to
+  `Err(message)`; `deactivate`, `observe`, `health` likewise;
+  `intercept(agent, event)` with `response_so_far` defaulting to `{}` and a
+  variant taking it; `event(agent, name, payload) -> HookEvent` fills the
+  timestamp and session id.
+- `metrics() -> String` scrapes the router; `metric(family, labels) ->
+  Option<f64>` parses one sample from the text format.
+- `restart(plugin)` drops the served instance and starts a new one against
+  the same `FakeHost`, whose KV survives: the "restart resumes" case in one
+  call.
+- `FakeHost` gains `kv_json(key)` and `actions_for(agent)`.
+
+Flow's tests and the SDK's own router tests move onto it. No daemon change,
+no new dependency.
+
+### 17.6 Crate, package and distribution
+
+`crates/hecaton-plugin-flow` is a library (`config.rs`: types, validation,
+compilation; `machine.rs`: the pure step function, where the property tests
+live; `plugin.rs`: the `Plugin` impl owning the agent map, the `Host` for
+KV and the `Metrics`) and a thin binary (`main.rs`: `Env::from_process`,
+`Host::new`, `serve`; failures print `flow: …` to stderr and exit non-zero).
+It ships `package/mise.toml` (empty `[tools]`, a `serve` task running
+`./bin/hecaton-plugin-flow`) and `package/hecaton-plugin.yaml` (name `flow`,
+version `0.1.0`, protocol 1, all nine events under `hooks.intercept`,
+`needs: [actions, kv]`, `routes: false`). The binary reports
+`CARGO_PKG_VERSION` in `hello`. Dependency rule: plugin crates depend on the
+SDK and `hecaton-api` only, never on `core`, `server`, `runtime` or
+`config`.
+
+`mise run package-plugins` (`scripts/package-plugins.sh`) builds the crate
+and recreates `target/plugins/flow/` with `bin/hecaton-plugin-flow` and the
+two package files; `test` and `e2e` depend on it, so `check` and CI assemble
+the package before nextest and the e2e uses the directory verbatim as a
+directory source. It loops over the plugin crates, so `web` joins it in
+phase 3.
+
+**Distribution.** That is the *development* layout, host-only by
+construction. The intended release shape puts **no binary in the tarball**:
+the package's `mise.toml` pins the plugin binary as a mise tool (a `ubi` or
+`github` backend entry against a release), the `serve` task runs it by name,
+and the daemon's `mise install` on the package fetches the asset for the
+host platform exactly as it installs `node` for an agent — one
+platform-neutral tarball, one digest, and the sandbox already grants read on
+the mise data dir (PB-4). Cross-compilation is the plugin repository's
+release pipeline (a target matrix; Linux x86_64 and aarch64 while nono is
+Landlock; static musl builds sidestep glibc mismatches). Hecaton has no
+release workflow yet; `package-plugins` gains a release mode when one exists.
+
+### 17.7 Testing and docs
+
+Layers, following §11: unit tests in the flow crate asserting every
+validation error's exact text and the step function's rules; `proptest` in
+`machine.rs` (the fired rule equals a naive reference matcher's; a validated
+config never panics on any event; every `goto` lands in a declared state);
+plugin integration through `Harness` in `crates/hecaton-plugin-flow/tests/`
+(rejection with path, merged verdict, actions, transitions and metrics,
+restart resumes, deactivate and changed config reset, unknown agent passes
+through); the conformance fixtures replayed unchanged, `metrics.json` now
+rendered from a `Metrics`; and a new e2e `flow_journey` beside the two
+plugin journeys, loading `target/plugins/flow` (located from the hecaton
+binary's target directory; skips with a reason when `package-plugins` has
+not run, fails under `HECATON_REQUIRE_TOOLS`), asserting alice's
+`PreToolUse` reply carries the block and the flow reason while bob's is
+`{}`, alice's stdin received the `send` text, the daemon's `/metrics` shows
+`hecaton_plugin_flow_state` at 1 for `review` and one `working`→`review`
+transition, `plugins/flow/kv/state/e2e/c/alice` exists, `update` with a bad
+regex fails with the full config-path line and leaves the fleet running, and
+`down` removes the key. `mise run mutants` and `verify-claude` are unchanged.
+
+Docs: `docs/plugin-protocol.md` gains a packaging section (both distribution
+shapes) and a paragraph on `metrics` via the SDK; `ARCHITECTURE.md` the flow
+plugin and the plugin-crate layer; `AGENTS.md` the `package-plugins` task and
+the gotchas as found (the KV reset rule and full-match anchoring first);
+`README.md` status "phase 2b done, phase 3 next" and a flow block;
+`examples/payments.yaml` a commented flow block for alice. The threat model
+is unchanged: flow adds no trust boundary.
+
+### 17.8 Refinements from the phase 2b plan (2026-09-07)
+
+Where the phase 2b implementation plan refined this section:
+
+- **`Harness::start` takes `&Env`, not the `FakeHost`**: the `Env` a
+  `FakeHost::env(name, scratch)` returns is what `Host::new` needs, and
+  the flow tests hold the same `Env` to build the plugin's own `Host`.
+- **`Harness::intercept` takes the event only**; the agent is in the
+  `HookEvent` that `event(agent, name, payload)` builds. `intercept_with`
+  adds `response_so_far` and `deadline_ms`.
+- **`Metrics` constructors** are `int_counter`, `int_counter_vec`,
+  `int_gauge`, `int_gauge_vec` and `render()`; the vector types are
+  re-exported from `hecaton_plugin_sdk::metrics`; registration errors are
+  `SdkError::Metrics`.
+- **`metrics.json` was re-recorded**: the encoder writes a `# HELP` line
+  the hand-written fixture lacked; `families_ok` accepted it already.
+- **Config errors are `ConfigError { path, message }`** (thiserror,
+  displayed `<path>: <message>`); `activate` stringifies it. Regex errors
+  keep only their last line without `error: `; unknown fields read
+  `unknown field `foo``.
+- **§11.1 row, verified 2026-09-07:** a binary inside a directory-source
+  package is executable under the package's read grant — yes, no sandbox
+  block needed (the manifest carries no `sandbox:` block; the plugin ran
+  to `hello` and `plugin list` showed `ready` with only the base package
+  read grant).
+- **`test` and `e2e` depend on `package-plugins`**, so `mise run check`
+  and CI assemble `target/plugins/flow/` before nextest.

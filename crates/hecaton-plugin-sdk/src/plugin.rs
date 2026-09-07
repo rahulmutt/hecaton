@@ -16,7 +16,7 @@ use hecaton_api::{
 };
 use serde_json::{Value, json};
 
-use crate::{Host, SdkError};
+use crate::{Host, Metrics, SdkError};
 
 pub trait Plugin: Send + Sync + 'static {
     /// `activate`: `Err(message)` rejects the agent's config; the daemon
@@ -55,9 +55,11 @@ pub trait Plugin: Send + Sync + 'static {
     fn health(&self) -> impl Future<Output = Result<(), String>> + Send {
         async { Ok(()) }
     }
-    /// Prometheus text; every family must start with `hecaton_plugin_<name>_`.
-    fn metrics(&self) -> impl Future<Output = String> + Send {
-        async { String::new() }
+    /// The plugin's registry, rendered by the router as Prometheus text;
+    /// every family it holds is already `hecaton_plugin_<name>_`-prefixed
+    /// (plugins spec §17.4). `None` renders an empty body.
+    fn metrics(&self) -> Option<&Metrics> {
+        None
     }
 }
 
@@ -147,11 +149,12 @@ async fn health<P: Plugin>(State(p): State<Arc<P>>) -> Response {
 }
 
 async fn metrics<P: Plugin>(State(p): State<Arc<P>>) -> Response {
-    (
-        [(CONTENT_TYPE, "text/plain; version=0.0.4")],
-        p.metrics().await,
-    )
-        .into_response()
+    let body = match p.metrics().map(Metrics::render) {
+        None => String::new(),
+        Some(Ok(text)) => text,
+        Some(Err(e)) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    ([(CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }
 
 /// A loopback listener on an ephemeral port and its `host:port`.
@@ -209,59 +212,8 @@ async fn serve_on<P: Plugin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hecaton_api::{HookEvent, PluginAction, Timestamp};
+    use hecaton_api::Timestamp;
     use serde_json::{Value, json};
-    use std::sync::Mutex;
-
-    #[derive(Default)]
-    struct Recorder {
-        activated: Mutex<Vec<(String, Value)>>,
-        deactivated: Mutex<Vec<String>>,
-        observed: Mutex<Vec<HookEvent>>,
-        healthy: Mutex<bool>,
-    }
-
-    impl Plugin for Recorder {
-        async fn activate(&self, agent: &str, config: Value) -> Result<(), String> {
-            if agent.ends_with("/bad") {
-                return Err("states.working.on[1].match: bad regex".into());
-            }
-            self.activated
-                .lock()
-                .unwrap()
-                .push((agent.to_string(), config));
-            Ok(())
-        }
-        async fn deactivate(&self, agent: &str) {
-            self.deactivated.lock().unwrap().push(agent.to_string());
-        }
-        async fn observe(&self, events: Vec<HookEvent>) {
-            self.observed.lock().unwrap().extend(events);
-        }
-        async fn intercept(
-            &self,
-            event: HookEvent,
-            mut response_so_far: Value,
-            deadline_ms: u64,
-        ) -> InterceptResponse {
-            response_so_far["seen"] = json!(event.name);
-            response_so_far["deadline"] = json!(deadline_ms);
-            InterceptResponse {
-                response: response_so_far,
-                actions: vec![PluginAction::Stop],
-            }
-        }
-        async fn health(&self) -> Result<(), String> {
-            if *self.healthy.lock().unwrap() {
-                Ok(())
-            } else {
-                Err("warming up".into())
-            }
-        }
-        async fn metrics(&self) -> String {
-            "hecaton_plugin_rec_up 1\n".into()
-        }
-    }
 
     /// A plugin with every method left at its default.
     struct Silent;
@@ -276,85 +228,6 @@ mod tests {
             status,
             serde_json::from_str(&text).unwrap_or(Value::String(text)),
         )
-    }
-
-    #[tokio::test]
-    async fn the_router_speaks_section_4_2() {
-        let plugin = Arc::new(Recorder::default());
-        let (listener, listen) = bind().await.unwrap();
-        tokio::spawn(run(listener, plugin.clone()));
-        let base = format!("http://{listen}");
-        let (s, v) = post(
-            &format!("{base}/v1/activate"),
-            json!({ "agent": "f/c/a", "config": { "k": 1 } }),
-        )
-        .await;
-        assert_eq!((s, v), (200, json!({})));
-        let (s, v) = post(
-            &format!("{base}/v1/activate"),
-            json!({ "agent": "f/c/bad", "config": {} }),
-        )
-        .await;
-        assert_eq!(s, 400);
-        assert_eq!(v["error"], "states.working.on[1].match: bad regex");
-        assert_eq!(plugin.activated.lock().unwrap()[0].0, "f/c/a");
-        let (s, _) = post(
-            &format!("{base}/v1/deactivate"),
-            json!({ "agent": "f/c/a" }),
-        )
-        .await;
-        assert_eq!(s, 200);
-        let event = HookEvent {
-            agent: "f/c/a".into(),
-            name: "PreToolUse".into(),
-            session_id: None,
-            received_at: Timestamp(1),
-            payload: json!({}),
-        };
-        let (s, _) = post(&format!("{base}/v1/events"), json!({ "events": [event] })).await;
-        assert_eq!(s, 200);
-        assert_eq!(plugin.observed.lock().unwrap().len(), 1);
-        let (s, v) = post(
-            &format!("{base}/v1/intercept"),
-            json!({ "event": event, "response_so_far": { "a": 1 }, "deadline_ms": 900 }),
-        )
-        .await;
-        assert_eq!(s, 200);
-        assert_eq!(
-            v["response"],
-            json!({ "a": 1, "seen": "PreToolUse", "deadline": 900 })
-        );
-        assert_eq!(v["actions"], json!([{ "action": "stop" }]));
-        let c = reqwest::Client::builder().no_proxy().build().unwrap();
-        assert_eq!(
-            c.get(format!("{base}/v1/health"))
-                .send()
-                .await
-                .unwrap()
-                .status()
-                .as_u16(),
-            503
-        );
-        *plugin.healthy.lock().unwrap() = true;
-        assert_eq!(
-            c.get(format!("{base}/v1/health"))
-                .send()
-                .await
-                .unwrap()
-                .status()
-                .as_u16(),
-            200
-        );
-        let m = c.get(format!("{base}/v1/metrics")).send().await.unwrap();
-        assert!(
-            m.headers()["content-type"]
-                .to_str()
-                .unwrap()
-                .starts_with("text/plain")
-        );
-        assert_eq!(m.text().await.unwrap(), "hecaton_plugin_rec_up 1\n");
-        let (s, v) = post(&format!("{base}/v1/activate"), json!({ "agent": "f/c/a" })).await;
-        assert_eq!(s, 400, "{v}");
     }
 
     #[tokio::test]
