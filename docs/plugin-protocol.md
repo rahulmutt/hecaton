@@ -206,13 +206,19 @@ never activates simply never runs for that agent.
 
 ## 6. Conformance
 
-`docs/plugin-protocol/*.json` holds fifteen fixtures, one JSON object
+`docs/plugin-protocol/*.json` holds eighteen fixtures, one JSON object
 each: `{ route, direction, request, status, response }` for
 `daemon-to-plugin` and most `plugin-to-daemon` routes; `raw` (base64)
 replaces `request`/`response` for the kv byte bodies, `health.json` and
 `metrics.json`; `hello-bad-token.json` additionally carries a top-level
 `"token"` to send instead of the real one. daemon-to-plugin fixtures also
 carry `headers`, the request headers the daemon sends.
+
+Fixtures with `"transport": "websocket"` (`attach-resize.json`,
+`fleets-watch.json`) describe one frame, not a request/response pair, and
+are asserted by the SDK's stream test against `FakeHost`; `routes.json`
+is replayed through the SDK router alone — the daemon's proxy forwards
+requests unparsed.
 
 Two tests replay every fixture:
 

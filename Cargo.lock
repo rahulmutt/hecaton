@@ -772,6 +772,7 @@ name = "hecaton-plugin-sdk"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-util",
  "hecaton-api",
  "prometheus",
  "reqwest",
@@ -780,6 +781,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-tungstenite 0.30.0",
 ]
 
 [[package]]

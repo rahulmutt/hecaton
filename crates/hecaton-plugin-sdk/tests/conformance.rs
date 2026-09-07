@@ -24,7 +24,7 @@ fn fixtures() -> BTreeMap<String, Value> {
     }
     assert_eq!(
         out.len(),
-        15,
+        18,
         "every fixture accounted for: {:?}",
         out.keys()
     );
@@ -100,6 +100,9 @@ impl Plugin for Reference {
     fn metrics(&self) -> Option<&hecaton_plugin_sdk::Metrics> {
         Some(&self.metrics)
     }
+    fn routes(&self) -> Option<axum::Router> {
+        Some(axum::Router::new().route("/", axum::routing::get(|| async { "hello from routes\n" })))
+    }
 }
 
 #[tokio::test]
@@ -109,7 +112,7 @@ async fn the_router_answers_every_daemon_to_plugin_fixture() {
     let c = reqwest::Client::builder().no_proxy().build().unwrap();
     for (name, f) in fixtures()
         .iter()
-        .filter(|(_, f)| f["direction"] == "daemon-to-plugin")
+        .filter(|(_, f)| f["direction"] == "daemon-to-plugin" && f.get("transport").is_none())
     {
         let (method, path) = f["route"].as_str().unwrap().split_once(' ').unwrap();
         let url = format!("http://{listen}{path}");
@@ -234,4 +237,30 @@ async fn the_host_sends_every_plugin_to_daemon_fixture_and_reads_the_answer() {
         serde_json::to_value(host.kv_list("state/").await.unwrap()).unwrap(),
         fx["kv-list"]["response"]["keys"]
     );
+}
+
+/// The two WebSocket fixtures: one frame each, asserted against `FakeHost`
+/// (the daemon's `PluginClient` has no stream calls to replay them through).
+#[tokio::test]
+async fn the_host_streams_match_their_fixtures() {
+    let fx = fixtures();
+    let record: FleetRecord =
+        serde_json::from_value(fx["fleets-watch"]["frame"][0].clone()).unwrap();
+    let fake = FakeHost::start("tok", json!({}), vec![record]).await;
+    let host = Host::new(fake.env("web", Path::new("/s"))).unwrap();
+    let mut watch = host.watch_fleets();
+    assert_eq!(
+        serde_json::to_value(watch.next().await).unwrap(),
+        fx["fleets-watch"]["frame"]
+    );
+    let mut a = host.attach("payments/backend/bob").await.unwrap();
+    a.resize(120, 40).await.unwrap();
+    a.write(b"ls\n").await.unwrap();
+    assert_eq!(a.read().await.as_deref(), Some(&b"ls\n"[..]));
+    assert_eq!(fake.resizes()[0].1, fx["attach-resize"]["frame"]);
+    assert_eq!(
+        fx["attach-resize"]["route"].as_str().unwrap(),
+        "GET /v1/plugin-host/agents/payments/backend/bob/attach"
+    );
+    assert_eq!(fake.attaches(), vec!["payments/backend/bob".to_string()]);
 }

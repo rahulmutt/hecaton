@@ -68,6 +68,14 @@ pub trait Plugin: Send + Sync + 'static {
     fn metrics(&self) -> Option<&Metrics> {
         None
     }
+    /// The plugin's own HTTP surface, mounted by the daemon under
+    /// `/v1/plugins/<name>/` when the manifest says `routes: true`
+    /// (plugin-protocol §4.1). Served under `/v1/routes` behind the same
+    /// bearer check as every other route; the request carries
+    /// `X-Hecaton-Forwarded-Prefix` for building links.
+    fn routes(&self) -> Option<Router> {
+        None
+    }
 }
 
 /// The §4.2 router for `plugin`. Every route, the plugin's own under
@@ -76,15 +84,20 @@ pub trait Plugin: Send + Sync + 'static {
 /// the listener is a loopback port any local process can reach.
 pub fn router<P: Plugin>(plugin: Arc<P>, token: &str) -> Router {
     let token: Arc<str> = Arc::from(token);
-    Router::new()
+    // The state is applied before nesting so both routers are `Router<()>`.
+    let base = Router::new()
         .route("/v1/activate", post(activate::<P>))
         .route("/v1/deactivate", post(deactivate::<P>))
         .route("/v1/events", post(events::<P>))
         .route("/v1/intercept", post(intercept::<P>))
         .route("/v1/health", get(health::<P>))
         .route("/v1/metrics", get(metrics::<P>))
-        .with_state(plugin)
-        .layer(middleware::from_fn_with_state(token, require_daemon_bearer))
+        .with_state(plugin.clone());
+    let base = match plugin.routes() {
+        Some(routes) => base.nest("/v1/routes", routes),
+        None => base,
+    };
+    base.layer(middleware::from_fn_with_state(token, require_daemon_bearer))
         // daemon → plugin request bodies are capped at 1 MiB (plugin-protocol
         // §1), matching the daemon's own `plugin_api::router` layer
         // (`hecaton-server/src/api.rs`); axum's default (2 MiB) is otherwise
@@ -350,6 +363,53 @@ mod tests {
                 .as_u16(),
             200
         );
+    }
+
+    #[tokio::test]
+    async fn routes_are_nested_behind_the_bearer() {
+        struct Routed;
+        impl Plugin for Routed {
+            fn routes(&self) -> Option<Router> {
+                Some(
+                    Router::new()
+                        .route("/", get(|| async { "root" }))
+                        .route("/x", get(|| async { "x" })),
+                )
+            }
+        }
+        let (listener, listen) = bind().await.unwrap();
+        tokio::spawn(run(listener, Arc::new(Routed), "tok"));
+        let c = reqwest::Client::builder().no_proxy().build().unwrap();
+        for (path, want) in [("/v1/routes", "root"), ("/v1/routes/x", "x")] {
+            let r = c
+                .get(format!("http://{listen}{path}"))
+                .bearer_auth("tok")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                (r.status().as_u16(), r.text().await.unwrap().as_str()),
+                (200, want),
+                "{path}"
+            );
+        }
+        let r = c
+            .get(format!("http://{listen}/v1/routes/x"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            401,
+            "the plugin's routes need the bearer too"
+        );
+        let r = c
+            .get(format!("http://{listen}/v1/routes/nope"))
+            .bearer_auth("tok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 404);
     }
 
     #[tokio::test]

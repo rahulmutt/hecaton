@@ -14,7 +14,7 @@ pub mod metrics;
 pub mod plugin;
 pub mod testing;
 
-pub use host::Host;
+pub use host::{Attach, AttachRead, AttachWrite, FleetWatch, Host};
 pub use metrics::Metrics;
 pub use plugin::{Plugin, bind, router, run, serve};
 

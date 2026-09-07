@@ -16,6 +16,8 @@ reqwest = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 prometheus = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

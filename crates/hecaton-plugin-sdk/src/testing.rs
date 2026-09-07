@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
 use axum::response::{IntoResponse, Response};
@@ -16,19 +17,26 @@ use axum::routing::get;
 use axum::{Json, Router};
 use hecaton_api::{
     CHAIN_BUDGET_MS, ErrorBody, FleetRecord, HelloRequest, HelloResponse, HookEvent,
-    InterceptRequest, InterceptResponse, KvKeys, PluginAction, Timestamp,
+    InterceptRequest, InterceptResponse, KvKeys, PluginAction, ResizeFrame, Timestamp,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::watch;
 
 use crate::{Env, Host, Plugin, SdkError, bind, run};
 
 struct Inner {
     token: String,
     config: Value,
-    fleets: Vec<FleetRecord>,
+    fleets: Mutex<Vec<FleetRecord>>,
+    /// Bumped by `set_fleets`; every open watch sends the list again.
+    fleets_changed: watch::Sender<u64>,
+    /// Bumped by `drop_watchers`; every open watch closes.
+    watch_epoch: watch::Sender<u64>,
     hellos: Mutex<Vec<HelloRequest>>,
     actions: Mutex<Vec<(String, PluginAction)>>,
+    resizes: Mutex<Vec<(String, Value)>>,
+    attaches: Mutex<Vec<String>>,
     kv: Mutex<BTreeMap<String, (Vec<u8>, bool)>>,
 }
 
@@ -43,9 +51,13 @@ impl FakeHost {
         let inner = Arc::new(Inner {
             token: token.to_string(),
             config,
-            fleets,
+            fleets: Mutex::new(fleets),
+            fleets_changed: watch::channel(0).0,
+            watch_epoch: watch::channel(0).0,
             hellos: Mutex::new(Vec::new()),
             actions: Mutex::new(Vec::new()),
+            resizes: Mutex::new(Vec::new()),
+            attaches: Mutex::new(Vec::new()),
             kv: Mutex::new(BTreeMap::new()),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -76,6 +88,35 @@ impl FakeHost {
     pub fn hellos(&self) -> Vec<HelloRequest> {
         self.inner
             .hellos
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Replaces the fleets list and pushes it to every open watch.
+    pub fn set_fleets(&self, fleets: Vec<FleetRecord>) {
+        *self.inner.fleets.lock().unwrap_or_else(|e| e.into_inner()) = fleets;
+        self.inner.fleets_changed.send_modify(|n| *n += 1);
+    }
+
+    /// Closes every open watch socket, as a daemon restart would.
+    pub fn drop_watchers(&self) {
+        self.inner.watch_epoch.send_modify(|n| *n += 1);
+    }
+
+    /// Every resize text frame an attach received: (agent, the frame).
+    pub fn resizes(&self) -> Vec<(String, Value)> {
+        self.inner
+            .resizes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The agents attached to, in the order the sockets opened.
+    pub fn attaches(&self) -> Vec<String> {
+        self.inner
+            .attaches
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -145,10 +186,15 @@ fn router(inner: Arc<Inner>) -> Router {
     Router::new()
         .route("/v1/plugin-host/hello", axum::routing::post(hello))
         .route("/v1/plugin-host/fleets", get(fleets))
+        .route("/v1/plugin-host/fleets/watch", get(watch_fleets))
         .route("/v1/plugin-host/fleets/{name}", get(fleet))
         .route(
             "/v1/plugin-host/agents/{fleet}/{crew}/{agent}/actions",
             axum::routing::post(post_action),
+        )
+        .route(
+            "/v1/plugin-host/agents/{fleet}/{crew}/{agent}/attach",
+            get(attach),
         )
         .route("/v1/plugin-host/kv", get(list_keys))
         .route(
@@ -185,7 +231,14 @@ async fn fleets(State(inner): State<Arc<Inner>>, headers: HeaderMap) -> Response
     if let Some(resp) = unauthorized(&inner, &headers) {
         return resp;
     }
-    Json(inner.fleets.clone()).into_response()
+    Json(
+        inner
+            .fleets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
+    )
+    .into_response()
 }
 
 async fn fleet(
@@ -196,10 +249,106 @@ async fn fleet(
     if let Some(resp) = unauthorized(&inner, &headers) {
         return resp;
     }
-    match inner.fleets.iter().find(|f| f.name() == name) {
-        Some(f) => Json(f.clone()).into_response(),
+    let found = inner
+        .fleets
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|f| f.name() == name)
+        .cloned();
+    match found {
+        Some(f) => Json(f).into_response(),
         None => error(StatusCode::NOT_FOUND, "fleet not found"),
     }
+}
+
+/// `GET fleets/watch` (WS): the whole list on connect and on every
+/// `set_fleets`, as the daemon's own watch does (§18.4).
+async fn watch_fleets(
+    State(inner): State<Arc<Inner>>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if let Some(resp) = unauthorized(&inner, &headers) {
+        return resp;
+    }
+    ws.on_upgrade(move |mut socket: WebSocket| async move {
+        let mut changes = inner.fleets_changed.subscribe();
+        let mut epoch = inner.watch_epoch.subscribe();
+        loop {
+            let list = inner
+                .fleets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let text = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
+            if socket.send(Message::Text(text.into())).await.is_err() {
+                return;
+            }
+            tokio::select! {
+                changed = changes.changed() => if changed.is_err() { return; },
+                _ = epoch.changed() => {
+                    let _ = socket.send(Message::Close(None)).await;
+                    return;
+                }
+                msg = socket.recv() => match msg {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                    Some(Ok(_)) => {}
+                },
+            }
+        }
+    })
+}
+
+/// An echo terminal: bytes come back, resizes are recorded, a text
+/// frame that is not a resize closes 1003 like the real daemon.
+async fn attach(
+    State(inner): State<Arc<Inner>>,
+    headers: HeaderMap,
+    AxumPath((f, c, a)): AxumPath<(String, String, String)>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if let Some(resp) = unauthorized(&inner, &headers) {
+        return resp;
+    }
+    let agent = format!("{f}/{c}/{a}");
+    inner
+        .attaches
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(agent.clone());
+    ws.on_upgrade(move |mut socket: WebSocket| async move {
+        while let Some(Ok(msg)) = socket.recv().await {
+            match msg {
+                Message::Binary(bytes) => {
+                    if socket.send(Message::Binary(bytes)).await.is_err() {
+                        return;
+                    }
+                }
+                Message::Text(text) => match ResizeFrame::parse(text.as_str()) {
+                    Some(frame) => inner
+                        .resizes
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((
+                            agent.clone(),
+                            serde_json::to_value(frame).unwrap_or(Value::Null),
+                        )),
+                    None => {
+                        let _ = socket
+                            .send(Message::Close(Some(CloseFrame {
+                                code: 1003,
+                                reason: "expected a resize frame".into(),
+                            })))
+                            .await;
+                        return;
+                    }
+                },
+                Message::Close(_) => return,
+                _ => {}
+            }
+        }
+    })
 }
 
 async fn post_action(
@@ -512,6 +661,31 @@ impl Harness {
         }
     }
 
+    /// `GET /v1/routes<path>` as the daemon's proxy would send it: the
+    /// bearer and `X-Hecaton-Forwarded-Prefix: <prefix>`.
+    pub async fn get_route(
+        &self,
+        path: &str,
+        prefix: &str,
+    ) -> (u16, Vec<(String, String)>, Vec<u8>) {
+        let resp = self
+            .http
+            .get(self.url(&format!("/v1/routes{path}")))
+            .bearer_auth(&self.token)
+            .header("x-hecaton-forwarded-prefix", prefix)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("Harness GET {path}: {e}"));
+        let status = resp.status().as_u16();
+        let headers = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        let body = resp.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
+        (status, headers, body)
+    }
+
     pub async fn metrics(&self) -> String {
         self.http
             .get(self.url("/v1/metrics"))
@@ -594,6 +768,20 @@ mod tests {
         fn metrics(&self) -> Option<&Metrics> {
             Some(&self.metrics)
         }
+        /// Echoes the prefix the daemon's proxy forwards, so a test can
+        /// see both the nesting and the header.
+        fn routes(&self) -> Option<axum::Router> {
+            Some(axum::Router::new().route(
+                "/where",
+                get(|headers: HeaderMap| async move {
+                    headers
+                        .get("x-hecaton-forwarded-prefix")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string()
+                }),
+            ))
+        }
     }
 
     #[tokio::test]
@@ -630,6 +818,12 @@ mod tests {
             .await;
         assert_eq!(v.response, json!({ "a": 1, "seen": "Stop", "deadline": 7 }));
         assert_eq!(h.health().await, Err("warming up".into()));
+        let (status, _headers, body) = h.get_route("/where", "/v1/plugins/cnt").await;
+        assert_eq!(
+            (status, String::from_utf8_lossy(&body).into_owned()),
+            (200, "/v1/plugins/cnt".to_string()),
+            "get_route sends the bearer and the forwarded prefix"
+        );
         let text = h.metrics().await;
         assert_eq!(
             metric(&text, "hecaton_plugin_cnt_intercepts", &[]),
