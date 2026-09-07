@@ -5,4 +5,4 @@ expression: "go(Some(&after), Keep::default(), &st, &running(&before))"
 stop payments/backend/bob
 ensure-crew payments/backend
 materialize payments/backend/bob
-start payments/backend/bob c04d2996
+start payments/backend/bob b931f32a

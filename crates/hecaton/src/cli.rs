@@ -41,6 +41,11 @@ pub enum Command {
     Status(StatusArgs),
     /// List fleets.
     List(ListArgs),
+    /// Manage daemon plugins declared in $XDG_CONFIG_HOME/hecaton/plugins.yaml.
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
 
     // -- internal --
     /// Reads the SessionStart hook JSON on stdin, posts it to the daemon,
@@ -107,6 +112,57 @@ pub struct ListArgs {
     pub api_url: Option<String>,
 }
 
+#[derive(Debug, Subcommand)]
+pub enum PluginCommand {
+    /// Add a package (directory, tarball or https URL) to plugins.yaml and sync a running daemon.
+    Install(PluginInstallArgs),
+    /// Reconcile the running daemon to plugins.yaml.
+    Sync(ApiOnlyArgs),
+    /// List declared plugins with phase and listen address.
+    List(ListArgs),
+    /// Remove a plugin from plugins.yaml; --purge also deletes its state and packages.
+    Remove(PluginRemoveArgs),
+    /// Build a plugin tarball from a package directory and print its sha256.
+    Package(PluginPackageArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PluginInstallArgs {
+    /// Package directory or tarball path (https:// URLs are declarable but
+    /// rejected until a TLS-enabled build).
+    pub source: String,
+    /// Expected sha256 of the tarball.
+    #[arg(long)]
+    pub sha256: Option<String>,
+    #[arg(long)]
+    pub api_url: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ApiOnlyArgs {
+    #[arg(long)]
+    pub api_url: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct PluginRemoveArgs {
+    pub name: String,
+    /// Also delete the plugin's state directory and installed packages (needs a running daemon).
+    #[arg(long)]
+    pub purge: bool,
+    #[arg(long)]
+    pub api_url: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct PluginPackageArgs {
+    /// Package directory holding hecaton-plugin.yaml and mise.toml.
+    pub dir: PathBuf,
+    /// Output tarball (default: ./<name>-<version>.tar.gz).
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+}
+
 #[derive(Debug, Args)]
 pub struct ServeArgs {
     /// Address to bind (default: config.toml `[server] bind`, else 127.0.0.1:7643).
@@ -152,6 +208,9 @@ pub enum DevCommand {
     /// Stand-in for `claude` in the e2e: runs the SessionStart command hooks
     /// and one Notification HTTP hook from settings.json, then sleeps.
     FakeClaude(FakeClaudeArgs),
+    /// Stand-in plugin for the e2e: binds a loopback listener, sends hello,
+    /// writes the reply to $HECATON_PLUGIN_SCRATCH/fake-plugin.hello, sleeps.
+    FakePlugin,
 }
 
 #[derive(Debug, Args)]

@@ -414,3 +414,11 @@ the corrections Phase 3 made: D4 (TLS deferred), D5 (`SessionStart` via
 `core`), §7 (`FleetPhase::Down`, re-`up` in place, `status`/`list`), §8
 (`Outcome` without actions until Spec B), §10 (e2e in the PR tier). Where they
 differ, the Phase 3 spec wins. Spec A is complete.
+
+## Addendum 2026-09-06 (Spec B)
+`docs/superpowers/specs/2026-09-06-hecaton-b-plugins-design.md` §12 lists the
+corrections Spec B made: §11 (Spec B is the plugin mechanism; `flow` is a
+plugin), §3 (no `hecaton-events`; `hecaton-plugin-sdk` and in-tree plugin
+crates), §5 (`plugins:` replaces `flow:`), §8 (`Outcome.actions` restored;
+`hecaton_plugin_flow_*` names), and the reserved fleet `hecaton`. Where they
+differ, the plugins spec wins.

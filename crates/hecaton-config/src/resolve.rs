@@ -34,6 +34,12 @@ pub fn resolve(file: &FleetFile, opts: &ResolveOptions) -> Result<FleetSpec, Con
             path: "name".to_string(),
             message: "required; set `name` in the file or pass --name".to_string(),
         })?;
+    if hecaton_core::is_reserved_fleet(&name) {
+        return Err(ConfigError::Invalid {
+            path: "name".to_string(),
+            message: format!("{name:?} is reserved for the daemon's plugins"),
+        });
+    }
     let host_layer = opts.host_claude_settings.as_ref().map(|s| {
         let mut s = s.clone();
         if let Some(obj) = s.as_object_mut() {
@@ -199,7 +205,7 @@ crews:
         let err = resolve(&file(fleet_hooks_yaml), &opts()).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "crews.c.agents.a.claude.settings.hooks: hecaton owns this key; configure hook behaviour via `flow` instead"
+            "crews.c.agents.a.claude.settings.hooks: hecaton owns this key; configure hook behaviour via `plugins` instead"
         );
     }
 
@@ -235,6 +241,26 @@ crews:
             resolve(&file(yaml), &opts()).unwrap_err().to_string(),
             "crews.c.agents.a: expected a mapping"
         );
+    }
+
+    #[test]
+    fn the_daemons_fleet_name_is_reserved() {
+        let file = crate::parse("apiVersion: hecaton/v1\nkind: Fleet\nname: hecaton\n").unwrap();
+        let err = resolve(&file, &ResolveOptions::default()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "name: \"hecaton\" is reserved for the daemon's plugins"
+        );
+        let file = crate::parse("apiVersion: hecaton/v1\nkind: Fleet\nname: ok\n").unwrap();
+        let err = resolve(
+            &file,
+            &ResolveOptions {
+                name_override: Some("hecaton".into()),
+                ..ResolveOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().starts_with("name: \"hecaton\" is reserved"));
     }
 
     #[test]

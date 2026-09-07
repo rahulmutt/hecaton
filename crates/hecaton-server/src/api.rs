@@ -6,17 +6,22 @@ use std::sync::Arc;
 
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
-use axum::http::{StatusCode, header::CONTENT_TYPE};
+use axum::http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use hecaton_api::{DownQuery, ErrorBody, FleetRequest, FleetSummary};
-use hecaton_core::{FleetName, FleetRecord, Keep};
+use hecaton_api::{
+    DownQuery, ErrorBody, FleetRequest, FleetSummary, HelloRequest, HelloResponse, PluginStatus,
+    SyncReport,
+};
+use hecaton_core::{AgentName, FleetName, FleetRecord, Keep, NameError};
+use serde_json::{Value, json};
 
 use crate::auth::{RateLimiter, bearer, constant_time_eq};
 use crate::daemon::{Daemon, DaemonError};
 use crate::hooks;
+use crate::plugins::PluginError;
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -65,6 +70,22 @@ impl From<DaemonError> for ApiError {
     }
 }
 
+impl From<PluginError> for ApiError {
+    fn from(e: PluginError) -> Self {
+        let status = match &e {
+            PluginError::Config { .. }
+            | PluginError::Manifest(_)
+            | PluginError::ManifestParse(_)
+            | PluginError::Digest { .. }
+            | PluginError::Package(_)
+            | PluginError::StillDeclared(_) => StatusCode::BAD_REQUEST,
+            PluginError::Fetch { .. } => StatusCode::BAD_GATEWAY,
+            PluginError::Io { .. } | PluginError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        Self::new(status, e.to_string())
+    }
+}
+
 /// 20 events/s with a burst of 50 per agent (spec §3.5).
 const HOOK_RATE: f64 = 20.0;
 const HOOK_BURST: f64 = 50.0;
@@ -80,6 +101,9 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
             "/v1/fleets/{name}",
             get(get_fleet).put(update_fleet).delete(delete_fleet),
         )
+        .route("/v1/plugins", get(list_plugins))
+        .route("/v1/plugins/sync", post(sync_plugins))
+        .route("/v1/plugins/{name}", delete(purge_plugin))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin))
         .layer(DefaultBodyLimit::max(4 << 20));
     let agents = Router::new()
@@ -88,11 +112,15 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
             post(hooks::events),
         )
         .layer(DefaultBodyLimit::max(1 << 20));
+    let plugins = Router::new()
+        .route("/v1/plugin-host/hello", post(plugin_hello))
+        .layer(DefaultBodyLimit::max(64 << 10));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/metrics", get(metrics))
         .merge(admin)
         .merge(agents)
+        .merge(plugins)
         .with_state(state)
 }
 
@@ -219,4 +247,50 @@ async fn delete_fleet(
         sessions: q.keep_sessions,
     };
     Ok(Json(state.daemon.down(&name, keep, q.purge).await?))
+}
+
+/// `POST /v1/plugin-host/hello`: the plugin's bearer token, verified
+/// against the `hecaton/plugins/<name>` secret; unknown plugin and bad
+/// token answer alike.
+async fn plugin_hello(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    b: Result<Json<HelloRequest>, JsonRejection>,
+) -> Result<Json<HelloResponse>, ApiError> {
+    let unauthorized = || ApiError::new(StatusCode::UNAUTHORIZED, "unknown plugin or bad token");
+    let Some(token) = bearer(&headers) else {
+        return Err(unauthorized());
+    };
+    let req = b
+        .map(|Json(r)| r)
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))?;
+    let name: AgentName = req.name.parse().map_err(|_: NameError| unauthorized())?;
+    state
+        .daemon
+        .plugin_hello(&name, token, req)
+        .await
+        .map(Json)
+        .map_err(|e| match e {
+            DaemonError::Unauthorized => unauthorized(),
+            other => other.into(),
+        })
+}
+
+async fn list_plugins(State(state): State<AppState>) -> Json<Vec<PluginStatus>> {
+    Json(state.daemon.plugins().list().await)
+}
+
+async fn sync_plugins(State(state): State<AppState>) -> Result<Json<SyncReport>, ApiError> {
+    Ok(Json(state.daemon.sync_plugins().await?))
+}
+
+async fn purge_plugin(
+    State(state): State<AppState>,
+    name: Result<Path<String>, PathRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let name: AgentName = path_name(name)?
+        .parse()
+        .map_err(|e: NameError| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+    state.daemon.plugins().purge(&name).await?;
+    Ok(Json(json!({})))
 }

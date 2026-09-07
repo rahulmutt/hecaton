@@ -1,10 +1,12 @@
 //! `Runtime`: the `Materializer` over real tools. `render_agent` is the
 //! pure-ish half (files only) shared with `hecaton dev materialize`.
 
+use std::time::Duration;
+
 use hecaton_api::{CredentialBundle, GitAuth, GitSettings};
 use hecaton_core::{
-    AgentId, CrewRef, HookTarget, Keep, LaunchPlan, MaterializeError, Materializer, RepoRef,
-    ResolvedAgent,
+    AgentId, AgentName, CrewRef, HookTarget, Keep, LaunchPlan, MaterializeError, Materializer,
+    RepoRef, ResolvedAgent, ResolvedPlugin,
 };
 
 use crate::env::agent_env;
@@ -161,14 +163,47 @@ impl Runtime {
     }
 
     fn rm_rf(id: &str, path: &std::path::Path) -> Result<(), MaterializeError> {
-        match std::fs::remove_dir_all(path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(MaterializeError::Io {
-                id: id.to_string(),
-                path: path.to_path_buf(),
-                message: e.to_string(),
-            }),
+        retry_rmdir(path, RM_RF_WINDOW, RM_RF_STEP, |p| {
+            std::fs::remove_dir_all(p)
+        })
+        .map_err(|e| MaterializeError::Io {
+            id: id.to_string(),
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        })
+    }
+}
+
+/// How long `rm_rf` keeps retrying a directory that refills under it, and
+/// how long it waits between attempts.
+const RM_RF_WINDOW: Duration = Duration::from_secs(5);
+const RM_RF_STEP: Duration = Duration::from_millis(100);
+
+/// `remove_dir_all` with a bounded retry on `DirectoryNotEmpty`: nono
+/// flushes its audit ledger and session file under `<root>/nono/` shortly
+/// after `tmux kill-window` returns, so a tree that was quiet when the
+/// walk started can refill under it. `NotFound` is success; every other
+/// error is returned at once, since only a concurrent writer is worth
+/// waiting for.
+fn retry_rmdir(
+    path: &std::path::Path,
+    window: Duration,
+    step: Duration,
+    mut remove: impl FnMut(&std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + window;
+    loop {
+        match remove(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::DirectoryNotEmpty
+                    || std::time::Instant::now() >= deadline
+                {
+                    return Err(e);
+                }
+                std::thread::sleep(step);
+            }
         }
     }
 }
@@ -256,6 +291,21 @@ impl Materializer for Runtime {
             Self::rm_rf(&id, &paths.root)?;
         }
         Ok(())
+    }
+
+    fn materialize_plugin(
+        &self,
+        plugin: &ResolvedPlugin,
+        host: &HookTarget,
+    ) -> Result<LaunchPlan, MaterializeError> {
+        let out = self.render_plugin(plugin, host)?;
+        self.install_plugin(plugin)?;
+        Ok(out.plan)
+    }
+
+    fn purge_plugin(&self, name: &AgentName) -> Result<(), MaterializeError> {
+        let root = self.layout.plugin(name).root;
+        Self::rm_rf(&hecaton_core::plugin_id(name).to_string(), &root)
     }
 }
 
@@ -399,5 +449,73 @@ mod tests {
             !paths.installed_marker().exists(),
             "marker must be removed even though a later step failed"
         );
+    }
+
+    fn enotempty() -> std::io::Error {
+        std::io::Error::from(std::io::ErrorKind::DirectoryNotEmpty)
+    }
+
+    /// nono keeps writing under `plugins/<name>/nono/` for a moment after
+    /// `tmux kill-window` returns, so a `remove_dir_all` that loses that
+    /// race must be retried rather than reported (`purge` and `down
+    /// --purge` both go through `rm_rf`).
+    #[test]
+    fn rm_rf_retries_a_directory_that_refills_under_it() {
+        let path = std::path::Path::new("/does/not/matter");
+        let mut calls = 0;
+        let r = retry_rmdir(path, Duration::from_secs(5), Duration::ZERO, |_| {
+            calls += 1;
+            if calls < 3 { Err(enotempty()) } else { Ok(()) }
+        });
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(calls, 3, "retried until the writer was done");
+
+        // a window that runs out returns the last error, and only after
+        // the window has actually elapsed
+        let mut calls = 0;
+        let start = std::time::Instant::now();
+        let e = retry_rmdir(
+            path,
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            |_| {
+                calls += 1;
+                Err(enotempty())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::DirectoryNotEmpty);
+        assert!(start.elapsed() >= Duration::from_millis(50));
+        assert!(calls > 1, "retried {calls} times");
+
+        // NotFound is success; any other error is returned at once
+        let mut calls = 0;
+        assert!(
+            retry_rmdir(path, Duration::from_secs(5), Duration::ZERO, |_| {
+                calls += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            })
+            .is_ok()
+        );
+        assert_eq!(calls, 1);
+        let mut calls = 0;
+        let e = retry_rmdir(path, Duration::from_secs(5), Duration::ZERO, |_| {
+            calls += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        })
+        .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(calls, 1, "a permanent error is not waited out");
+    }
+
+    #[test]
+    fn rm_rf_removes_a_tree_and_ignores_a_missing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("plugins/hello");
+        std::fs::create_dir_all(root.join("nono")).unwrap();
+        std::fs::write(root.join("nono/ledger"), "x").unwrap();
+        Runtime::rm_rf("hecaton/plugins/hello", &root).unwrap();
+        assert!(!root.exists());
+        Runtime::rm_rf("hecaton/plugins/hello", &root).unwrap();
     }
 }

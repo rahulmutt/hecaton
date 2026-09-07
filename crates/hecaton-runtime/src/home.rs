@@ -3,6 +3,7 @@
 
 use std::path::Path;
 
+pub use hecaton_api::HOOK_EVENTS;
 use hecaton_api::{CredentialBundle, GitAuth, GitSettings};
 use hecaton_core::{AgentId, HookTarget, MaterializeError};
 use serde_json::{Map, Value, json};
@@ -15,20 +16,6 @@ use crate::quote::sh_quote;
 /// 2.1.263: "HTTP hooks are not supported for SessionStart/Setup"); these
 /// run `hecaton hook-relay` as a `command` hook instead (P3-2).
 pub const RELAY_EVENTS: &[&str] = &["SessionStart"];
-
-/// Every Claude Code hook event hecaton listens to. Kept as one list so the
-/// daemon and the settings writer agree.
-pub const HOOK_EVENTS: &[&str] = &[
-    "SessionStart",
-    "SessionEnd",
-    "UserPromptSubmit",
-    "PreToolUse",
-    "PostToolUse",
-    "Notification",
-    "Stop",
-    "SubagentStop",
-    "PreCompact",
-];
 
 pub const REDACTED: &str = "<redacted>";
 

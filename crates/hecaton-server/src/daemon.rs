@@ -5,9 +5,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use hecaton_api::{CredentialBundle, FleetSpec, FleetSummary, HookEvent};
+use hecaton_api::{
+    CredentialBundle, FleetSpec, FleetSummary, HelloRequest, HelloResponse, HookEvent, SyncReport,
+};
 use hecaton_core::{
-    AgentId, EventHandler, Fleet, FleetName, FleetRecord, FleetSecrets, Keep, Outcome,
+    AgentId, AgentName, EventHandler, Fleet, FleetName, FleetRecord, FleetSecrets, Keep, Outcome,
+    is_reserved_fleet, plugin_id,
 };
 use tokio::sync::{RwLock, mpsc, oneshot};
 
@@ -15,6 +18,7 @@ use crate::actor::{self, FleetHandle, Msg, Ports, Shared};
 use crate::auth::constant_time_eq;
 use crate::hooks::ParsedEvent;
 use crate::metrics::Metrics;
+use crate::plugins::{PluginError, PluginHost, PluginHostConfig};
 
 pub struct Daemon {
     fleets: RwLock<BTreeMap<FleetName, FleetHandle>>,
@@ -22,6 +26,7 @@ pub struct Daemon {
     shared: Shared,
     handler: Arc<dyn EventHandler>,
     token: String,
+    plugins: Arc<PluginHost>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -47,12 +52,21 @@ impl Daemon {
         metrics: Metrics,
         token: String,
         existing: Vec<(FleetRecord, FleetSecrets)>,
+        plugin_config: PluginHostConfig,
     ) -> Arc<Self> {
         let (shared, purged) = actor::shared(metrics);
+        let plugins = PluginHost::start(plugin_config, &ports, shared.clone());
         let ports = Arc::new(ports);
         let mut fleets = BTreeMap::new();
         for (record, secrets) in existing {
             match FleetName::try_from(record.spec.name.clone()) {
+                // The plugin host owns this name and already has an actor;
+                // a stored record under it predates the reservation (or was
+                // written by hand) and would fight it for tmux and state.
+                Ok(name) if is_reserved_fleet(name.as_str()) => tracing::error!(
+                    fleet = %name,
+                    "ignoring a stored fleet named {name}: the name is reserved for the daemon's plugins"
+                ),
                 Ok(name) => {
                     let h = actor::spawn(
                         name.clone(),
@@ -73,6 +87,7 @@ impl Daemon {
             shared,
             handler,
             token,
+            plugins,
         });
         tokio::spawn(Self::forget_purged(Arc::downgrade(&daemon), purged));
         daemon
@@ -95,6 +110,43 @@ impl Daemon {
         &self.shared.metrics
     }
 
+    pub fn plugins(&self) -> &Arc<PluginHost> {
+        &self.plugins
+    }
+
+    /// Reconciles the plugin set to `plugins.yaml`; `serve` calls it once
+    /// at start and fails fast on an error, `plugin sync` on demand.
+    pub async fn sync_plugins(&self) -> Result<SyncReport, PluginError> {
+        self.plugins.sync().await
+    }
+
+    /// `hello` authenticates with the plugin's token — the hook secret the
+    /// actor minted for `hecaton/plugins/<name>` — and is otherwise the
+    /// plugin's `SessionStart`.
+    pub async fn plugin_hello(
+        &self,
+        name: &AgentName,
+        token: &str,
+        req: HelloRequest,
+    ) -> Result<HelloResponse, DaemonError> {
+        if !self.verify_secret(&plugin_id(name), token).await {
+            return Err(DaemonError::Unauthorized);
+        }
+        self.plugins.hello(name, req).await
+    }
+
+    /// The `hecaton` fleet belongs to the plugin host: readable, never
+    /// written through the fleet API.
+    fn reject_reserved(name: &FleetName) -> Result<(), DaemonError> {
+        if is_reserved_fleet(name.as_str()) {
+            return Err(DaemonError::Invalid(format!(
+                "name: {:?} is reserved for the daemon's plugins",
+                name.as_str()
+            )));
+        }
+        Ok(())
+    }
+
     /// `POST` (`replace == false`): 409 unless the fleet is absent or
     /// settled `Down`. `PUT` (`replace == true`): 404 when absent.
     pub async fn apply(
@@ -104,6 +156,7 @@ impl Daemon {
         credentials: CredentialBundle,
         replace: bool,
     ) -> Result<FleetRecord, DaemonError> {
+        Self::reject_reserved(name)?;
         if spec.name != name.as_str() {
             return Err(DaemonError::Invalid(format!(
                 "spec.name {:?} does not match the fleet {name}",
@@ -157,6 +210,7 @@ impl Daemon {
         keep: Keep,
         purge: bool,
     ) -> Result<FleetRecord, DaemonError> {
+        Self::reject_reserved(name)?;
         let handle = self
             .fleets
             .read()
@@ -175,6 +229,9 @@ impl Daemon {
     }
 
     pub async fn get(&self, name: &FleetName) -> Option<FleetRecord> {
+        if is_reserved_fleet(name.as_str()) {
+            return Some(self.plugins.record());
+        }
         self.fleets
             .read()
             .await
@@ -182,20 +239,26 @@ impl Daemon {
             .map(|h| h.status.borrow().clone())
     }
 
+    /// Every record `/metrics` gauges, the plugin fleet included.
     pub async fn snapshots(&self) -> Vec<FleetRecord> {
-        self.fleets
+        let mut out: Vec<FleetRecord> = self
+            .fleets
             .read()
             .await
             .values()
             .map(|h| h.status.borrow().clone())
-            .collect()
+            .collect();
+        out.push(self.plugins.record());
+        out
     }
 
+    /// User fleets only: the plugin fleet is not a fleet row.
     pub async fn list(&self) -> Vec<FleetSummary> {
-        self.snapshots()
+        self.fleets
+            .read()
             .await
-            .iter()
-            .map(FleetRecord::summary)
+            .values()
+            .map(|h| h.status.borrow().summary())
             .collect()
     }
 

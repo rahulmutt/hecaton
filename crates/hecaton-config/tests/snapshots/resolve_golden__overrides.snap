@@ -25,7 +25,7 @@ crews:
           RUST_LOG: info
         runner:
           type: tmux
-        flow: {}
+        plugins: {}
       dave:
         claude:
           settings: {}
@@ -42,4 +42,4 @@ crews:
           RUST_LOG: info
         runner:
           type: tmux
-        flow: {}
+        plugins: {}

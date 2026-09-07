@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use hecaton_api::{CredentialBundle, GitSettings, Timestamp};
 
 use crate::agent::{CrewRef, ResolvedAgent};
-use crate::name::{AgentId, FleetName};
+use crate::name::{AgentId, AgentName, FleetName};
+use crate::plugin::ResolvedPlugin;
 use crate::ports::{
     AgentRunner, Clock, HookTarget, Keep, LaunchPlan, MaterializeError, Materializer,
     ObservedState, ProcessState, RunnerError,
@@ -114,6 +115,23 @@ impl Materializer for FakeMaterializer {
             },
             other => other,
         })
+    }
+    fn materialize_plugin(
+        &self,
+        plugin: &ResolvedPlugin,
+        _: &HookTarget,
+    ) -> Result<LaunchPlan, MaterializeError> {
+        let id = plugin.id().to_string();
+        self.check("materialize_plugin", &id, "mise")?;
+        Ok(LaunchPlan {
+            cwd: plugin.package.clone(),
+            env: BTreeMap::new(),
+            argv: vec!["fake-plugin".into()],
+            script: PathBuf::from("/fake").join(&id).join("launch.sh"),
+        })
+    }
+    fn purge_plugin(&self, name: &AgentName) -> Result<(), MaterializeError> {
+        self.check("purge_plugin", name.as_str(), "rm")
     }
 }
 
@@ -276,6 +294,39 @@ mod tests {
         assert_eq!(e.to_string(), "f/c/a: rm remove_agent: boom");
         assert!(m.remove_agent(&id("f/c/a")).is_ok());
         assert!(m.remove_agent(&id("f/c/b")).is_ok());
+    }
+
+    #[test]
+    fn plugin_calls_are_recorded_and_failable() {
+        let m = FakeMaterializer::default();
+        let p = ResolvedPlugin {
+            name: "web".parse().unwrap(),
+            package: "/pkg/web".into(),
+            manifest: serde_json::from_value(serde_json::json!({
+                "apiVersion": "hecaton/v1", "kind": "Plugin", "name": "web",
+                "version": "0.1.0", "protocol": 1, "start": "serve"
+            }))
+            .unwrap(),
+            config: serde_json::json!({}),
+            digest: None,
+        };
+        let host = HookTarget {
+            url: "http://127.0.0.1:1".into(),
+            secret: "tok".into(),
+        };
+        let plan = m.materialize_plugin(&p, &host).unwrap();
+        assert_eq!(plan.cwd, PathBuf::from("/pkg/web"));
+        m.fail_next("purge_plugin", "web", "busy");
+        assert_eq!(
+            m.purge_plugin(&"web".parse().unwrap())
+                .unwrap_err()
+                .to_string(),
+            "web: rm purge_plugin: busy"
+        );
+        assert_eq!(
+            m.calls(),
+            vec!["materialize_plugin hecaton/plugins/web", "purge_plugin web"]
+        );
     }
 
     #[test]

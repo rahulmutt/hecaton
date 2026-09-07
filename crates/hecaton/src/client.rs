@@ -5,10 +5,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use hecaton_api::{DownQuery, ErrorBody, FleetRequest, FleetSummary};
+use hecaton_api::{DownQuery, ErrorBody, FleetRequest, FleetSummary, PluginStatus, SyncReport};
 use hecaton_core::FleetRecord;
 use serde::de::DeserializeOwned;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::wiring::{layout_from_env, server_paths};
 
@@ -162,6 +162,37 @@ impl Client {
         Self::must(self.request("GET", "/v1/fleets", None), "fleet list")
     }
 
+    /// `Some(client)` when an endpoint and token exist, `None` when no
+    /// daemon has published an endpoint (so `plugin install` can edit the
+    /// file offline). A stale endpoint still yields a client whose calls
+    /// fail with `NOT_RUNNING`.
+    pub fn try_connect(api_url: Option<&str>) -> Result<Option<Self>> {
+        match Self::connect(api_url) {
+            Ok(c) => Ok(Some(c)),
+            Err(e) if e.to_string().starts_with(NOT_RUNNING) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn plugins(&self) -> Result<Vec<PluginStatus>> {
+        Self::must(self.request("GET", "/v1/plugins", None), "plugin list")
+    }
+
+    pub fn sync_plugins(&self) -> Result<SyncReport> {
+        Self::must(
+            self.request("POST", "/v1/plugins/sync", Some(&json!({}))),
+            "sync report",
+        )
+    }
+
+    pub fn purge_plugin(&self, name: &str) -> Result<()> {
+        Self::must(
+            self.request::<Value>("DELETE", &format!("/v1/plugins/{name}"), None),
+            &format!("plugin {name}"),
+        )
+        .map(|_| ())
+    }
+
     pub fn down(&self, name: &str, q: &DownQuery) -> Result<FleetRecord> {
         Self::must(
             self.request(
@@ -228,5 +259,28 @@ mod tests {
         let e = c.list().unwrap_err().to_string();
         assert!(e.contains("did not answer"), "{e}");
         assert!(!e.starts_with(NOT_RUNNING), "{e}");
+    }
+
+    #[test]
+    fn plugin_calls_hit_the_plugin_routes() {
+        let (url, rx) = crate::testutil::stub_server(
+            "200 OK",
+            r#"{"installed":["a"],"stopped":[],"unchanged":[]}"#,
+        );
+        let c = Client::new(url, "t".into());
+        let r = c.sync_plugins().unwrap();
+        assert_eq!(r.installed, vec!["a"]);
+        let raw = rx.recv().unwrap();
+        assert!(raw.starts_with("POST /v1/plugins/sync HTTP/1.1"), "{raw}");
+        let (url, rx) = crate::testutil::stub_server("200 OK", "{}");
+        Client::new(url, "t".into()).purge_plugin("web").unwrap();
+        assert!(
+            rx.recv()
+                .unwrap()
+                .starts_with("DELETE /v1/plugins/web HTTP/1.1")
+        );
+        let (url, rx) = crate::testutil::stub_server("200 OK", "[]");
+        assert!(Client::new(url, "t".into()).plugins().unwrap().is_empty());
+        assert!(rx.recv().unwrap().starts_with("GET /v1/plugins HTTP/1.1"));
     }
 }

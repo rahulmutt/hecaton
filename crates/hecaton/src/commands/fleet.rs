@@ -88,7 +88,7 @@ pub fn render_list(rows: &[FleetSummary]) -> String {
 
 /// Columns padded to the widest cell, two spaces apart, trailing spaces
 /// trimmed, so rows compare byte-for-byte in tests.
-fn table<const N: usize>(header: &[&str; N], rows: &[[String; N]]) -> String {
+pub(crate) fn table<const N: usize>(header: &[&str; N], rows: &[[String; N]]) -> String {
     let mut widths: Vec<usize> = header.iter().map(|h| h.len()).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {

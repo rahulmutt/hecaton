@@ -100,12 +100,16 @@ async fn the_fleet_api_and_hook_ingress_end_to_end() {
         hook_url: "http://127.0.0.1:1".into(),
         resync: Duration::from_secs(3600),
     };
+    // The plugin host wants a config even when no plugin is declared; the
+    // directory stays empty and is dropped with the test.
+    let plugin_dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(
         ports,
         Arc::new(PassThrough),
         Metrics::new().unwrap(),
         "admin-tok".into(),
         Vec::new(),
+        hecaton_server::testing::plugin_config_in(plugin_dir.path()),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();

@@ -24,6 +24,7 @@ credentials, hook input, or sandbox rules.
   live in `hecaton-core`; adapter crates implement them and never depend on
   each other. Only the `hecaton` binary wires adapters to ports;
   `hecaton-server` receives `Ports` and never imports `hecaton-runtime`.
+  `hecaton-plugin-sdk` depends on `hecaton-api` only.
 - Library crates return `thiserror` errors whose messages start with the config
   path (`crews.backend.agents.bob.tools.node: …`); only the binary uses `anyhow`.
 - Every tool version — `mise.toml` and fleet `tools:` — is exact.
@@ -82,4 +83,31 @@ credentials, hook input, or sandbox rules.
 - `hecaton-server` and `hecaton` integration tests (`api_it`, `cli_serve`,
   `cli_fleet`, `e2e`) bind port 0 and use private tmux sockets; if a run is
   interrupted, kill leftovers via `server/hecaton.pid` under the test's temp
-  HOME and `tmux -L hecaton-e2e-<pid> kill-server`.
+  HOME and `tmux -L hecaton-e2e-<pid> kill-server` (the plugin e2e uses
+  socket `hecaton-e2e-plugins-<pid>`).
+- `hecaton` is a reserved fleet name (the plugin fleet). `FleetName` still
+  parses it — the reservation lives in `Daemon::apply`/`down` and
+  `hecaton_config::resolve`.
+- A plugin's token is the hook secret the fleet actor mints for
+  `hecaton/plugins/<name>`; it lives in `nono-profile.json` as
+  `HECATON_PLUGIN_TOKEN` and nowhere else. It is minted when the plugin is
+  added and rotates on remove + re-add, not on every restart: `Actor::apply`
+  reuses an existing secret and only drops the ones the spec no longer wants.
+- Plugin packages: `plugins.yaml` directory sources are used in place with no
+  digest (development and the e2e); tarballs and URLs need `sha256` and
+  unpack read-only under `$XDG_DATA_HOME/hecaton/plugins/<name>/<digest12>/`.
+- The daemon runs `mise trust` + `mise install` on the package's own
+  `mise.toml` with `MISE_STATE_DIR` under the plugin's home; the sandbox uses
+  the same dir, so if `mise run` says the config is untrusted, the two
+  `MISE_STATE_DIR`s diverged (`plugin.rs`: `install_plugin_tools` vs
+  `plugin_env`). Do not set `MISE_GLOBAL_CONFIG_FILE` inside the sandbox —
+  mise would run the start task in `$HOME` and walk `$HOME`'s ancestors out
+  of the sandbox (`plugin.rs::plugin_env` explains).
+- `hecaton dev fake-plugin` is what the plugin e2e runs; it binds a loopback
+  listener under nono and says hello through the SDK.
+- `plugin remove --purge` (and `down --purge`) used to answer 500 `Directory
+  not empty` about one run in twenty: `tmux kill-window` returns before nono
+  finishes writing its ledger under `plugins/<name>/nono/`. Fixed on both
+  sides — `PluginHost::purge` waits (30 s) for the actor to take the plugin
+  out of the record before deleting anything, and `Runtime::rm_rf` retries
+  `remove_dir_all` for 5 s while the error is `DirectoryNotEmpty`.

@@ -6,6 +6,20 @@ use serde_json::Value;
 
 use crate::Timestamp;
 
+/// Every Claude Code hook event hecaton wires (Phase 2 spec §4.2). One
+/// list so the settings writer, the daemon and plugin manifests agree.
+pub const HOOK_EVENTS: &[&str] = &[
+    "SessionStart",
+    "SessionEnd",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "Notification",
+    "Stop",
+    "SubagentStop",
+    "PreCompact",
+];
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HookEvent {
     /// `fleet/crew/agent`.

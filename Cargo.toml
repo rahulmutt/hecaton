@@ -13,6 +13,7 @@ repository = "https://github.com/rahulmutt/hecaton"
 hecaton-api = { path = "crates/hecaton-api" }
 hecaton-core = { path = "crates/hecaton-core" }
 hecaton-config = { path = "crates/hecaton-config" }
+hecaton-plugin-sdk = { path = "crates/hecaton-plugin-sdk" }
 hecaton-runtime = { path = "crates/hecaton-runtime" }
 hecaton-server = { path = "crates/hecaton-server" }
 
@@ -25,6 +26,8 @@ clap = { version = "4.6.6", features = ["derive"] }
 sha2 = "0.11.0"
 hex = "0.4.3"
 toml = "1.1.5"
+tar = "0.4.46"
+flate2 = "1.1.10"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
 axum = "0.8.9"
 ureq = { version = "3.4.1", default-features = false, features = ["json"] }

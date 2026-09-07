@@ -15,6 +15,7 @@ path = "src/main.rs"
 hecaton-api = { workspace = true }
 hecaton-config = { workspace = true }
 hecaton-core = { workspace = true }
+hecaton-plugin-sdk = { workspace = true }
 hecaton-runtime = { workspace = true }
 hecaton-server = { workspace = true }
 anyhow = { workspace = true }
