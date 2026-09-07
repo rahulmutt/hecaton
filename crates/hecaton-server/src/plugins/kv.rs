@@ -131,8 +131,8 @@ impl PluginKv {
         }
     }
 
-    /// Every key under the prefix, sorted. Temp files (`.` + name) are
-    /// never keys, so they are skipped.
+    /// Every key under the prefix, sorted. `write_private`'s leftover temp
+    /// files (`.{name}.tmp~{pid}`) are never keys, so they are skipped.
     pub fn list(&self, name: &AgentName, prefix: &str) -> Result<Vec<String>, PluginError> {
         let dir = self.dir(name);
         let mut keys = Vec::new();
@@ -161,15 +161,14 @@ impl PluginKv {
         Ok(())
     }
 
-    /// `write_private`'s leftover temp file is named `.{name}.tmp-{pid}`.
+    /// `write_private`'s leftover temp file is named `.{name}.tmp~{pid}`.
     /// A leading `.` alone is not enough to tell: `validate_key` allows a
     /// segment to start with `.` (only a bare `.` or `..` segment is
-    /// rejected), so a key like `._` is a real key, not a temp file.
+    /// rejected), so a key like `._` is a real key, not a temp file. `~`
+    /// is outside `validate_key`'s alphabet (`[A-Za-z0-9._/-]`), so no
+    /// valid key segment can ever contain `.tmp~`; the match is exact.
     fn is_temp(file_name: &str) -> bool {
-        file_name.starts_with('.')
-            && file_name
-                .rsplit_once(".tmp-")
-                .is_some_and(|(_, pid)| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+        file_name.starts_with('.') && file_name.contains(".tmp~")
     }
 }
 
@@ -263,6 +262,37 @@ mod tests {
                 .count(),
             1,
             "no temp files left"
+        );
+    }
+
+    #[test]
+    fn keys_that_look_like_temp_files_still_list_but_a_planted_stale_temp_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = kv(dir.path(), 1);
+        // Neither key contains write_private's `~` marker, so both are real
+        // keys per `validate_key`, not leftover temp files.
+        store.put(&flow(), ".x.tmp-1", b"a", false).unwrap();
+        store.put(&flow(), "a/.tmp-42", b"b", false).unwrap();
+        assert_eq!(
+            store.list(&flow(), "").unwrap(),
+            vec![".x.tmp-1".to_string(), "a/.tmp-42".to_string()]
+        );
+        assert_eq!(
+            store.get(&flow(), ".x.tmp-1").unwrap().as_deref(),
+            Some(&b"a"[..])
+        );
+        assert_eq!(
+            store.get(&flow(), "a/.tmp-42").unwrap().as_deref(),
+            Some(&b"b"[..])
+        );
+
+        // A stale temp file planted by hand, using write_private's own
+        // marker (`~`), is excluded from every listing.
+        std::fs::write(dir.path().join("plugins/flow/kv/.x.tmp~999"), b"stale").unwrap();
+        assert_eq!(
+            store.list(&flow(), "").unwrap(),
+            vec![".x.tmp-1".to_string(), "a/.tmp-42".to_string()],
+            "the planted `.x.tmp~999` is not a key"
         );
     }
 

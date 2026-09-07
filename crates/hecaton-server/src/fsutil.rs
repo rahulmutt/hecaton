@@ -7,7 +7,11 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 /// Writes `bytes` to `path` via a sibling temp file and rename, created
-/// 0600 from the start, parent directory created if missing.
+/// 0600 from the start, parent directory created if missing. The temp
+/// name is `.{name}.tmp~{pid}`: `~` is outside every validated key
+/// alphabet in this crate (e.g. `plugins::kv`'s `[A-Za-z0-9._/-]`), so a
+/// caller that lists a directory by validated name can never mistake a
+/// real entry for this leftover.
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let dir = path
         .parent()
@@ -17,7 +21,7 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .file_name()
         .ok_or_else(|| io::Error::other("path has no file name"))?
         .to_string_lossy();
-    let tmp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
+    let tmp = dir.join(format!(".{name}.tmp~{}", std::process::id()));
     let _ = fs::remove_file(&tmp);
     let mut f = OpenOptions::new()
         .write(true)
