@@ -4,5 +4,7 @@
 //! owns the agents, the KV-backed state and the metrics.
 
 pub mod config;
+pub mod machine;
 
 pub use config::{Compiled, ConfigError, FlowConfig, compile};
+pub use machine::{Step, step};
