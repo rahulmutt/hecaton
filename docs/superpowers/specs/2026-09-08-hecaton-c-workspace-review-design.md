@@ -444,3 +444,10 @@ terminal in the review page, no per-plugin filesystem grants.
   (`inspect_it`); the bracketed paste against the real `claude`
   (`verify-claude`) is left pending — a by-hand run, not run at
   implementation.
+- **`load-buffer -` from stdin instead of `set-buffer`** (§3.3): the tmux
+  client packs a command's argv into one message and refuses it over
+  16 KiB ("command too long"; 15000 bytes accepted, 17000 refused on the
+  pinned tmux 3.7c), so a review of the 64 KiB §4.4 allows could never be
+  an argument. `send_text` fills the buffer with `load-buffer -b
+  hecaton-send-<n> -` and hands the text to the client on its stdin; the
+  `paste-buffer -p -d` and the delete-on-failure cleanup are unchanged.

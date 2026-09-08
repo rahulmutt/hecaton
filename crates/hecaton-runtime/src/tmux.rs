@@ -161,6 +161,24 @@ impl TmuxRunner {
             })
     }
 
+    /// `run`, with `input` handed to the tmux client on its stdin: the
+    /// client packs a command's argv into a single message and refuses one
+    /// over 16 KiB ("command too long"), so a review-sized text cannot be
+    /// an argument of `set-buffer` and arrives through `load-buffer -`
+    /// instead.
+    fn run_with_stdin(&self, id: &str, args: &[&str], input: &[u8]) -> Result<(), RunnerError> {
+        self.cmd()
+            .args(args.iter().copied())
+            .run_with_stdin(input)
+            .map(|_| ())
+            .map_err(|f| RunnerError::Tool {
+                id: id.to_string(),
+                subcommand: f.subcommand,
+                args: f.args,
+                stderr: f.stderr,
+            })
+    }
+
     /// tmux exits non-zero with "no server running" / "can't find" /
     /// "error connecting" when nothing exists, and with "no current
     /// target" when the server is up but holds no session at all (the
@@ -442,8 +460,12 @@ impl AgentRunner for TmuxRunner {
     /// One line goes through `send-keys -l`. Text with a newline goes
     /// through a named buffer and `paste-buffer -p` (Spec C §3.3): `-p`
     /// wraps it in bracketed-paste markers when the application asked for
-    /// them, which is how Claude Code takes a multi-line paste as one
-    /// message; `-d` deletes the buffer. Buffer names are unique per
+    /// them, which a multi-line paste is expected to arrive on as one
+    /// message (verify with `mise run verify-claude`; Spec C §8, pending);
+    /// `-d` deletes the buffer. The buffer is filled by `load-buffer -`
+    /// from the tmux client's stdin, not by `set-buffer -- <text>`: the
+    /// client refuses a command whose packed argv exceeds 16 KiB, and
+    /// Spec C §4.4 allows a review of 64 KiB. Buffer names are unique per
     /// process so two concurrent sends cannot swap texts; on a failed
     /// paste (the target window gone, say) the buffer is deleted before
     /// the error is returned, so failures do not leak buffers.
@@ -456,7 +478,7 @@ impl AgentRunner for TmuxRunner {
                 std::process::id(),
                 SEND_SEQ.fetch_add(1, Ordering::Relaxed)
             );
-            self.run(&id, &["set-buffer", "-b", &buffer, "--", text])?;
+            self.run_with_stdin(&id, &["load-buffer", "-b", &buffer, "-"], text.as_bytes())?;
             if let Err(err) = self.run(
                 &id,
                 &["paste-buffer", "-p", "-d", "-b", &buffer, "-t", &target],

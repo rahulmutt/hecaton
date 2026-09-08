@@ -236,10 +236,14 @@ credentials, hook input, or sandbox rules.
   on `…Key=void 0`; `.gitleaks.toml` keeps the default ruleset and
   allowlists exactly the three vendored files by anchored path. Anything
   else under `assets/` is still scanned.
-- `send_text` with a newline goes through `set-buffer` + `paste-buffer -p -d`
-  (a bracketed paste), single lines through `send-keys -l`. The e2e's
-  `fake-claude` records a paste line by line; the real `claude` takes it as
-  one message (`verify-claude`).
+- `send_text` with a newline goes through `load-buffer -b <name> -` +
+  `paste-buffer -p -d` (a bracketed paste), single lines through
+  `send-keys -l`. The text rides in on the tmux client's *stdin*, not in
+  the argv: the client refuses a command whose packed argv is over 16 KiB
+  ("command too long"), and a review may be 64 KiB. The e2e's
+  `fake-claude` records a paste line by line; the real `claude` is expected
+  to arrive as one message — verify with `mise run verify-claude`
+  (Spec C §8, pending).
 - Workspace git calls (`hecaton-runtime/src/inspect.rs`) set
   `GIT_OPTIONAL_LOCKS=0` and `-c core.fsmonitor=false -c core.hooksPath=<empty>`
   and pass `--no-ext-diff --no-textconv` to every `diff`: the crew's

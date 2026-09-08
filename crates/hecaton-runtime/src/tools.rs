@@ -6,7 +6,7 @@ use std::fmt;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolPaths {
@@ -151,12 +151,25 @@ impl Cmd {
     }
 
     pub(crate) fn run(&self) -> Result<CmdOutput, CmdFailure> {
-        self.run_with_exit_codes(&[0])
+        self.exec(&[0], None)
     }
 
     /// `run`, treating any exit code in `accepted` as success: `git diff
     /// --no-index` exits 1 when the files differ, which is the answer.
     pub(crate) fn run_with_exit_codes(&self, accepted: &[i32]) -> Result<CmdOutput, CmdFailure> {
+        self.exec(accepted, None)
+    }
+
+    /// `run`, feeding `input` on the child's stdin and closing it: how a
+    /// payload larger than an argv reaches a tool (`tmux load-buffer -`).
+    /// The write is synchronous and the pipe buffer is 64 KiB, so this
+    /// suits a tool that consumes stdin before it writes much of its own
+    /// output — which `load-buffer` does (it writes none).
+    pub(crate) fn run_with_stdin(&self, input: &[u8]) -> Result<CmdOutput, CmdFailure> {
+        self.exec(&[0], Some(input))
+    }
+
+    fn exec(&self, accepted: &[i32], stdin: Option<&[u8]>) -> Result<CmdOutput, CmdFailure> {
         let mut c = Command::new(&self.program);
         c.args(&self.args).envs(&self.env);
         for k in &self.env_removals {
@@ -171,9 +184,34 @@ impl Cmd {
             args: self.args.clone(),
             stderr,
         };
-        let out = c
-            .output()
-            .map_err(|e| failure(format!("cannot execute {}: {e}", self.program.display())))?;
+        let cannot_execute =
+            |e: std::io::Error| failure(format!("cannot execute {}: {e}", self.program.display()));
+        let out = match stdin {
+            None => c.output().map_err(cannot_execute)?,
+            Some(input) => {
+                let mut child = c
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .map_err(cannot_execute)?;
+                // Dropped (and so closed) before the wait: the child sees EOF.
+                let written = match child.stdin.take() {
+                    Some(mut pipe) => pipe.write_all(input),
+                    None => Ok(()),
+                };
+                if let Err(e) = written {
+                    // Do not wait on a child that may never read its input.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(failure(format!(
+                        "cannot write to {}: {e}",
+                        self.program.display()
+                    )));
+                }
+                child.wait_with_output().map_err(cannot_execute)?
+            }
+        };
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         if let Some(log) = &self.log {

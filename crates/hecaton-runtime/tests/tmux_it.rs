@@ -409,7 +409,7 @@ fn send_text_with_newlines_arrives_as_one_paste() {
 }
 
 /// A `paste-buffer` failure (the target window gone, an agent dying
-/// concurrently with a `send_text`) must not leak the buffer `set-buffer`
+/// concurrently with a `send_text`) must not leak the buffer `load-buffer`
 /// created: `send_text` deletes it itself before returning the error.
 #[test]
 fn send_text_deletes_the_buffer_when_paste_buffer_fails() {
@@ -442,7 +442,87 @@ fn send_text_deletes_the_buffer_when_paste_buffer_fails() {
         .unwrap();
     assert!(
         !String::from_utf8_lossy(&buffers.stdout).contains("hecaton-send-"),
-        "the buffer set-buffer created must not survive a failed paste: {}",
+        "the buffer load-buffer created must not survive a failed paste: {}",
+        String::from_utf8_lossy(&buffers.stdout)
+    );
+    r.stop_crew(&crew).unwrap();
+}
+
+/// Spec C §4.4 allows a 64 KiB review, and the header, the quoted lines
+/// and the per-comment framing put the rendered message well past that.
+/// tmux's client refuses a command whose packed argv exceeds 16 KiB
+/// ("command too long"), so the text cannot travel as an argument of
+/// `set-buffer`; it goes in on the client's stdin through `load-buffer -`
+/// instead. ~70 KiB must arrive whole, and leave no buffer behind.
+#[test]
+fn send_text_of_seventy_kilobytes_arrives_whole() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("tmux", false));
+        return;
+    };
+    let root = support::temp_root("tmux-paste-big");
+    let socket = format!("hecaton-test-paste-big-{}", std::process::id());
+    let _server = KillServer {
+        tmux: tools.tmux.clone(),
+        socket: socket.clone(),
+    };
+    let r = TmuxRunner::new(tools.tmux.clone(), socket.clone());
+    let id: AgentId = "f/c/a".parse().unwrap();
+    let crew = id.crew_ref();
+    let agent_dir = root.join("a");
+    std::fs::create_dir_all(agent_dir.join("logs")).unwrap();
+    let stdin_log = agent_dir.join("stdin.log");
+    let script = agent_dir.join("launch.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\nexec cat >> {}\n", stdin_log.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let plan = LaunchPlan {
+        cwd: agent_dir.clone(),
+        env: BTreeMap::new(),
+        argv: vec![],
+        script: script.clone(),
+    };
+    r.ensure_crew(&crew).unwrap();
+    r.ensure_agent(&id, &plan).unwrap();
+    wait_for(|| {
+        matches!(
+            r.observe(&id.fleet).unwrap().get(&id),
+            Some(ProcessState::Running { .. })
+        )
+    });
+    std::thread::sleep(Duration::from_millis(300));
+
+    // 1000 × 72 bytes = 70.3 KiB, every line well under the tty's
+    // canonical line limit and the last one without a newline.
+    let text: String = (0..1000)
+        .map(|i| format!("line {i:05} {}", "x".repeat(60)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.len() > 70 << 10, "{}", text.len());
+    r.send_text(&id, &text, true).unwrap();
+
+    let expected = format!("{text}\n");
+    wait_for(|| std::fs::read_to_string(&stdin_log).is_ok_and(|s| s.contains("line 00999")));
+    let got = std::fs::read_to_string(&stdin_log).unwrap();
+    assert_eq!(
+        got.len(),
+        expected.len(),
+        "the paste must arrive whole: {} of {} bytes",
+        got.len(),
+        expected.len()
+    );
+    assert_eq!(got, expected);
+
+    let buffers = std::process::Command::new(&tools.tmux)
+        .args(["-L", &socket, "list-buffers"])
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&buffers.stdout).contains("hecaton-send-"),
+        "{}",
         String::from_utf8_lossy(&buffers.stdout)
     );
     r.stop_crew(&crew).unwrap();
