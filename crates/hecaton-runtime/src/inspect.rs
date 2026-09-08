@@ -34,8 +34,13 @@ const DIFF_FLAGS: &[&str] = &["--no-ext-diff", "--no-textconv", "--no-color"];
 
 /// Config keys whose value is a program git runs on `diff` (a clean
 /// filter through `.gitattributes`) or on checkout; `--no-ext-diff` and
-/// `--no-textconv` do not cover them, so a diff is refused instead.
-const FILTER_KEYS: &str = r"^filter\..*\.(clean|smudge|process)$";
+/// `--no-textconv` do not cover them, so a diff is refused instead. A
+/// matching `extensions.worktreeconfig` (git lowercases variable names in
+/// `--name-only` output, whatever case the file used) means the worktree
+/// may have a `config.worktree` file the `--local` read below cannot see
+/// — hecaton never enables `worktreeConfig`, so one set here means the
+/// repository config was tampered with, and a diff is refused outright.
+const FILTER_KEYS: &str = r"^(filter\..*\.(clean|smudge|process)|extensions\.worktreeconfig)$";
 
 impl Runtime {
     /// The agent's worktree and crew paths; `Missing` when the worktree

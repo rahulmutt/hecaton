@@ -253,6 +253,10 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
             .contains("+more")
     );
 
+    // README must be wired to the "pwn" filter, or nothing would ever run
+    // it and the marker checks below would pass even without the guard.
+    std::fs::write(w.join(".gitattributes"), "README filter=pwn\n").unwrap();
+
     // a clean/smudge/process filter in repo config would run as the daemon
     git(
         w,
@@ -268,6 +272,34 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
     assert!(!marker.exists(), "the filter ran");
     git(w, &["config", "--unset", "filter.pwn.clean"]);
     assert!(rt.diff(&id, "origin/main").is_ok(), "unset: diffs again");
+
+    // extensions.worktreeConfig would let an agent write a filter into
+    // <gitdir>/worktrees/<id>/config.worktree, a file `--local` cannot
+    // see; refused on the extension key itself instead.
+    git(w, &["config", "extensions.worktreeConfig", "true"]);
+    git(
+        w,
+        &[
+            "config",
+            "--worktree",
+            "filter.pwn.clean",
+            &hook.display().to_string(),
+        ],
+    );
+    let e = rt.diff(&id, "origin/main").unwrap_err();
+    assert_eq!(
+        e,
+        WorkspaceError::Filter {
+            key: "extensions.worktreeconfig".into()
+        }
+    );
+    assert!(!marker.exists(), "the filter ran");
+    // unset the filter while the extension is still on (so `--worktree`
+    // still resolves to config.worktree), then the extension itself.
+    git(w, &["config", "--worktree", "--unset", "filter.pwn.clean"]);
+    git(w, &["config", "--unset", "extensions.worktreeConfig"]);
+    assert!(rt.diff(&id, "origin/main").is_ok(), "unset: diffs again");
+    std::fs::remove_file(w.join(".gitattributes")).unwrap();
 
     // a missing base is a git error naming the subcommand
     let e = rt.diff(&id, "origin/nope").unwrap_err();

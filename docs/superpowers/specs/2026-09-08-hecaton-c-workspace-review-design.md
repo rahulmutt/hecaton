@@ -472,6 +472,8 @@ terminal in the review page, no per-plugin filesystem grants.
   and `text` (4096) multiply by the 200 comments.
 - **A diff fails closed on a declared filter** (§5 called it the planned
   follow-up): `WorkspaceError::Filter`, 500 `repository config sets <key>;
-  workspace diff refused`.
+  workspace diff refused`. Also refused on `extensions.worktreeconfig`:
+  hecaton never enables `worktreeConfig`, so one set means `config.worktree`
+  may hold a filter the `--local` config read cannot see.
 - **A single line over 4 KiB is pasted through the buffer too**:
   `send-keys -l` carries the text as argv, which tmux caps at ~16 KiB.
