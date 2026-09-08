@@ -362,6 +362,7 @@ async fn a_stored_fleet_under_the_reserved_name_is_ignored() {
         runner: h.runner.clone(),
         clock: h.clock.clone(),
         store: h.store.clone(),
+        workspace: h.workspace.clone(),
         policy: Default::default(),
         hook_url: "http://127.0.0.1:1".into(),
         resync: Duration::from_secs(3600),

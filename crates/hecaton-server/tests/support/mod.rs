@@ -167,7 +167,7 @@ impl Drop for World {
 /// A daemon with the chain handler, served on a port, with one package
 /// `flow` declared (intercepts PreToolUse+Stop, observes Stop, needs
 /// actions+kv) and one package `web` (observes SessionStart, needs
-/// fleets+attach, serves routes).
+/// fleets+attach+workspace, serves routes).
 pub async fn world() -> World {
     let h = Harness::new(Duration::from_secs(3600));
     let dir = tempfile::tempdir().unwrap();
@@ -179,7 +179,7 @@ pub async fn world() -> World {
     write_plugin_package(
         &dir.path().join("web-pkg"),
         "web",
-        "hooks: { observe: [SessionStart] }\nneeds: [fleets, attach]\nroutes: true\n",
+        "hooks: { observe: [SessionStart] }\nneeds: [fleets, attach, workspace]\nroutes: true\n",
     );
     std::fs::write(
         dir.path().join("plugins.yaml"),

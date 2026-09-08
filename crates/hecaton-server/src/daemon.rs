@@ -12,7 +12,7 @@ use hecaton_api::{
 };
 use hecaton_core::{
     AgentId, AgentName, AgentRunner, EventHandler, Fleet, FleetName, FleetRecord, FleetSecrets,
-    Keep, Outcome, is_reserved_fleet, plugin_id, reserved_fleet_reason,
+    Keep, Outcome, WorkspaceReader, is_reserved_fleet, plugin_id, reserved_fleet_reason,
 };
 use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
@@ -278,6 +278,18 @@ impl Daemon {
 
     pub fn runner(&self) -> Arc<dyn AgentRunner> {
         self.ports.runner.clone()
+    }
+
+    pub fn workspace(&self) -> Arc<dyn WorkspaceReader> {
+        self.ports.workspace.clone()
+    }
+
+    /// `origin/<ref>` of the agent's crew, from the fleet's record; `None`
+    /// when the fleet or the crew is unknown.
+    pub async fn base_ref(&self, agent: &AgentId) -> Option<String> {
+        let record = self.get(&agent.fleet).await?;
+        let crew = record.spec.crews.get(agent.crew.as_str())?;
+        Some(format!("origin/{}", crew.git_ref))
     }
 
     /// Reconciles the plugin set to `plugins.yaml`; `serve` calls it once

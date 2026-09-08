@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, Mutex as StdMutex};
 use std::time::Duration;
 
 use hecaton_api::Timestamp;
-use hecaton_core::fakes::{FakeClock, FakeMaterializer, FakeRunner};
+use hecaton_core::fakes::{FakeClock, FakeMaterializer, FakeRunner, FakeWorkspace};
 use hecaton_core::{FleetName, FleetRecord, FleetSecrets, FleetStore, ReconcilePolicy, StoreError};
 
 use crate::actor::Ports;
@@ -57,6 +57,7 @@ pub struct Harness {
     pub runner: Arc<FakeRunner>,
     pub clock: Arc<FakeClock>,
     pub store: Arc<MemoryStore>,
+    pub workspace: Arc<FakeWorkspace>,
     pub ports: Arc<Ports>,
     pub registry: Arc<PluginRegistry>,
     pub client: PluginClient,
@@ -75,11 +76,13 @@ impl Harness {
         let runner = Arc::new(FakeRunner::default());
         let clock = Arc::new(FakeClock::new(Timestamp(1_000)));
         let store = Arc::new(MemoryStore::new());
+        let workspace = Arc::new(FakeWorkspace::default());
         let ports = Arc::new(Ports {
             materializer: materializer.clone(),
             runner: runner.clone(),
             clock: clock.clone(),
             store: store.clone(),
+            workspace: workspace.clone(),
             policy,
             hook_url: "http://127.0.0.1:1".to_string(),
             resync,
@@ -94,6 +97,7 @@ impl Harness {
             runner,
             clock,
             store,
+            workspace,
             ports,
             registry: PluginRegistry::new(),
             client: PluginClient::new().unwrap_or_else(|e| panic!("http client: {e}")),
@@ -165,6 +169,7 @@ impl Harness {
             runner: self.runner.clone(),
             clock: self.clock.clone(),
             store: self.store.clone(),
+            workspace: self.workspace.clone(),
             policy: self.ports.policy.clone(),
             hook_url: self.ports.hook_url.clone(),
             resync: self.ports.resync,
