@@ -186,6 +186,58 @@ async fn routes_plugin(expect: String) -> String {
     listen
 }
 
+/// A "plugin" that answers 101 to whatever it is asked and then holds the
+/// connection, as a peer that believes it upgraded would. A raw socket:
+/// no HTTP library sends a 101 to a request that did not ask for one.
+async fn switching_protocols_plugin() -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                    )
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            });
+        }
+    });
+    listen
+}
+
+/// A 101 to a request that never asked to upgrade is the plugin's fault,
+/// answered 502; before, the mount awaited a downstream upgrade that could
+/// never happen and parked the task with the plugin's connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_101_to_a_plain_request_is_a_502_not_a_parked_task() {
+    let w = world().await;
+    let admin = [("Authorization", format!("Bearer {}", w.api.token()))];
+    let admin: Vec<(&str, &str)> = admin.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let web = token(&w, "web").await;
+    let listen = switching_protocols_plugin().await;
+    Host::new(Env {
+        api_url: w.api.base.clone(),
+        name: "web".into(),
+        token: web,
+        scratch: w.dir.path().join("s"),
+    })
+    .unwrap()
+    .hello("0.1.0", &listen)
+    .await
+    .unwrap();
+    let (s, _, text) = w.api.raw("GET", "/v1/plugins/web/", &admin, None);
+    assert_eq!(s, 502, "{text}");
+    assert!(text.contains("101"), "{text}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_mount_proxies_plain_requests_and_websockets_and_filters_headers() {
     let w = world().await;
@@ -237,7 +289,8 @@ async fn the_mount_proxies_plain_requests_and_websockets_and_filters_headers() {
     let mut with_junk = admin.clone();
     with_junk.push(("Cookie", "hecaton_session=stolen"));
     with_junk.push(("X-Custom", "1"));
-    with_junk.push(("Connection", "keep-alive"));
+    with_junk.push(("X-Hop", "1"));
+    with_junk.push(("Connection", "keep-alive, X-Hop"));
     let (s, _, text) = w
         .api
         .raw("GET", "/v1/plugins/web/headers?q=1", &with_junk, None);
@@ -255,6 +308,10 @@ async fn the_mount_proxies_plain_requests_and_websockets_and_filters_headers() {
     );
     assert!(!seen.contains_key("cookie"), "{seen:?}");
     assert!(!seen.contains_key("connection"), "{seen:?}");
+    assert!(
+        !seen.contains_key("x-hop"),
+        "a header Connection names is hop-by-hop: {seen:?}"
+    );
     assert_eq!(
         seen.get("host").map(|h| h == &listen),
         Some(true),
