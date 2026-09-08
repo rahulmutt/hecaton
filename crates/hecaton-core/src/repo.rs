@@ -162,10 +162,25 @@ mod tests {
             ("acme/pay ments", "expected owner/name or a clone URL"),
             ("a/..", "expected owner/name or a clone URL"),
             ("./b", "expected owner/name or a clone URL"),
+            // '@' alone is not scp-like syntax; that needs the ':' too
+            ("acme@payments-api", "expected owner/name or a clone URL"),
         ] {
             let err = RepoRef::parse(bad).unwrap_err();
             assert_eq!(err.value, bad);
             assert_eq!(err.reason, reason, "for {bad:?}");
+        }
+    }
+
+    #[test]
+    fn display_is_the_clone_url() {
+        for s in [
+            "acme/payments-api",
+            "https://gitlab.com/acme/x.git",
+            "file:///srv/git/api.git",
+        ] {
+            let r = RepoRef::parse(s).unwrap();
+            assert_eq!(r.to_string(), r.clone_url(), "for {s}");
+            assert!(!r.to_string().is_empty(), "for {s}");
         }
     }
 

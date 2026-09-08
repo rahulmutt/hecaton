@@ -1,13 +1,11 @@
 //! Tool version exactness, shared by manifest validation (`plugin.rs`) and
 //! fleet-config validation (`hecaton_config::validate`).
 
-/// Rejects mise's fuzzy forms: keywords, `prefix:`/`ref:`/`path:`/`sub-`
-/// specs, wildcards, bare `major` / `major.minor` numbers, and digit-free
+/// Rejects mise's fuzzy forms: `prefix:`/`ref:`/`path:`/`sub-` specs,
+/// wildcards, bare `major` / `major.minor` numbers, and anything without a
+/// digit — the empty string, the keywords ("latest", "lts", "system") and
 /// channel names ("nightly", "stable", "beta", "canary").
 pub fn is_exact_version(v: &str) -> bool {
-    if v.is_empty() || matches!(v, "latest" | "lts" | "system") {
-        return false;
-    }
     if v.ends_with(".x") || v.contains('*') || v.contains(':') {
         return false;
     }
