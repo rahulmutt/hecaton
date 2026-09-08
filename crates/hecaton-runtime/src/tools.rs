@@ -151,6 +151,12 @@ impl Cmd {
     }
 
     pub(crate) fn run(&self) -> Result<CmdOutput, CmdFailure> {
+        self.run_with_exit_codes(&[0])
+    }
+
+    /// `run`, treating any exit code in `accepted` as success: `git diff
+    /// --no-index` exits 1 when the files differ, which is the answer.
+    pub(crate) fn run_with_exit_codes(&self, accepted: &[i32]) -> Result<CmdOutput, CmdFailure> {
         let mut c = Command::new(&self.program);
         c.args(&self.args).envs(&self.env);
         for k in &self.env_removals {
@@ -184,7 +190,8 @@ impl Cmd {
                 );
             }
         }
-        if !out.status.success() {
+        let ok = out.status.code().is_some_and(|c| accepted.contains(&c));
+        if !ok {
             return Err(failure(if stderr.trim().is_empty() {
                 format!("exit status {}", out.status)
             } else {
@@ -249,6 +256,14 @@ mod tests {
         assert!(logged.contains("$ sh -c echo out"));
         assert!(logged.contains("err\n"), "stderr is logged even on success");
         assert!(logged.contains("[exit exit status: 3]"));
+    }
+
+    #[test]
+    fn an_accepted_exit_code_is_success_and_keeps_stdout() {
+        let sh = Cmd::new(Path::new("/bin/sh")).args(["-c", "echo out; exit 1"]);
+        assert!(sh.run().is_err());
+        assert_eq!(sh.run_with_exit_codes(&[0, 1]).unwrap().stdout, "out\n");
+        assert!(sh.run_with_exit_codes(&[2]).is_err());
     }
 
     #[test]

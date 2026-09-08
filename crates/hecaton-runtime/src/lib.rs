@@ -5,6 +5,7 @@
 pub mod env;
 pub mod fsutil;
 pub mod home;
+pub mod inspect;
 pub mod launch;
 pub mod layout;
 pub mod materializer;
