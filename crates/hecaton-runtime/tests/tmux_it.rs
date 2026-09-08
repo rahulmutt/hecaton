@@ -342,3 +342,68 @@ fn attach_streams_the_pane_and_the_grouped_session_dies_with_the_stream() {
     wait_for(|| sessions().trim().is_empty());
     drop(again);
 }
+
+/// Spec C §3.3: a multi-line `send_text` arrives whole. `send-keys -l`
+/// would deliver a literal newline as Ctrl-J to the application; a
+/// buffer paste delivers the text as a terminal paste does, `\r` between
+/// the lines, which a cooked tty turns back into `\n` for `cat`.
+#[test]
+fn send_text_with_newlines_arrives_as_one_paste() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("tmux", false));
+        return;
+    };
+    let root = support::temp_root("tmux-paste");
+    let socket = format!("hecaton-test-paste-{}", std::process::id());
+    let _server = KillServer {
+        tmux: tools.tmux.clone(),
+        socket: socket.clone(),
+    };
+    let r = TmuxRunner::new(tools.tmux.clone(), socket.clone());
+    let id: AgentId = "f/c/a".parse().unwrap();
+    let crew = id.crew_ref();
+    let agent_dir = root.join("a");
+    std::fs::create_dir_all(agent_dir.join("logs")).unwrap();
+    let stdin_log = agent_dir.join("stdin.log");
+    let script = agent_dir.join("launch.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\nexec cat >> {}\n", stdin_log.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let plan = LaunchPlan {
+        cwd: agent_dir.clone(),
+        env: BTreeMap::new(),
+        argv: vec![],
+        script: script.clone(),
+    };
+    r.ensure_crew(&crew).unwrap();
+    r.ensure_agent(&id, &plan).unwrap();
+    wait_for(|| {
+        matches!(
+            r.observe(&id.fleet).unwrap().get(&id),
+            Some(ProcessState::Running { .. })
+        )
+    });
+    // give `cat` a moment to be the pane's foreground process
+    std::thread::sleep(Duration::from_millis(300));
+
+    r.send_text(&id, "single", true).unwrap();
+    r.send_text(&id, "line one\nline two\n\nline four", true)
+        .unwrap();
+    wait_for(|| std::fs::read_to_string(&stdin_log).is_ok_and(|s| s.contains("line four")));
+    let got = std::fs::read_to_string(&stdin_log).unwrap();
+    assert_eq!(got, "single\nline one\nline two\n\nline four\n", "{got:?}");
+    // the paste buffer was deleted afterwards
+    let buffers = std::process::Command::new(&tools.tmux)
+        .args(["-L", &socket, "list-buffers"])
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&buffers.stdout).contains("hecaton-send-"),
+        "{}",
+        String::from_utf8_lossy(&buffers.stdout)
+    );
+    r.stop_crew(&crew).unwrap();
+}

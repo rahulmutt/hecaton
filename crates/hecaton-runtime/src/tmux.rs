@@ -39,6 +39,7 @@ const IDLE_ARGV: [&str; 3] = ["/bin/sh", "-c", "while :; do sleep 3600; done"];
 pub const ATTACH_SESSION_PREFIX: &str = "hecaton-attach-";
 const ATTACH_TERM: &str = "xterm-256color";
 static ATTACH_SEQ: AtomicU64 = AtomicU64::new(0);
+static SEND_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// `hecaton-attach-<8 hex>`, unique per process: the clock, a counter and
 /// the pid folded into 32 bits.
@@ -438,10 +439,29 @@ impl AgentRunner for TmuxRunner {
         Ok(out)
     }
 
+    /// One line goes through `send-keys -l`. Text with a newline goes
+    /// through a named buffer and `paste-buffer -p` (Spec C §3.3): `-p`
+    /// wraps it in bracketed-paste markers when the application asked for
+    /// them, which is how Claude Code takes a multi-line paste as one
+    /// message; `-d` deletes the buffer. Buffer names are unique per
+    /// process so two concurrent sends cannot swap texts.
     fn send_text(&self, agent: &AgentId, text: &str, submit: bool) -> Result<(), RunnerError> {
         let id = agent.to_string();
         let target = Self::window_target(agent);
-        self.run(&id, &["send-keys", "-t", &target, "-l", "--", text])?;
+        if text.contains('\n') {
+            let buffer = format!(
+                "hecaton-send-{}-{}",
+                std::process::id(),
+                SEND_SEQ.fetch_add(1, Ordering::Relaxed)
+            );
+            self.run(&id, &["set-buffer", "-b", &buffer, "--", text])?;
+            self.run(
+                &id,
+                &["paste-buffer", "-p", "-d", "-b", &buffer, "-t", &target],
+            )?;
+        } else {
+            self.run(&id, &["send-keys", "-t", &target, "-l", "--", text])?;
+        }
         if submit {
             self.run(&id, &["send-keys", "-t", &target, "Enter"])?;
         }
