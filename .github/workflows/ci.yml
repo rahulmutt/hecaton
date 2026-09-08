@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
-        with: { install: false, cache: true }
+        with: { version: 2026.9.2, install: false, cache: true }
       - run: mise install rust cargo:cargo-nextest cargo-insta tmux nono gh
       - run: mise run check
   mutants:
@@ -28,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
-        with: { install: false, cache: true }
+        with: { version: 2026.9.2, install: false, cache: true }
       - run: mise install rust github:sourcefrog/cargo-mutants
       - run: mise run mutants
   audit:
@@ -37,6 +37,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
-        with: { install: false, cache: true }
+        with: { version: 2026.9.2, install: false, cache: true }
       - run: mise install rust cargo:cargo-audit aqua:EmbarkStudios/cargo-deny
       - run: mise run audit
