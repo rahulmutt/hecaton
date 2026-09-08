@@ -1304,3 +1304,14 @@ everything else in them is internal.
   filters its agents by it).
 - **The 1011 close on a PTY write failure says so** ("the terminal's
   writer failed"); it used to reuse the 1000 reason.
+- **The web plugin's assets live under a digest segment**,
+  `/assets/<sha256 of the three files, 12 hex>/xterm.js` (§18.5 had
+  `/assets/xterm.js`). They are served `immutable` for a year, and an
+  unversioned URL would have handed any browser that visited before a
+  stale bundle after a vendor bump; a new bundle is now a new URL. The
+  pages link the digest path; the old path is a 404.
+- **The web bridge forwards the daemon's close to the browser** through
+  the SDK's new `AttachRead::close_reason()`: the page's `[disconnected:
+  <reason>]` line shows 1000/1003/1011 and the daemon's text instead of a
+  fixed "the terminal closed" (reserved codes 1005/1006/1015 cross as
+  1011).

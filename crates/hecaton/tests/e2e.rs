@@ -1329,8 +1329,25 @@ fn web_journey() {
         &[("Cookie", &cookie)],
     );
     assert_eq!(status, 200);
-    assert!(page.contains("/v1/plugins/web/assets/xterm.js"), "{page}");
-    let (status, _, js) = raw_get(&format!("{mount}assets/xterm.js"), &[("Cookie", &cookie)]);
+    // assets are linked under a digest segment; the page says which
+    let marker = "/v1/plugins/web/assets/";
+    let at = page
+        .find(marker)
+        .unwrap_or_else(|| panic!("an asset link: {page}"))
+        + marker.len();
+    let digest = &page[at..at + 12];
+    assert!(
+        digest.chars().all(|c| c.is_ascii_hexdigit()),
+        "a digest segment: {digest:?}"
+    );
+    assert!(
+        page.contains(&format!("{marker}{digest}/xterm.js")),
+        "{page}"
+    );
+    let (status, _, js) = raw_get(
+        &format!("{mount}assets/{digest}/xterm.js"),
+        &[("Cookie", &cookie)],
+    );
     assert_eq!((status, js.len()), (200, 488663));
 
     // the terminal: through the proxy, the plugin and the daemon's attach

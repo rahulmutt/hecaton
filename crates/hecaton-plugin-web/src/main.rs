@@ -18,8 +18,8 @@ fn run() -> anyhow::Result<()> {
     let env = Env::from_process()?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let host = Host::new(env.clone())?;
-        let plugin = WebPlugin::new(Host::new(env)?)?;
+        let host = Host::new(env)?;
+        let plugin = WebPlugin::new(host.clone())?;
         let watch = plugin.start_watch();
         eprintln!("web: starting");
         let result = serve(&host, env!("CARGO_PKG_VERSION"), plugin).await;

@@ -3,7 +3,7 @@
 //! index polls `agents.json`; the terminal page runs the vendored
 //! xterm.js against `agents/{id}/ws`, which relays to the daemon's attach.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use axum::body::Bytes;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
@@ -13,6 +13,8 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use hecaton_api::{ResizeFrame, TextFrame};
+use hecaton_plugin_sdk::metrics::IntGauge;
+use sha2::{Digest, Sha256};
 
 use crate::plugin::Shared;
 use crate::state::AgentRow;
@@ -23,6 +25,16 @@ const XTERM_JS: &[u8] = include_bytes!("../assets/xterm.js");
 const XTERM_CSS: &[u8] = include_bytes!("../assets/xterm.css");
 const ADDON_FIT_JS: &[u8] = include_bytes!("../assets/addon-fit.js");
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+/// The first twelve hex digits of the sha256 over the three vendored
+/// files, in every asset path: a vendor bump is a new URL, so `IMMUTABLE`
+/// can never hand a browser that visited before a stale bundle.
+pub static ASSET_DIGEST: LazyLock<String> = LazyLock::new(|| {
+    let mut h = Sha256::new();
+    h.update(XTERM_JS);
+    h.update(XTERM_CSS);
+    h.update(ADDON_FIT_JS);
+    hex::encode(h.finalize())[..12].to_string()
+});
 /// How often the index re-fetches `agents.json`, in milliseconds.
 const INDEX_POLL_MS: u32 = 2000;
 
@@ -32,16 +44,20 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/agents.json", get(agents_json))
         .route("/agents/{fleet}/{crew}/{agent}", get(terminal))
         .route("/agents/{fleet}/{crew}/{agent}/ws", get(bridge_route))
-        .route("/assets/{file}", get(asset))
+        .route("/assets/{digest}/{file}", get(asset))
         .with_state(shared)
 }
 
 /// The mount the daemon put us under, without a trailing slash; empty
-/// when called directly (tests, curl).
+/// when called directly (tests, curl). The proxy overwrites the header
+/// and direct access needs the plugin's bearer, so a value that is not
+/// a path could only come from a caller who already holds the token —
+/// it is still not put into a page.
 fn prefix(headers: &HeaderMap) -> String {
     headers
         .get(PREFIX_HEADER)
         .and_then(|v| v.to_str().ok())
+        .filter(|s| s.starts_with('/'))
         .map(|s| s.trim_end_matches('/').to_string())
         .unwrap_or_default()
 }
@@ -132,11 +148,11 @@ pub fn terminal_html(prefix: &str, id: &str) -> String {
     format!(
         r#"<!doctype html>
 <html><head><meta charset="utf-8"><title>{id}</title>
-<link rel="stylesheet" href="{p}/assets/xterm.css">
+<link rel="stylesheet" href="{p}/assets/{d}/xterm.css">
 <style>html,body{{height:100%;margin:0;background:#000}}#t{{height:100%}}</style>
 </head><body><div id="t"></div>
-<script src="{p}/assets/xterm.js"></script>
-<script src="{p}/assets/addon-fit.js"></script>
+<script src="{p}/assets/{d}/xterm.js"></script>
+<script src="{p}/assets/{d}/addon-fit.js"></script>
 <script>
 const term = new Terminal({{ cursorBlink: true, fontSize: 14 }});
 const fit = new FitAddon.FitAddon();
@@ -163,6 +179,7 @@ term.focus();
 "#,
         p = html_escape(prefix),
         id = html_escape(id),
+        d = ASSET_DIGEST.as_str(),
     )
 }
 
@@ -198,7 +215,10 @@ async fn bridge_route(
     ws.on_upgrade(move |socket| bridge(socket, shared, id))
 }
 
-async fn asset(Path(file): Path<String>) -> Response {
+async fn asset(Path((digest, file)): Path<(String, String)>) -> Response {
+    if digest != *ASSET_DIGEST {
+        return (StatusCode::NOT_FOUND, "no such asset bundle").into_response();
+    }
     let (kind, bytes) = match file.as_str() {
         "xterm.js" => ("text/javascript; charset=utf-8", XTERM_JS),
         "xterm.css" => ("text/css; charset=utf-8", XTERM_CSS),
@@ -224,9 +244,39 @@ async fn close(socket: &mut WebSocket, code: u16, reason: &str) {
         .await;
 }
 
+/// Holds `terminals_open` up for as long as it lives, so a bridge future
+/// dropped mid-way (server shutdown, an aborted task) still lets the
+/// gauge fall.
+struct OpenTerminal(IntGauge);
+
+impl OpenTerminal {
+    fn new(gauge: &IntGauge) -> Self {
+        gauge.inc();
+        Self(gauge.clone())
+    }
+}
+
+impl Drop for OpenTerminal {
+    fn drop(&mut self) {
+        self.0.dec();
+    }
+}
+
+/// A close code that may be sent in a close frame: the daemon's own
+/// (1000, 1003, 1011) cross as they are; 1005, 1006 and 1015 are reserved
+/// for a socket that ended without one and become 1011.
+fn forwardable(code: u16) -> u16 {
+    match code {
+        1005 | 1006 | 1015 => 1011,
+        1000..=1013 | 3000..=4999 => code,
+        _ => 1011,
+    }
+}
+
 /// One browser tab ↔ one daemon attach: binary both ways, the browser's
 /// resize text frames forwarded as resizes, everything else ignored.
-/// Ends when either side closes.
+/// Ends when either side closes; the daemon's close code and reason
+/// reach the browser, so the page can say why.
 pub async fn bridge(mut browser: WebSocket, shared: Arc<Shared>, agent: String) {
     let attach = match shared.host.attach(&agent).await {
         Ok(a) => a,
@@ -236,7 +286,7 @@ pub async fn bridge(mut browser: WebSocket, shared: Arc<Shared>, agent: String) 
         }
     };
     let (mut rd, mut wr) = attach.split();
-    shared.terminals_open.inc();
+    let _open = OpenTerminal::new(&shared.terminals_open);
     shared.terminals_total.inc();
     loop {
         tokio::select! {
@@ -247,7 +297,12 @@ pub async fn bridge(mut browser: WebSocket, shared: Arc<Shared>, agent: String) 
                     }
                 }
                 None => {
-                    close(&mut browser, 1000, "the terminal closed").await;
+                    let (code, reason) = match rd.close_reason() {
+                        Some(why) if !why.reason.is_empty() => (forwardable(why.code), why.reason.clone()),
+                        Some(why) => (forwardable(why.code), "the terminal closed".to_string()),
+                        None => (1000, "the terminal closed".to_string()),
+                    };
+                    close(&mut browser, code, &reason).await;
                     break;
                 }
             },
@@ -270,7 +325,6 @@ pub async fn bridge(mut browser: WebSocket, shared: Arc<Shared>, agent: String) 
         }
     }
     wr.close().await;
-    shared.terminals_open.dec();
 }
 
 #[cfg(test)]
@@ -300,9 +354,54 @@ mod tests {
             "no prefix: relative to the root"
         );
         let page = terminal_html("/v1/plugins/web", "f/c/a");
-        assert!(page.contains(r#"src="/v1/plugins/web/assets/xterm.js""#));
+        let d = ASSET_DIGEST.as_str();
+        assert_eq!(d.len(), 12);
+        assert!(d.chars().all(|c| c.is_ascii_hexdigit()), "{d}");
+        assert!(page.contains(&format!(r#"src="/v1/plugins/web/assets/{d}/xterm.js""#)));
         assert!(page.contains(r#""/v1/plugins/web/agents/f/c/a/ws""#));
         let page = terminal_html("/p", "<x>");
         assert!(page.contains("&lt;x&gt;") && !page.contains("<x>"));
+    }
+
+    /// The proxy overwrites the header, and direct access needs the
+    /// plugin's bearer; the check is defence in depth at the boundary.
+    #[test]
+    fn a_forwarded_prefix_is_a_path_or_nothing() {
+        let with = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(PREFIX_HEADER, v.parse().unwrap());
+            prefix(&h)
+        };
+        assert_eq!(with("/v1/plugins/web"), "/v1/plugins/web");
+        assert_eq!(with("/v1/plugins/web/"), "/v1/plugins/web");
+        assert_eq!(with("http://evil.example"), "", "not a path");
+        assert_eq!(with("javascript:alert(1)"), "");
+        assert_eq!(with(""), "");
+        assert_eq!(prefix(&HeaderMap::new()), "");
+    }
+
+    #[test]
+    fn the_open_terminals_gauge_falls_with_the_guard() {
+        let gauge = hecaton_plugin_sdk::metrics::IntGauge::new("open", "open").unwrap();
+        let a = OpenTerminal::new(&gauge);
+        let b = OpenTerminal::new(&gauge);
+        assert_eq!(gauge.get(), 2);
+        drop(a);
+        assert_eq!(gauge.get(), 1);
+        drop(b);
+        assert_eq!(gauge.get(), 0);
+    }
+
+    #[test]
+    fn only_sendable_close_codes_are_forwarded() {
+        assert_eq!(forwardable(1000), 1000);
+        assert_eq!(forwardable(1003), 1003);
+        assert_eq!(forwardable(1011), 1011);
+        assert_eq!(forwardable(4000), 4000);
+        // reserved: never on the wire
+        assert_eq!(forwardable(1005), 1011);
+        assert_eq!(forwardable(1006), 1011);
+        assert_eq!(forwardable(1015), 1011);
+        assert_eq!(forwardable(2000), 1011);
     }
 }

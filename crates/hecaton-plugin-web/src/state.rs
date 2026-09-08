@@ -36,7 +36,8 @@ impl Cache {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// `activate`: listed when enabled, hidden otherwise.
+    /// `activate`: listed when enabled, hidden otherwise. The pair stays
+    /// active either way; only the listing changes.
     pub fn set_enabled(&self, agent: &str, enabled: bool) {
         let mut i = self.lock();
         if enabled {
@@ -46,7 +47,9 @@ impl Cache {
         }
     }
 
-    /// `deactivate`.
+    /// `deactivate`: forget the agent. Today that is the listing flag
+    /// alone, the same as `set_enabled(agent, false)`; any per-agent state
+    /// added later is purged here and kept there.
     pub fn remove(&self, agent: &str) {
         self.lock().enabled.remove(agent);
     }
@@ -68,6 +71,8 @@ impl Cache {
 
 /// The enabled agents in id order with their phase from the fleets;
 /// an enabled agent no fleet knows yet is `pending` with no message.
+/// Agent ids are fleet-prefixed (`<fleet>/<crew>/<agent>`), so at most
+/// one fleet knows an id; the first match is the only one.
 pub fn rows_of(enabled: &BTreeSet<String>, fleets: &[FleetRecord]) -> Vec<AgentRow> {
     enabled
         .iter()
