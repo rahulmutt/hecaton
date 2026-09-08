@@ -463,3 +463,10 @@ terminal in the review page, no per-plugin filesystem grants.
   `(dev, ino)`, then takes the size from that handle and reads from it —
   the agent owns the worktree and could otherwise swap the final component
   for a symlink between the check and the read.
+- **The review caps bound the rendered message, not only the fields**
+  (§4.4): `head` and `base_ref` are at most 256 bytes each, no rendered
+  field (`summary`, `path`, `text`, `body`, `head`, `base_ref`) may carry
+  a NUL, and the route refuses a rendered message over
+  `MAX_MESSAGE_BYTES` (256 KiB) with `message: longer than 262144 bytes`.
+  The per-field caps do not bound the message on their own: `path` (4096)
+  and `text` (4096) multiply by the 200 comments.

@@ -9,6 +9,14 @@ pub const MAX_COMMENTS: usize = 200;
 pub const MAX_BODY_BYTES: usize = 64 << 10;
 /// One quoted diff line, in bytes.
 pub const MAX_TEXT_BYTES: usize = 4096;
+/// `head` and `base_ref` each, in bytes. A ref name is short; the field
+/// is otherwise a free 4 KiB × 2 in the message header.
+pub const MAX_REF_BYTES: usize = 256;
+/// The whole rendered message, in bytes. The per-field caps do not bound
+/// it on their own — 200 comments each carry a 4096-byte `path` and a
+/// 4096-byte `text` beside the capped bodies — and the message travels
+/// through the daemon into a tmux paste buffer.
+pub const MAX_MESSAGE_BYTES: usize = 256 << 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -51,7 +59,20 @@ pub struct ReviewBody {
     pub comments: Vec<Comment>,
 }
 
-/// The 400 text, field path first, or `Ok` for a sendable review.
+/// A NUL would end the message at the tmux client's argv, and nothing
+/// downstream has any use for one. `path` is not checked here: `check_path`
+/// already refuses NUL, with its own reason.
+fn no_nul(field: &str, value: &str) -> Result<(), String> {
+    if value.contains('\0') {
+        return Err(format!("{field}: contains NUL"));
+    }
+    Ok(())
+}
+
+/// The 400 text, field path first, or `Ok` for a sendable review. Every
+/// field the message renders is bounded here; the rendered message itself
+/// is bounded by `MAX_MESSAGE_BYTES` at the route, since `path` and `text`
+/// multiply by the comment count.
 pub fn validate(body: &ReviewBody) -> Result<(), String> {
     if body.comments.is_empty() && body.summary.trim().is_empty() {
         return Err("nothing to send".into());
@@ -59,6 +80,15 @@ pub fn validate(body: &ReviewBody) -> Result<(), String> {
     if body.comments.len() > MAX_COMMENTS {
         return Err(format!("comments: more than {MAX_COMMENTS}"));
     }
+    if body.head.len() > MAX_REF_BYTES {
+        return Err(format!("head: longer than {MAX_REF_BYTES} bytes"));
+    }
+    if body.base_ref.len() > MAX_REF_BYTES {
+        return Err(format!("base_ref: longer than {MAX_REF_BYTES} bytes"));
+    }
+    no_nul("head", &body.head)?;
+    no_nul("base_ref", &body.base_ref)?;
+    no_nul("summary", &body.summary)?;
     let mut bytes = body.summary.len();
     for (i, c) in body.comments.iter().enumerate() {
         check_path(&c.path)
@@ -74,6 +104,8 @@ pub fn validate(body: &ReviewBody) -> Result<(), String> {
                 "comments[{i}].text: longer than {MAX_TEXT_BYTES} bytes"
             ));
         }
+        no_nul(&format!("comments[{i}].text"), &c.text)?;
+        no_nul(&format!("comments[{i}].body"), &c.body)?;
         bytes += c.body.len();
     }
     if bytes > MAX_BODY_BYTES {
@@ -220,5 +252,85 @@ mod tests {
         let minimal: ReviewBody = serde_json::from_value(json!({})).unwrap();
         assert!(minimal.comments.is_empty() && minimal.head.is_empty());
         assert_eq!(Side::Old.to_string(), "old");
+    }
+
+    /// `head` and `base_ref` are rendered into the header and were
+    /// unbounded; a NUL in any rendered field would end the text early
+    /// wherever it is handed on as a C string.
+    #[test]
+    fn refs_are_bounded_and_no_rendered_field_may_carry_a_nul() {
+        let mut b = body();
+        b.head = "f".repeat(MAX_REF_BYTES);
+        assert_eq!(validate(&b), Ok(()), "256 bytes of head is fine");
+        b.head = "f".repeat(MAX_REF_BYTES + 1);
+        assert_eq!(
+            validate(&b),
+            Err(format!("head: longer than {MAX_REF_BYTES} bytes"))
+        );
+        let mut b = body();
+        b.base_ref = "r".repeat(MAX_REF_BYTES + 1);
+        assert_eq!(
+            validate(&b),
+            Err(format!("base_ref: longer than {MAX_REF_BYTES} bytes"))
+        );
+
+        let mut b = body();
+        b.head = "3f9c\0a1d".into();
+        assert_eq!(validate(&b), Err("head: contains NUL".to_string()));
+        let mut b = body();
+        b.base_ref = "origin/\0main".into();
+        assert_eq!(validate(&b), Err("base_ref: contains NUL".to_string()));
+        let mut b = body();
+        b.summary = "looks\0good".into();
+        assert_eq!(validate(&b), Err("summary: contains NUL".to_string()));
+        let mut b = body();
+        b.comments[1].text = "+ let\0x = 1;".into();
+        assert_eq!(
+            validate(&b),
+            Err("comments[1].text: contains NUL".to_string())
+        );
+        let mut b = body();
+        b.comments[0].body = "fix\0this".into();
+        assert_eq!(
+            validate(&b),
+            Err("comments[0].body: contains NUL".to_string())
+        );
+        // `path` is the shared rule's job, and it refuses NUL already.
+        let mut b = body();
+        b.comments[0].path = "src/\0lib.rs".into();
+        assert_eq!(
+            validate(&b),
+            Err("comments[0].path: workspace: invalid path: contains NUL".to_string())
+        );
+    }
+
+    /// The per-field caps leave the rendered message unbounded: 200
+    /// comments, each with a 4096-byte `path` and a 4096-byte `text`,
+    /// pass `validate` and render over 1.6 MiB. The route checks the
+    /// rendered length against `MAX_MESSAGE_BYTES`.
+    #[test]
+    fn a_valid_review_can_still_render_a_message_past_the_message_cap() {
+        let big = ReviewBody {
+            head: "3f9c2a1".into(),
+            base_ref: "origin/main".into(),
+            summary: String::new(),
+            comments: std::iter::repeat_n(
+                Comment {
+                    path: "d/".repeat(2047) + "f",
+                    side: Side::New,
+                    line: 1,
+                    text: "+".repeat(MAX_TEXT_BYTES),
+                    body: "no".into(),
+                },
+                MAX_COMMENTS,
+            )
+            .collect(),
+        };
+        assert_eq!(validate(&big), Ok(()), "every field is within its cap");
+        let message = render_message("f/c/a", &big);
+        assert!(message.len() > MAX_MESSAGE_BYTES, "{} bytes", message.len());
+        assert_eq!(MAX_MESSAGE_BYTES, 262144);
+        // A review of the size the caps are written for stays well under.
+        assert!(render_message("f/c/a", &body()).len() < MAX_MESSAGE_BYTES);
     }
 }

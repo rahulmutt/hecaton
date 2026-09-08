@@ -541,6 +541,26 @@ async fn a_review_is_one_send_text_and_a_divider_in_the_column() {
         (status, String::from_utf8_lossy(&body).as_ref()),
         (400, "comments: more than 200")
     );
+    // Every field within its cap and the whole body under the 1 MiB
+    // proxy limit, but 200 × (4095-byte path + 300-byte text) renders
+    // past the message cap.
+    let wide: Vec<Value> = (0..200)
+        .map(|i| {
+            json!({ "path": "d/".repeat(2047) + "f", "side": "new", "line": i,
+                    "text": "+".repeat(300), "body": "b" })
+        })
+        .collect();
+    let (status, body) = h
+        .post_route(
+            "/agents/e2e/c/alice/review",
+            "/v1/plugins/web",
+            &json!({ "comments": wide }),
+        )
+        .await;
+    assert_eq!(
+        (status, String::from_utf8_lossy(&body).as_ref()),
+        (400, "message: longer than 262144 bytes")
+    );
     assert_eq!(
         fake.actions_for(ALICE).len(),
         1,

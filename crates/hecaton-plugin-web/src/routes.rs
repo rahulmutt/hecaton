@@ -19,7 +19,7 @@ use hecaton_plugin_sdk::metrics::IntGauge;
 use sha2::{Digest, Sha256};
 
 use crate::plugin::Shared;
-use crate::review::{ReviewBody, render_message, validate};
+use crate::review::{MAX_MESSAGE_BYTES, ReviewBody, render_message, validate};
 use crate::state::{AgentRow, now};
 
 pub const PREFIX_HEADER: &str = "x-hecaton-forwarded-prefix";
@@ -501,6 +501,15 @@ async fn post_review(
         return (StatusCode::BAD_REQUEST, reason).into_response();
     }
     let message = render_message(&id, &review);
+    // `validate` bounds every field, but `path` and `text` multiply by the
+    // comment count, so the rendered message needs its own cap.
+    if message.len() > MAX_MESSAGE_BYTES {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("message: longer than {MAX_MESSAGE_BYTES} bytes"),
+        )
+            .into_response();
+    }
     let n = review.comments.len();
     let action = PluginAction::SendText {
         text: message.clone(),
