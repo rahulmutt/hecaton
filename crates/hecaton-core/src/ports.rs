@@ -6,7 +6,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
-use hecaton_api::{CredentialBundle, GitSettings, Timestamp};
+use hecaton_api::{CredentialBundle, GitSettings, Timestamp, WorkspaceDiff, WorkspaceTree};
 
 use crate::agent::{CrewRef, ResolvedAgent};
 use crate::name::{AgentId, AgentName, CrewName, FleetName};
@@ -133,6 +133,49 @@ pub enum RunnerError {
     Parse { id: String, message: String },
 }
 
+/// Why a workspace read failed (Spec C §3.1). `Display` is what the
+/// daemon answers a plugin with, except `Io`, which names a daemon-side
+/// path and is logged instead.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WorkspaceError {
+    /// The agent's worktree directory does not exist.
+    #[error("no workspace for agent {0}")]
+    Missing(String),
+    /// The worktree exists and the path does not.
+    #[error("no such path")]
+    NoSuchPath,
+    #[error("workspace: invalid path: {0}")]
+    InvalidPath(String),
+    #[error("not a regular file")]
+    NotAFile,
+    #[error("not a directory")]
+    NotADirectory,
+    #[error("file larger than {} MiB", limit >> 20)]
+    TooLarge { limit: u64 },
+    #[error("{id}: git {subcommand}: {}", first_line(stderr))]
+    Tool {
+        id: String,
+        subcommand: String,
+        args: Vec<String>,
+        stderr: String,
+    },
+    #[error("{path}: {message}")]
+    Io { path: PathBuf, message: String },
+}
+
+/// Read-only access to an agent's worktree (Spec C §3.1). Sync like every
+/// port; the daemon calls it in `spawn_blocking`. Implementations apply
+/// `hecaton_api::check_path` before any I/O and never follow a symlink.
+pub trait WorkspaceReader: Send + Sync {
+    /// The worktree against the merge-base with `base_ref`
+    /// (`origin/<crew ref>`): committed, uncommitted and untracked alike.
+    fn diff(&self, agent: &AgentId, base_ref: &str) -> Result<WorkspaceDiff, WorkspaceError>;
+    /// One regular file, at most `WORKSPACE_FILE_LIMIT` bytes.
+    fn read_file(&self, agent: &AgentId, path: &str) -> Result<Vec<u8>, WorkspaceError>;
+    /// One directory, never recursive; the empty path is the root.
+    fn list_dir(&self, agent: &AgentId, path: &str) -> Result<WorkspaceTree, WorkspaceError>;
+}
+
 /// Makes files exist (or not) for crews and agents.
 pub trait Materializer: Send + Sync {
     fn ensure_crew(
@@ -247,5 +290,44 @@ mod tests {
             "f/c/a: git clone: fatal: repository not found"
         );
         assert_eq!(first_line(""), "");
+    }
+
+    mod path_rule {
+        use hecaton_api::check_path;
+        use proptest::prelude::*;
+        use std::path::{Component, Path};
+
+        fn segment() -> impl Strategy<Value = String> {
+            prop_oneof![
+                4 => "[a-z][a-z0-9._-]{0,6}".prop_map(String::from),
+                1 => Just("..".to_string()),
+                1 => Just(".".to_string()),
+                1 => Just(String::new()),
+                1 => Just(".git".to_string()),
+                1 => Just(".GIT".to_string()),
+            ]
+        }
+
+        proptest! {
+            /// An accepted path joins under the root without `.`/`..`
+            /// components, names no `.git` and has no empty segment; a
+            /// refused one carries a reason.
+            #[test]
+            fn accepted_paths_stay_under_the_root(segments in prop::collection::vec(segment(), 0..6)) {
+                let path = segments.join("/");
+                match check_path(&path) {
+                    Ok(()) => {
+                        let joined = Path::new("/root").join(&path);
+                        prop_assert!(joined
+                            .components()
+                            .all(|c| !matches!(c, Component::ParentDir | Component::CurDir)));
+                        prop_assert!(joined.starts_with("/root"));
+                        prop_assert!(!path.split('/').any(|s| s.eq_ignore_ascii_case(".git")));
+                        prop_assert!(path.is_empty() || !path.split('/').any(str::is_empty));
+                    }
+                    Err(reason) => prop_assert!(!reason.is_empty()),
+                }
+            }
+        }
     }
 }
