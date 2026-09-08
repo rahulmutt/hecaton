@@ -1551,8 +1551,9 @@ fn web_journey() {
         review.to_string().as_bytes(),
     );
     assert_eq!((status, body.as_str()), (200, "{}"));
+    // the paste is pumped line by line: wait for the last line, not a middle one
     let stdin = wait_file_until(&w.agent_dir("alice").join("home/fake-claude.stdin"), |s| {
-        s.contains("Please expand these notes.")
+        s.contains("Looks fine.")
     });
     assert!(
         stdin.contains("Review of e2e/c/alice against origin/main at "),

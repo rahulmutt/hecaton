@@ -240,3 +240,22 @@ Run: `for i in 1 2 3 4 5; do mise x -- cargo nextest run -p hecaton-runtime --li
 - [ ] **Step 2: Commit**
 
 Subject: `Wait for the child's exec in the /proc-scanning tests`. Body: the fork/exec window and the load it was seen under. Trailer as in Global Constraints. Also drop the Global Constraints line about retrying the hook from `AGENTS.md`? No — `AGENTS.md` never mentioned it; nothing to remove.
+
+---
+
+### Task 5: The e2e waits for the review's last line before reading stdin
+
+**Files:**
+- Modify: `crates/hecaton/tests/e2e.rs` (`web_journey`, the `wait_file_until` on `fake-claude.stdin`)
+
+Found while landing Task 4: `fake-claude` records the paste line by line, and the wait predicate fired on a middle line ("Please expand these notes."), so under load the file was read before "Overall:\nLooks fine." had been written and the last assertion failed.
+
+- [ ] **Step 1: The predicate**
+
+Change the `wait_file_until` closure to `|s| s.contains("Looks fine.")` (the message's last line; the review body's `summary` is `Looks fine.`). Keep the three substring assertions as they are. Add a one-line comment above: `// the paste is pumped line by line: wait for the last line, not a middle one`.
+
+Run: `mise run e2e` (or `mise x -- cargo nextest run -p hecaton --test e2e web_journey` after `mise run package-plugins`).
+
+- [ ] **Step 2: Commit**
+
+Subject: `Wait for the review's last line before reading fake-claude's stdin`. Body: the line-by-line pump and the load it was seen under. Trailer as in Global Constraints. Only `e2e.rs` and this plan file in the commit.
