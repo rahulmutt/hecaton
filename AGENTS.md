@@ -236,11 +236,12 @@ credentials, hook input, or sandbox rules.
   on `…Key=void 0`; `.gitleaks.toml` keeps the default ruleset and
   allowlists exactly the three vendored files by anchored path. Anything
   else under `assets/` is still scanned.
-- `send_text` with a newline goes through `load-buffer -b <name> -` +
-  `paste-buffer -p -d` (a bracketed paste), single lines through
-  `send-keys -l`. The text rides in on the tmux client's *stdin*, not in
-  the argv: the client refuses a command whose packed argv is over 16 KiB
-  ("command too long"), and a review may be 64 KiB. The e2e's
+- `send_text` with a newline, or longer than 4 KiB, goes through
+  `load-buffer -b <name> -` + `paste-buffer -p -d` (a bracketed paste);
+  shorter single lines go through `send-keys -l`. The text rides in on the
+  tmux client's *stdin*, not in the argv: the client refuses a command
+  whose packed argv is over 16 KiB ("command too long"), and a review may
+  be 64 KiB. The e2e's
   `fake-claude` records a paste line by line; the real `claude` is expected
   to arrive as one message — verify with `mise run verify-claude`
   (Spec C §8, pending).

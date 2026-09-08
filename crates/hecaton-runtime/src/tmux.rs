@@ -40,6 +40,10 @@ pub const ATTACH_SESSION_PREFIX: &str = "hecaton-attach-";
 const ATTACH_TERM: &str = "xterm-256color";
 static ATTACH_SEQ: AtomicU64 = AtomicU64::new(0);
 static SEND_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Above this many bytes a single line is pasted through a buffer like a
+/// multi-line text: tmux refuses a command whose argv exceeds ~16 KiB
+/// (`command too long`), and `send-keys -l` carries the text as argv.
+pub(crate) const SEND_KEYS_LIMIT: usize = 4096;
 
 /// `hecaton-attach-<8 hex>`, unique per process: the clock, a counter and
 /// the pid folded into 32 bits.
@@ -457,8 +461,9 @@ impl AgentRunner for TmuxRunner {
         Ok(out)
     }
 
-    /// One line goes through `send-keys -l`. Text with a newline goes
-    /// through a named buffer and `paste-buffer -p` (Spec C §3.3): `-p`
+    /// One short line goes through `send-keys -l`; text with a newline, or
+    /// longer than `SEND_KEYS_LIMIT`, goes through a named buffer and
+    /// `paste-buffer -p` (Spec C §3.3): `-p`
     /// wraps it in bracketed-paste markers when the application asked for
     /// them, on which a multi-line paste is expected to arrive as one
     /// message (verify with `mise run verify-claude`; Spec C §8, pending);
@@ -472,7 +477,7 @@ impl AgentRunner for TmuxRunner {
     fn send_text(&self, agent: &AgentId, text: &str, submit: bool) -> Result<(), RunnerError> {
         let id = agent.to_string();
         let target = Self::window_target(agent);
-        if text.contains('\n') {
+        if text.contains('\n') || text.len() > SEND_KEYS_LIMIT {
             let buffer = format!(
                 "hecaton-send-{}-{}",
                 std::process::id(),

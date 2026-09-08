@@ -473,3 +473,5 @@ terminal in the review page, no per-plugin filesystem grants.
 - **A diff fails closed on a declared filter** (§5 called it the planned
   follow-up): `WorkspaceError::Filter`, 500 `repository config sets <key>;
   workspace diff refused`.
+- **A single line over 4 KiB is pasted through the buffer too**:
+  `send-keys -l` carries the text as argv, which tmux caps at ~16 KiB.

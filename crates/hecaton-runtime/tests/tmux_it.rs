@@ -527,3 +527,73 @@ fn send_text_of_seventy_kilobytes_arrives_whole() {
     );
     r.stop_crew(&crew).unwrap();
 }
+
+/// A single line past `send-keys`' argv ceiling (~16 KiB) is pasted like a
+/// multi-line text; a short single line still goes through `send-keys -l`.
+#[test]
+fn a_long_single_line_send_text_arrives_whole() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("tmux", false));
+        return;
+    };
+    let root = support::temp_root("tmux-longline");
+    let socket = format!("hecaton-test-longline-{}", std::process::id());
+    let _server = KillServer {
+        tmux: tools.tmux.clone(),
+        socket: socket.clone(),
+    };
+    let r = TmuxRunner::new(tools.tmux.clone(), socket.clone());
+    let id: AgentId = "f/c/a".parse().unwrap();
+    let crew = id.crew_ref();
+    let agent_dir = root.join("a");
+    std::fs::create_dir_all(agent_dir.join("logs")).unwrap();
+    let stdin_log = agent_dir.join("stdin.log");
+    let script = agent_dir.join("launch.sh");
+    // `-icanon` matters here and nowhere else in this file: Linux's tty
+    // line discipline buffers canonical input until a newline and silently
+    // truncates a line past ~4 KiB with none, which a real full-screen
+    // agent avoids by putting its pty in raw mode; `cat` never does, so
+    // the stand-in script must do it instead, or this single unterminated
+    // line — the case this test exists to cover — would never arrive.
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nstty -icanon -echo\nexec cat >> {}\n",
+            stdin_log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let plan = LaunchPlan {
+        cwd: agent_dir.clone(),
+        env: BTreeMap::new(),
+        argv: vec![],
+        script: script.clone(),
+    };
+    r.ensure_crew(&crew).unwrap();
+    r.ensure_agent(&id, &plan).unwrap();
+    wait_for(|| {
+        matches!(
+            r.observe(&id.fleet).unwrap().get(&id),
+            Some(ProcessState::Running { .. })
+        )
+    });
+    std::thread::sleep(Duration::from_millis(300));
+
+    let long: String = (0..20_000)
+        .map(|i| char::from(b'a' + (i % 26) as u8))
+        .collect();
+    assert!(long.len() > 16 << 10 && !long.contains('\n'));
+    r.send_text(&id, "short", true).unwrap();
+    r.send_text(&id, &long, true).unwrap();
+    wait_for(|| std::fs::read_to_string(&stdin_log).is_ok_and(|s| s.len() >= long.len() + 7));
+    let got = std::fs::read_to_string(&stdin_log).unwrap();
+    assert_eq!(got, format!("short\n{long}\n"), "len {}", got.len());
+    // no buffer left behind
+    let buffers = std::process::Command::new(&tools.tmux)
+        .args(["-L", &socket, "list-buffers"])
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&buffers.stdout).contains("hecaton-send-"));
+    r.stop_crew(&crew).unwrap();
+}
