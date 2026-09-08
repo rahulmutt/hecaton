@@ -343,16 +343,27 @@ mod tests {
                 "{token:?}"
             );
         }
+        // every route, not a sample: the middleware is one, but a route
+        // registered outside it would pass unnoticed
         let c = reqwest::Client::builder().no_proxy().build().unwrap();
-        assert_eq!(
-            c.get(format!("{base}/v1/health"))
-                .send()
-                .await
-                .unwrap()
-                .status()
-                .as_u16(),
-            401
-        );
+        for (method, path) in [
+            ("POST", "/v1/activate"),
+            ("POST", "/v1/deactivate"),
+            ("POST", "/v1/events"),
+            ("POST", "/v1/intercept"),
+            ("GET", "/v1/health"),
+            ("GET", "/v1/metrics"),
+        ] {
+            let req = match method {
+                "POST" => c.post(format!("{base}{path}")).json(&json!({})),
+                _ => c.get(format!("{base}{path}")),
+            };
+            assert_eq!(
+                req.send().await.unwrap().status().as_u16(),
+                401,
+                "{method} {path} without a bearer"
+            );
+        }
         assert_eq!(
             c.get(format!("{base}/v1/metrics"))
                 .bearer_auth("tok")

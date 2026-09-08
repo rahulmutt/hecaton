@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
@@ -21,7 +22,7 @@ use hecaton_api::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 
 use crate::{Env, Host, Plugin, SdkError, bind, run};
 
@@ -33,6 +34,12 @@ struct Inner {
     fleets_changed: watch::Sender<u64>,
     /// Bumped by `drop_watchers`; every open watch closes.
     watch_epoch: watch::Sender<u64>,
+    /// `inject_watch_text`: a raw text frame to every open watch.
+    watch_inject: broadcast::Sender<String>,
+    /// Watch sockets ever opened.
+    watch_connections: AtomicUsize,
+    /// `close_attaches`: a close frame to every open attach.
+    attach_close: broadcast::Sender<(u16, String)>,
     hellos: Mutex<Vec<HelloRequest>>,
     actions: Mutex<Vec<(String, PluginAction)>>,
     resizes: Mutex<Vec<(String, Value)>>,
@@ -54,6 +61,9 @@ impl FakeHost {
             fleets: Mutex::new(fleets),
             fleets_changed: watch::channel(0).0,
             watch_epoch: watch::channel(0).0,
+            watch_inject: broadcast::channel(8).0,
+            watch_connections: AtomicUsize::new(0),
+            attach_close: broadcast::channel(8).0,
             hellos: Mutex::new(Vec::new()),
             actions: Mutex::new(Vec::new()),
             resizes: Mutex::new(Vec::new()),
@@ -102,6 +112,24 @@ impl FakeHost {
     /// Closes every open watch socket, as a daemon restart would.
     pub fn drop_watchers(&self) {
         self.inner.watch_epoch.send_modify(|n| *n += 1);
+    }
+
+    /// Sends `text` as-is on every open watch socket: a daemon speaking a
+    /// dialect the SDK cannot parse.
+    pub fn inject_watch_text(&self, text: &str) {
+        let _ = self.inner.watch_inject.send(text.to_string());
+    }
+
+    /// How many watch sockets have been opened so far.
+    pub fn watch_connections(&self) -> usize {
+        self.inner.watch_connections.load(Ordering::SeqCst)
+    }
+
+    /// Closes every open attach from the daemon's side with `code` and
+    /// `reason`, as the daemon does when the window ends (1000) or the
+    /// runner fails (1011).
+    pub fn close_attaches(&self, code: u16, reason: &str) {
+        let _ = self.inner.attach_close.send((code, reason.to_string()));
     }
 
     /// Every resize text frame an attach received: (agent, the frame).
@@ -273,23 +301,41 @@ async fn watch_fleets(
         return resp;
     }
     ws.on_upgrade(move |mut socket: WebSocket| async move {
+        inner.watch_connections.fetch_add(1, Ordering::SeqCst);
         let mut changes = inner.fleets_changed.subscribe();
         let mut epoch = inner.watch_epoch.subscribe();
-        loop {
+        let mut inject = inner.watch_inject.subscribe();
+        // One ping before the first frame: the real daemon pings every
+        // 30 s, and a consumer must skip pings without dropping the socket.
+        if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
+            return;
+        }
+        let list = |inner: &Inner| {
             let list = inner
                 .fleets
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
-            let text = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
-            if socket.send(Message::Text(text.into())).await.is_err() {
-                return;
-            }
+            serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())
+        };
+        if socket.send(Message::Text(list(&inner).into())).await.is_err() {
+            return;
+        }
+        loop {
             tokio::select! {
-                changed = changes.changed() => if changed.is_err() { return; },
+                changed = changes.changed() => {
+                    if changed.is_err() || socket.send(Message::Text(list(&inner).into())).await.is_err() {
+                        return;
+                    }
+                }
                 _ = epoch.changed() => {
                     let _ = socket.send(Message::Close(None)).await;
                     return;
+                }
+                text = inject.recv() => {
+                    if let Ok(text) = text && socket.send(Message::Text(text.into())).await.is_err() {
+                        return;
+                    }
                 }
                 msg = socket.recv() => match msg {
                     None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
@@ -319,7 +365,22 @@ async fn attach(
         .unwrap_or_else(|e| e.into_inner())
         .push(agent.clone());
     ws.on_upgrade(move |mut socket: WebSocket| async move {
-        while let Some(Ok(msg)) = socket.recv().await {
+        let mut closes = inner.attach_close.subscribe();
+        loop {
+            let msg = tokio::select! {
+                msg = socket.recv() => match msg {
+                    Some(Ok(msg)) => msg,
+                    _ => return,
+                },
+                close = closes.recv() => {
+                    if let Ok((code, reason)) = close {
+                        let _ = socket
+                            .send(Message::Close(Some(CloseFrame { code, reason: reason.into() })))
+                            .await;
+                    }
+                    return;
+                }
+            };
             match msg {
                 Message::Binary(bytes) => {
                     if socket.send(Message::Binary(bytes)).await.is_err() {
