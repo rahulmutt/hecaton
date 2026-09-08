@@ -1001,9 +1001,16 @@ never enters the browser.
 
 A cookie-authenticated proxy request must also be same-origin: when
 `Sec-Fetch-Site` is present it must be `same-origin` or `none`; otherwise
-`Origin` must be absent or equal the daemon's own origin — exactly the
+`Origin` must be absent, or equal the daemon's own origin — exactly the
 `http://127.0.0.1:<port>` of the printed login URL (`localhost` is a
-different origin to a browser). Anything else is 403. The cookie is accepted on the proxy alone, never on another route.
+different origin to a browser) — or have as its authority the request's
+own `Host` (a browser cannot forge `Origin` and fills `Host` from the URL
+the page connected to, so the two agree only for a page that host served;
+the scheme is ignored because a TLS-terminating reverse proxy rewrites
+it). The last form is what a WebSocket handshake through a reverse proxy
+carries: `Sec-Fetch-Site` absent, `Origin` the proxy's hostname. Anything
+else is 403. The cookie is accepted on the proxy alone, never on another
+route.
 
 **CLI.** `hecaton plugin open <name>` calls `POST /v1/sessions` with `to`
 set to `/v1/plugins/<name>/` and prints the login URL. It does not launch

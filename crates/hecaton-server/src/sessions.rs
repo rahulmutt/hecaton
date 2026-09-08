@@ -180,18 +180,35 @@ pub fn set_cookie(id: &str) -> String {
 }
 
 /// Whether a cookie-authenticated request came from the daemon's own
-/// origin (§18.2): `Sec-Fetch-Site` when the browser sends it (every
-/// current one does), else `Origin` — absent on a plain navigation, and
-/// exactly `http://127.0.0.1:<port>` on a fetch or WebSocket from a page
-/// the daemon served (`localhost` is another origin to a browser).
+/// origin (§18.2): `Sec-Fetch-Site` when the browser sends it, else
+/// `Origin` — absent on a plain navigation; on a fetch or WebSocket from a
+/// page the daemon served, exactly `http://127.0.0.1:<port>` (`localhost`
+/// is another origin to a browser) or, through a reverse proxy, an origin
+/// whose authority is the request's own `Host`. A WebSocket handshake
+/// arrives without `Sec-Fetch-Site` through at least one proxy in the wild.
 pub fn same_origin(headers: &HeaderMap, origin: &str) -> bool {
     if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
         return matches!(site.trim(), "same-origin" | "none");
     }
-    match headers.get("origin").and_then(|v| v.to_str().ok()) {
-        None => true,
-        Some(o) => o.trim().trim_end_matches('/') == origin,
+    let Some(o) = headers.get("origin").and_then(|v| v.to_str().ok()) else {
+        return true;
+    };
+    let o = o.trim().trim_end_matches('/');
+    if o == origin {
+        return true;
     }
+    // Behind a TLS-terminating reverse proxy the browser never sees the
+    // daemon's loopback origin: its `Origin` is the proxy's hostname and
+    // its scheme https. A browser fills `Host` from the URL the page itself
+    // connected to and cannot forge `Origin`, so the two agree only for a
+    // page that host served — the classic cross-site WebSocket hijacking
+    // check. The scheme is ignored on purpose: the proxy rewrites it.
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim);
+    let authority = o.split_once("://").map(|(_, a)| a);
+    matches!((host, authority), (Some(h), Some(a)) if !a.is_empty() && a == h)
 }
 
 /// Where a login may send the browser: a path under the mount made of
@@ -360,6 +377,96 @@ mod tests {
                 origin
             ),
             "sec-fetch-site wins when present"
+        );
+    }
+
+    /// Behind a TLS-terminating reverse proxy the browser's `Origin` is the
+    /// proxy's hostname, never the daemon's loopback origin; a handshake
+    /// without `Sec-Fetch-Site` (a WebSocket) is then judged by whether
+    /// `Origin`'s authority is the request's own `Host`.
+    #[test]
+    fn same_origin_accepts_an_origin_whose_authority_is_the_request_host() {
+        let origin = "http://127.0.0.1:7643";
+        let with = |pairs: &[(&'static str, &'static str)]| {
+            let mut h = HeaderMap::new();
+            for (k, v) in pairs {
+                h.insert(*k, HeaderValue::from_str(v).unwrap());
+            }
+            h
+        };
+        let host = "hecaton-7643.example.test";
+        assert!(same_origin(
+            &with(&[
+                ("host", host),
+                ("origin", "https://hecaton-7643.example.test")
+            ]),
+            origin
+        ));
+        assert!(
+            same_origin(
+                &with(&[
+                    ("host", host),
+                    ("origin", "https://hecaton-7643.example.test/")
+                ]),
+                origin
+            ),
+            "a trailing slash is tolerated as before"
+        );
+        assert!(same_origin(
+            &with(&[
+                ("host", "127.0.0.1:7643"),
+                ("origin", "http://127.0.0.1:7643")
+            ]),
+            origin
+        ));
+        assert!(
+            !same_origin(
+                &with(&[("host", host), ("origin", "https://evil.example")]),
+                origin
+            ),
+            "another host"
+        );
+        assert!(
+            !same_origin(
+                &with(&[
+                    ("host", host),
+                    ("origin", "https://hecaton-7643.example.test:8443")
+                ]),
+                origin
+            ),
+            "another port is another origin"
+        );
+        assert!(
+            !same_origin(
+                &with(&[
+                    ("host", host),
+                    ("origin", "https://hecaton-7643.example.test.evil.example")
+                ]),
+                origin
+            ),
+            "a prefix is not a match"
+        );
+        assert!(
+            !same_origin(&with(&[("host", host), ("origin", "null")]), origin),
+            "an opaque origin"
+        );
+        assert!(
+            !same_origin(
+                &with(&[("origin", "https://hecaton-7643.example.test")]),
+                origin
+            ),
+            "no Host to agree with"
+        );
+        assert!(
+            !same_origin(
+                &with(&[
+                    ("sec-fetch-site", "cross-site"),
+                    ("host", host),
+                    ("origin", "https://hecaton-7643.example.test")
+                ]),
+                origin
+            ),
+            "sec-fetch-site still wins"
         );
     }
 

@@ -194,10 +194,13 @@ credentials, hook input, or sandbox rules.
 - The root of a plugin mount forwards to `/v1/routes` (no slash); axum's
   `nest` answers the nested `/` there and 404s `/v1/routes/`. A plugin's
   `routes()` router registers `/`, not `/index`.
-- Cookie-authenticated proxy requests need `Sec-Fetch-Site: same-origin`
+- Cookie-authenticated proxy requests need `Sec-Fetch-Site: same-origin`,
   or an `Origin` equal to the exact `http://127.0.0.1:<port>` of the login
-  URL; `localhost` is another origin. A test client that sends neither
-  passes (a navigation sends neither).
+  URL (`localhost` is another origin) or whose authority is the request's
+  `Host` (a WebSocket handshake through a reverse proxy: no
+  `Sec-Fetch-Site`, `Origin` the proxy's hostname — found by
+  `verify-claude` behind one, as `[disconnected]` on the terminal page). A
+  test client that sends none of them passes (a navigation sends none).
 - `/v1/plugins/<name>` without the trailing slash is the admin purge
   route, so a browser there got 401 `missing or invalid admin token`
   even with a good cookie; a GET there is now a 308 to the mount, and a

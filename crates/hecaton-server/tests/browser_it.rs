@@ -392,6 +392,43 @@ async fn the_mount_proxies_plain_requests_and_websockets_and_filters_headers() {
         None,
     );
     assert_eq!(s, 401);
+
+    // Through a TLS-terminating reverse proxy, a browser's WebSocket
+    // handshake carries the proxy's hostname as both Host and Origin and
+    // no Sec-Fetch-Site; that is the page's own host, so it passes. A
+    // foreign Origin against the same Host is a hijack attempt.
+    let ws_url = format!(
+        "{}/v1/plugins/web/echo",
+        w.api.base.replacen("http://", "ws://", 1)
+    );
+    let proxied = |origin: &str| {
+        let mut req = ws_url.clone().into_client_request().unwrap();
+        let h = req.headers_mut();
+        h.insert("host", "hecaton-7643.example.test".parse().unwrap());
+        h.insert("origin", origin.parse().unwrap());
+        h.insert("cookie", cookie.parse().unwrap());
+        req
+    };
+    let (mut ws, _) = connect_async(proxied("https://hecaton-7643.example.test"))
+        .await
+        .expect("a proxied handshake whose Origin is its Host");
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+        b"ping".to_vec().into(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        ws.next().await.unwrap().unwrap().into_data().as_ref(),
+        b"ping"
+    );
+    ws.close(None).await.unwrap();
+    let e = connect_async(proxied("https://evil.example"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, tokio_tungstenite::tungstenite::Error::Http(ref r) if r.status() == 403),
+        "{e}"
+    );
     let (s, _, _) = w.api.raw("GET", "/v1/fleets", &[("Cookie", &cookie)], None);
     assert_eq!(s, 401, "the cookie opens the mount and nothing else");
 
