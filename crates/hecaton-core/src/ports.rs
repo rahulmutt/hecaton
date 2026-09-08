@@ -159,6 +159,9 @@ pub enum WorkspaceError {
         args: Vec<String>,
         stderr: String,
     },
+    /// The repository's config names a clean/smudge/process filter; a diff would run it as the daemon.
+    #[error("repository config sets {key}; workspace diff refused")]
+    Filter { key: String },
     #[error("{path}: {message}")]
     Io { path: PathBuf, message: String },
 }

@@ -32,6 +32,11 @@ const CONFIG: &[&str] = &[
 /// On every `diff`: no external diff driver, no textconv, no colour.
 const DIFF_FLAGS: &[&str] = &["--no-ext-diff", "--no-textconv", "--no-color"];
 
+/// Config keys whose value is a program git runs on `diff` (a clean
+/// filter through `.gitattributes`) or on checkout; `--no-ext-diff` and
+/// `--no-textconv` do not cover them, so a diff is refused instead.
+const FILTER_KEYS: &str = r"^filter\..*\.(clean|smudge|process)$";
+
 impl Runtime {
     /// The agent's worktree and crew paths; `Missing` when the worktree
     /// directory does not exist (not materialized, or purged).
@@ -196,6 +201,27 @@ impl WorkspaceReader for Runtime {
         let id = agent.to_string();
         let (ws, crew) = self.workspace_of(agent)?;
         let git = |args: &[&str], ok: &[i32]| self.inspect_git(&id, &crew, &ws, args, ok);
+        let filters = git(
+            &[
+                "config",
+                "--local",
+                "--includes",
+                "--name-only",
+                "--get-regexp",
+                FILTER_KEYS,
+            ],
+            &[0, 1],
+        )?;
+        if let Some(key) = filters
+            .lines()
+            .next()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+        {
+            return Err(WorkspaceError::Filter {
+                key: key.to_string(),
+            });
+        }
         let head = git(&["rev-parse", "HEAD"], &[0])?.trim().to_string();
         let merge_base = git(&["merge-base", base_ref, "HEAD"], &[0])?
             .trim()

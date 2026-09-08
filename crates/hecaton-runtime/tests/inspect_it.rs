@@ -253,6 +253,22 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
             .contains("+more")
     );
 
+    // a clean/smudge/process filter in repo config would run as the daemon
+    git(
+        w,
+        &["config", "filter.pwn.clean", &hook.display().to_string()],
+    );
+    let e = rt.diff(&id, "origin/main").unwrap_err();
+    assert_eq!(
+        e,
+        WorkspaceError::Filter {
+            key: "filter.pwn.clean".into()
+        }
+    );
+    assert!(!marker.exists(), "the filter ran");
+    git(w, &["config", "--unset", "filter.pwn.clean"]);
+    assert!(rt.diff(&id, "origin/main").is_ok(), "unset: diffs again");
+
     // a missing base is a git error naming the subcommand
     let e = rt.diff(&id, "origin/nope").unwrap_err();
     assert!(

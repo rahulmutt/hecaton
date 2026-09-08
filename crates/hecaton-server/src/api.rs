@@ -122,7 +122,7 @@ impl From<hecaton_core::WorkspaceError> for ApiError {
             W::Missing(_) | W::NoSuchPath => StatusCode::NOT_FOUND,
             W::InvalidPath(_) | W::NotAFile | W::NotADirectory => StatusCode::BAD_REQUEST,
             W::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
-            W::Tool { .. } | W::Io { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            W::Tool { .. } | W::Filter { .. } | W::Io { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self::new(status, e.to_string())
     }

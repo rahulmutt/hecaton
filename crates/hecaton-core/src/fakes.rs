@@ -834,5 +834,12 @@ mod tests {
             WorkspaceError::InvalidPath("absolute".into()).to_string(),
             "workspace: invalid path: absolute"
         );
+        assert_eq!(
+            WorkspaceError::Filter {
+                key: "filter.lfs.clean".into()
+            }
+            .to_string(),
+            "repository config sets filter.lfs.clean; workspace diff refused"
+        );
     }
 }

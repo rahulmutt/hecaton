@@ -248,6 +248,10 @@ credentials, hook input, or sandbox rules.
   `GIT_OPTIONAL_LOCKS=0` and `-c core.fsmonitor=false -c core.hooksPath=<empty>`
   and pass `--no-ext-diff --no-textconv` to every `diff`: the crew's
   `.git/config` is agent-writable. Keep those when adding a git call there.
+- A workspace `diff` refuses with `repository config sets filter.<x>.<clean|smudge|process>; workspace diff refused`
+  when the crew's `.git/config` declares a filter — the fix is to unset it
+  (an agent can write that file). `read_file`/`list_dir` run no git and are
+  unaffected.
 - A workspace route's two 404s differ on purpose: `no workspace for agent`
   (no worktree yet) and `no such path`; the SDK maps only the second to
   `None`.
