@@ -1,5 +1,6 @@
-//! The daemon's end of `GET /v1/plugin-host/agents/{id}/attach` (plugins
-//! spec §18.4): one WebSocket bridged to the runner's `PtyStream`. Binary
+//! The daemon's end of `GET
+//! /v1/plugin-host/agents/{fleet}/{crew}/{agent}/attach` (plugins spec
+//! §18.4): one WebSocket bridged to the runner's `PtyStream`. Binary
 //! frames are terminal bytes both ways; the one text frame is a resize.
 //! Dropping the stream at the end is what ends the terminal session.
 
@@ -7,7 +8,7 @@ use std::io::{Read, Write};
 
 use axum::body::Bytes;
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
-use hecaton_api::ResizeFrame;
+use hecaton_api::{ResizeFrame, TextFrame};
 use hecaton_core::PtyStream;
 use tokio::sync::mpsc;
 
@@ -45,8 +46,11 @@ impl Drop for StreamGuard {
             Ok(_) => {
                 tokio::task::spawn_blocking(move || drop(stream));
             }
-            // No runtime to protect (a plain thread, or one shutting down):
-            // dropping here is the only option left.
+            // No runtime at all (a plain thread): dropping here is the
+            // only option left. A runtime that is shutting down still
+            // answers `Ok` and accepts the blocking task; the stream is
+            // then dropped as the blocking queue drains, the same
+            // exposure as the `spawn_blocking(drop)` calls in `bridge`.
             Err(_) => drop(stream),
         }
     }
@@ -97,18 +101,20 @@ pub async fn bridge(mut socket: WebSocket, mut guard: StreamGuard) {
                     {
                         Ok((w, Ok(()))) => writer = w,
                         Ok((_, Err(_))) | Err(_) => {
-                            close(&mut socket, CLOSE_ERROR, "the window closed").await;
+                            close(&mut socket, CLOSE_ERROR, "the terminal's writer failed").await;
                             break;
                         }
                     }
                 }
                 Some(Ok(Message::Text(text))) => match ResizeFrame::parse(text.as_str()) {
-                    Some(frame) => {
+                    TextFrame::Resize(frame) => {
                         if let Err(e) = stream.resize(frame.resize.cols, frame.resize.rows) {
                             tracing::debug!("attach resize failed: {e}");
                         }
                     }
-                    None => {
+                    // a hidden container's fit, not a fault
+                    TextFrame::ZeroSized => {}
+                    TextFrame::Malformed => {
                         close(&mut socket, CLOSE_UNSUPPORTED, "expected a resize frame").await;
                         break;
                     }
@@ -146,11 +152,21 @@ fn pump_reader(mut reader: Box<dyn Read + Send>, tx: &mpsc::Sender<Vec<u8>>) {
     }
 }
 
+/// A close frame's reason fits in the control frame: 123 bytes at most,
+/// cut at a character boundary (a runner error can be long).
+fn close_reason(reason: &str) -> String {
+    let mut end = reason.len().min(123);
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    reason[..end].to_string()
+}
+
 async fn close(socket: &mut WebSocket, code: u16, reason: &str) {
     let _ = socket
         .send(Message::Close(Some(CloseFrame {
             code,
-            reason: reason.to_string().into(),
+            reason: close_reason(reason).into(),
         })))
         .await;
 }
@@ -210,6 +226,15 @@ mod tests {
         drop(stream);
         rx.recv_timeout(Duration::from_secs(5))
             .expect("the caller's own drop");
+    }
+
+    #[test]
+    fn a_close_reason_fits_the_control_frame() {
+        assert_eq!(close_reason("the window closed"), "the window closed");
+        let long = format!("attach: {}", "x".repeat(300));
+        assert_eq!(close_reason(&long).len(), 123);
+        let multibyte = "ü".repeat(70); // 140 bytes
+        assert_eq!(close_reason(&multibyte).len(), 122, "a character boundary");
     }
 
     #[test]

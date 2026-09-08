@@ -177,21 +177,43 @@ impl Read for FakePtyReader {
     }
 }
 
-struct FakePtyWriter(Arc<PtyShared>);
+struct FakePtyWriter {
+    shared: Arc<PtyShared>,
+    /// Every write fails: the runner's side broke under the session.
+    broken: bool,
+}
 
 impl Write for FakePtyWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let mut b = lock(&self.0.buf);
+        if self.broken {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "pty write failed",
+            ));
+        }
+        let mut b = lock(&self.shared.buf);
         if b.closed {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "pty closed"));
         }
         b.data.extend(bytes);
-        self.0.cv.notify_all();
+        self.shared.cv.notify_all();
         Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+/// Where the runner's side of an attached stream fails, for the 1011
+/// paths (plugins spec §18.4): `FakeRunner::fault_next_attach`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PtyFault {
+    /// `reader()` fails.
+    Reader,
+    /// `writer()` fails.
+    Writer,
+    /// The writer is handed out but every write fails.
+    Write,
 }
 
 /// The fake's terminal: an echo. Bytes written come back on the reader,
@@ -201,14 +223,31 @@ pub struct FakePty {
     shared: Arc<PtyShared>,
     agent: String,
     resizes: Arc<Mutex<Vec<(String, u16, u16)>>>,
+    /// The runner's open attaches, so a drop takes its own entry out.
+    attached: Arc<Mutex<BTreeMap<String, Arc<PtyShared>>>>,
+    /// The port says the writer is taken once, as `TmuxAttach` enforces.
+    writer_taken: AtomicBool,
+    fault: Option<PtyFault>,
 }
 
 impl PtyStream for FakePty {
     fn reader(&self) -> io::Result<Box<dyn Read + Send>> {
+        if self.fault == Some(PtyFault::Reader) {
+            return Err(io::Error::other("no reader: the pty is gone"));
+        }
         Ok(Box::new(FakePtyReader(self.shared.clone())))
     }
     fn writer(&self) -> io::Result<Box<dyn Write + Send>> {
-        Ok(Box::new(FakePtyWriter(self.shared.clone())))
+        if self.writer_taken.swap(true, Ordering::SeqCst) {
+            return Err(io::Error::other("the writer was already taken"));
+        }
+        if self.fault == Some(PtyFault::Writer) {
+            return Err(io::Error::other("no writer: the pty is gone"));
+        }
+        Ok(Box::new(FakePtyWriter {
+            shared: self.shared.clone(),
+            broken: self.fault == Some(PtyFault::Write),
+        }))
     }
     fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
         lock(&self.resizes).push((self.agent.clone(), cols, rows));
@@ -219,6 +258,15 @@ impl PtyStream for FakePty {
 impl Drop for FakePty {
     fn drop(&mut self) {
         self.shared.close();
+        // Only this stream's own entry: a newer attach for the same agent
+        // has replaced it and stays open.
+        let mut attached = lock(&self.attached);
+        if attached
+            .get(&self.agent)
+            .is_some_and(|open| Arc::ptr_eq(open, &self.shared))
+        {
+            attached.remove(&self.agent);
+        }
     }
 }
 
@@ -231,8 +279,10 @@ pub struct FakeRunner {
     /// `observe()` is logged, counted, leaves status unchanged, and the
     /// next tick retries at the resync cadence).
     fail_observe: AtomicBool,
-    attached: Mutex<BTreeMap<String, Arc<PtyShared>>>,
+    attached: Arc<Mutex<BTreeMap<String, Arc<PtyShared>>>>,
     resizes: Arc<Mutex<Vec<(String, u16, u16)>>>,
+    /// Consumed, oldest first, by the next `attach` calls.
+    faults: Mutex<VecDeque<PtyFault>>,
 }
 
 impl FakeRunner {
@@ -255,7 +305,12 @@ impl FakeRunner {
     pub fn set_fail_observe(&self, fail: bool) {
         self.fail_observe.store(fail, Ordering::SeqCst);
     }
-    /// Ends the reader of the latest attach for `agent`; `false` if none.
+    /// The next `attach` succeeds but its stream fails as `fault` says.
+    pub fn fault_next_attach(&self, fault: PtyFault) {
+        lock(&self.faults).push_back(fault);
+    }
+    /// Ends the reader of the latest attach for `agent`; `false` if none
+    /// is open (a dropped stream took its own entry out).
     pub fn close_attach(&self, agent: &AgentId) -> bool {
         match lock(&self.attached).remove(&agent.to_string()) {
             Some(shared) => {
@@ -330,10 +385,14 @@ impl AgentRunner for FakeRunner {
         self.check("attach", &id)?;
         let shared = Arc::new(PtyShared::default());
         lock(&self.attached).insert(id.clone(), shared.clone());
+        let fault = lock(&self.faults).pop_front();
         Ok(Box::new(FakePty {
             shared,
             agent: id,
             resizes: self.resizes.clone(),
+            attached: self.attached.clone(),
+            writer_taken: AtomicBool::new(false),
+            fault,
         }))
     }
 }
@@ -367,6 +426,36 @@ mod tests {
 
     fn id(s: &str) -> AgentId {
         s.parse().unwrap()
+    }
+
+    /// The fake is the contract twin the server tests run against: a
+    /// double take passes against it only if it would pass on tmux.
+    #[test]
+    fn the_fake_pty_hands_out_its_writer_once() {
+        let r = FakeRunner::default();
+        let pty = r.attach(&id("f/c/a")).unwrap();
+        assert!(pty.writer().is_ok());
+        assert!(pty.writer().is_err(), "PtyStream::writer: taken once");
+        assert!(
+            pty.reader().is_ok() && pty.reader().is_ok(),
+            "readers clone"
+        );
+    }
+
+    #[test]
+    fn a_dropped_attach_is_no_longer_there_to_close() {
+        let r = FakeRunner::default();
+        let a = id("f/c/a");
+        let pty = r.attach(&a).unwrap();
+        drop(pty);
+        assert!(!r.close_attach(&a), "the drop closed it; nothing left");
+        // a newer attach for the same agent is untouched by an older drop
+        let first = r.attach(&a).unwrap();
+        let second = r.attach(&a).unwrap();
+        drop(first);
+        assert!(r.close_attach(&a), "the second attach was still open");
+        drop(second);
+        assert!(!r.close_attach(&a));
     }
 
     #[test]

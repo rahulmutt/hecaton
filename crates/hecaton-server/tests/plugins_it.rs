@@ -239,6 +239,14 @@ async fn plugins_sync_hello_list_and_purge() {
         body["error"],
         "name: \"hecaton\" is reserved for the daemon's plugins"
     );
+    let mut watch = req.clone();
+    watch["spec"]["name"] = "watch".into();
+    let (s, body) = api.call("POST", "/v1/fleets", admin, Some(&watch));
+    assert_eq!(s, 400);
+    assert_eq!(
+        body["error"],
+        "name: \"watch\" is reserved: it would shadow the plugin host's fleets/watch route"
+    );
     let (s, _) = api.call(
         "DELETE",
         "/v1/fleets/hecaton?keep_repos=false&keep_sessions=false&purge=false",

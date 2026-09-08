@@ -10,6 +10,21 @@ use hecaton_core::{AgentId, AgentRunner, LaunchPlan, ProcessState};
 use hecaton_runtime::tmux::ATTACH_SESSION_PREFIX;
 use hecaton_runtime::{ANCHOR_WINDOW, TmuxRunner};
 
+/// Kills the test's tmux server on every exit path, a panic included, so
+/// a failing run does not leave a server behind.
+struct KillServer {
+    tmux: std::path::PathBuf,
+    socket: String,
+}
+
+impl Drop for KillServer {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new(&self.tmux)
+            .args(["-L", &self.socket, "kill-server"])
+            .status();
+    }
+}
+
 fn wait_for(mut f: impl FnMut() -> bool) {
     let start = Instant::now();
     while !f() {
@@ -77,6 +92,10 @@ fn session_window_observe_exit_respawn_and_teardown() {
     };
     let root = support::temp_root("tmux");
     let socket = format!("hecaton-test-{}", std::process::id());
+    let _server = KillServer {
+        tmux: tools.tmux.clone(),
+        socket: socket.clone(),
+    };
     let r = TmuxRunner::new(tools.tmux.clone(), socket.clone());
     let id: AgentId = "f/c/a".parse().unwrap();
     let crew = id.crew_ref();
@@ -153,9 +172,6 @@ fn session_window_observe_exit_respawn_and_teardown() {
     r.stop_crew(&crew).unwrap();
     r.stop_crew(&crew).unwrap();
     assert!(r.observe(&fleet).unwrap().crews.is_empty());
-    let _ = std::process::Command::new(&tools.tmux)
-        .args(["-L", &socket, "kill-server"])
-        .status();
 }
 
 /// Plugins spec §18.4, §11.1: a real tmux attach through the PTY sees the
@@ -169,6 +185,10 @@ fn attach_streams_the_pane_and_the_grouped_session_dies_with_the_stream() {
     };
     let root = support::temp_root("tmux-attach");
     let socket = format!("hecaton-test-attach-{}", std::process::id());
+    let _server = KillServer {
+        tmux: tools.tmux.clone(),
+        socket: socket.clone(),
+    };
     let r = TmuxRunner::new(tools.tmux.clone(), socket.clone());
     let id: AgentId = "f/c/a".parse().unwrap();
     let crew = id.crew_ref();
@@ -287,13 +307,38 @@ fn attach_streams_the_pane_and_the_grouped_session_dies_with_the_stream() {
         Some(ProcessState::Running { .. })
     ));
 
+    // A client that cannot create its session is an error, not a live
+    // stream that emits tmux's error line and EOF: the same runner behind
+    // a tmux whose `new-session` fails (the crew session, its windows and
+    // `list-windows` are the real tmux's).
+    let wrapper = root.join("tmux-broken-new-session.sh");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in new-session) echo 'no such session' >&2; exit 1;; esac; done\nexec {} \"$@\"\n",
+            tools.tmux.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let broken = TmuxRunner::new(wrapper, socket.clone());
+    let err = match broken.attach(&id) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a client whose session never appeared was handed out as a stream"),
+    };
+    assert!(
+        err.contains("before its session appeared"),
+        "the failed client is reported, not handed out: {err}"
+    );
+    assert!(
+        !sessions().contains(ATTACH_SESSION_PREFIX),
+        "nothing left of the failed attach"
+    );
+
     // a second attach, then stop_crew must take the group with it
     let again = r.attach(&id).unwrap();
     wait_for(|| sessions().contains(ATTACH_SESSION_PREFIX));
     r.stop_crew(&crew).unwrap();
     wait_for(|| sessions().trim().is_empty());
     drop(again);
-    let _ = std::process::Command::new(&tools.tmux)
-        .args(["-L", &socket, "kill-server"])
-        .status();
 }

@@ -15,8 +15,8 @@
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hecaton_core::{
     AgentId, AgentName, AgentRunner, CrewName, CrewRef, FleetName, LaunchPlan, ObservedState,
@@ -86,7 +86,7 @@ pub struct TmuxAttach {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     /// The port says the writer is taken once; enforced here rather than
     /// relying on what `portable-pty` does on a second `take_writer`.
-    writer_taken: std::sync::atomic::AtomicBool,
+    writer_taken: AtomicBool,
     tmux: PathBuf,
     socket: String,
     session: String,
@@ -395,7 +395,11 @@ impl AgentRunner for TmuxRunner {
         let name = crew.to_string();
         // `kill-session` on the crew session alone would leave its
         // windows alive in any grouped attach session (§18.4): every
-        // session of the group goes.
+        // session of the group goes. The list and the kills are separate
+        // commands, so an attach created in between survives with the
+        // windows linked into it while `observe` reports the crew gone;
+        // the reconciler's next pass finds and stops it. tmux has no
+        // "kill the group" command to make this one step.
         let Some(text) = self.run_optional(
             &name,
             &["list-sessions", "-F", "#{session_name}\t#{session_group}"],
@@ -502,14 +506,54 @@ impl AgentRunner for TmuxRunner {
             .spawn_command(cmd)
             .map_err(|e| fail(format!("spawn: {e}")))?;
         drop(pty.slave);
-        Ok(Box::new(TmuxAttach {
+        let mut attach = TmuxAttach {
             master: pty.master,
             child,
-            writer_taken: std::sync::atomic::AtomicBool::new(false),
+            writer_taken: AtomicBool::new(false),
             tmux: self.tmux.clone(),
             socket: self.socket.clone(),
-            session,
-        }))
+            session: session.clone(),
+        };
+        // Everything after the `windows()` check was fire-and-forget: a
+        // duplicate name or a crew session killed meanwhile would hand
+        // out a live stream whose reader shows tmux's error line and then
+        // EOF. The session appearing is what says the client attached (a
+        // `select-window` failing after that leaves it on the anchor, not
+        // dead); on failure `attach` drops here and cleans up after
+        // itself.
+        self.confirm_attached(&mut attach).map_err(fail)?;
+        Ok(Box::new(attach))
+    }
+}
+
+/// How long an attach client gets to bring its session up.
+const ATTACH_CONFIRM: Duration = Duration::from_secs(5);
+
+impl TmuxRunner {
+    fn confirm_attached(&self, attach: &mut TmuxAttach) -> Result<(), String> {
+        let target = format!("={}", attach.session);
+        let start = Instant::now();
+        loop {
+            if self
+                .cmd()
+                .args(["has-session", "-t", target.as_str()])
+                .run()
+                .is_ok()
+            {
+                return Ok(());
+            }
+            if let Ok(Some(status)) = attach.child.try_wait() {
+                return Err(format!(
+                    "the tmux client exited ({status:?}) before its session appeared"
+                ));
+            }
+            if start.elapsed() > ATTACH_CONFIRM {
+                return Err(format!(
+                    "the attach session did not appear within {ATTACH_CONFIRM:?}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 

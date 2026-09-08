@@ -48,7 +48,7 @@ pub fn parse(config: &Value) -> Result<WebConfig, ConfigError> {
             Value::Number(_) => "number",
             Value::String(_) => "string",
             Value::Array(_) => "array",
-            Value::Object(_) => unreachable!("checked above"),
+            Value::Object(_) => "object",
         };
         return Err(ConfigError {
             path: String::new(),

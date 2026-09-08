@@ -25,8 +25,21 @@ use crate::version::is_exact_version;
 pub const RESERVED_FLEET: &str = "hecaton";
 pub const PLUGIN_CREW: &str = "plugins";
 
+/// The plugin fleet's name.
 pub fn is_reserved_fleet(name: &str) -> bool {
     name == RESERVED_FLEET
+}
+
+/// Why a user fleet may not take `name`, if it may not. `hecaton` is the
+/// plugin fleet; `watch` is a legal label that `GET
+/// /v1/plugin-host/fleets/watch` would shadow, so a fleet of that name
+/// could never be fetched by a plugin.
+pub fn reserved_fleet_reason(name: &str) -> Option<&'static str> {
+    match name {
+        RESERVED_FLEET => Some("reserved for the daemon's plugins"),
+        "watch" => Some("reserved: it would shadow the plugin host's fleets/watch route"),
+        _ => None,
+    }
 }
 
 /// `hecaton/plugins/<name>`.
@@ -228,7 +241,23 @@ mod tests {
     use super::*;
     use crate::ResolvedAgent;
     use hecaton_api::{Capability, HookSubscriptions};
+
     use serde_json::json;
+
+    #[test]
+    fn two_fleet_names_are_reserved_and_only_one_is_the_plugin_fleet() {
+        assert_eq!(
+            reserved_fleet_reason("hecaton"),
+            Some("reserved for the daemon's plugins")
+        );
+        assert_eq!(
+            reserved_fleet_reason("watch"),
+            Some("reserved: it would shadow the plugin host's fleets/watch route")
+        );
+        assert_eq!(reserved_fleet_reason("payments"), None);
+        assert!(is_reserved_fleet("hecaton"));
+        assert!(!is_reserved_fleet("watch"), "not the plugin fleet");
+    }
     use std::collections::BTreeSet;
 
     const MISE: &str = "[tools]\nttyd = \"1.7.7\"\n\n[tasks.serve]\nrun = \"python3 plugin.py\"\n";

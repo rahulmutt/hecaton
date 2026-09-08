@@ -5,7 +5,7 @@
 //! upgraded on both sides and copied byte for byte — the proxy never
 //! parses a WebSocket frame.
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::Request;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
@@ -27,7 +27,8 @@ pub const FORWARDED_PREFIX: &str = "x-hecaton-forwarded-prefix";
 /// Never forwarded on a request: the daemon's own credentials, the host
 /// (hyper sets it from the upstream URI), and the hop-by-hop set of RFC
 /// 9110 §7.6.1 — `connection` and `upgrade` excepted on an upgrade
-/// request, which is exactly what they are for.
+/// request, which is exactly what they are for. Whatever `Connection:`
+/// itself names is hop-by-hop too (`connection_named`).
 pub(crate) const DROPPED: [&str; 9] = [
     "authorization",
     "cookie",
@@ -50,22 +51,59 @@ const DROPPED_RESPONSE: [&str; 6] = [
     "transfer-encoding",
 ];
 
+/// Negligible on loopback; bounds a plugin whose listener has gone away
+/// without closing its port.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub fn client() -> HttpClient {
-    Client::builder(TokioExecutor::new()).build_http()
+    let mut connector = HttpConnector::new();
+    connector.set_connect_timeout(Some(CONNECT_TIMEOUT));
+    Client::builder(TokioExecutor::new()).build(connector)
 }
 
-pub fn is_upgrade(headers: &HeaderMap) -> bool {
+/// An upgrade request is `Upgrade` together with a `Connection` that
+/// lists `upgrade` (RFC 9110 §7.8); either alone is a stray header.
+pub(crate) fn is_upgrade(headers: &HeaderMap) -> bool {
     headers.contains_key(header::UPGRADE)
+        && connection_named(headers).any(|name| name.eq_ignore_ascii_case("upgrade"))
+}
+
+/// The field names a `Connection:` header lists, every occurrence,
+/// lowercased as header names compare.
+fn connection_named(headers: &HeaderMap) -> impl Iterator<Item = String> + '_ {
+    headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
 }
 
 fn filtered(src: &HeaderMap, dropped: &[&str], keep_upgrade: bool) -> HeaderMap {
+    let named: Vec<String> = connection_named(src).collect();
     let mut out = HeaderMap::new();
     for (k, v) in src {
         let name = k.as_str();
         if dropped.contains(&name) {
             continue;
         }
-        if !keep_upgrade && (name == "connection" || name == "upgrade") {
+        if name == "connection" {
+            // On an upgrade the value is rewritten to exactly `Upgrade`:
+            // the other names it carried were stripped just above and a
+            // `Connection` naming absent headers would be a lie.
+            if keep_upgrade && !out.contains_key(header::CONNECTION) {
+                out.insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
+            }
+            continue;
+        }
+        if name == "upgrade" {
+            if keep_upgrade {
+                out.append(k.clone(), v.clone());
+            }
+            continue;
+        }
+        if named.iter().any(|n| n == name) {
             continue;
         }
         out.append(k.clone(), v.clone());
@@ -79,6 +117,37 @@ pub fn forwarded_headers(src: &HeaderMap) -> HeaderMap {
 
 pub fn response_headers(src: &HeaderMap, upgraded: bool) -> HeaderMap {
     filtered(src, &DROPPED_RESPONSE, upgraded)
+}
+
+/// Why a request body could not be read whole.
+#[derive(Debug)]
+pub(crate) enum BodyError {
+    /// More than `MAX_BODY` bytes: the client's fault, 413.
+    TooLarge,
+    /// The connection failed under the body: nobody's request to
+    /// forward, 400.
+    Transport(String),
+}
+
+/// The whole body, capped at `MAX_BODY`. Read frame by frame rather than
+/// through `axum::body::to_bytes` so the two ways it can fail stay apart:
+/// that helper folds a client that disconnected mid-body into the same
+/// error as one that sent too much.
+pub(crate) async fn read_body(body: Body) -> Result<Bytes, BodyError> {
+    use hyper::body::Body as _;
+    let mut body = std::pin::pin!(body);
+    let mut out = Vec::new();
+    while let Some(frame) = std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await {
+        let frame = frame.map_err(|e| BodyError::Transport(e.to_string()))?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        if out.len() + data.len() > MAX_BODY {
+            return Err(BodyError::TooLarge);
+        }
+        out.extend_from_slice(&data);
+    }
+    Ok(Bytes::from(out))
 }
 
 /// The `<rest>` of `/v1/plugins/<name>/<rest>`, taken from the request's
@@ -136,11 +205,14 @@ pub async fn forward(
     // side's upgrade handle in the request's extensions.
     let downstream = hyper::upgrade::on(&mut req);
     let (parts, body) = req.into_parts();
-    let bytes = match axum::body::to_bytes(body, MAX_BODY).await {
+    let bytes = match read_body(body).await {
         Ok(b) => b,
-        Err(_) => {
+        Err(BodyError::TooLarge) => {
             return ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "body exceeds 1 MiB")
                 .into_response();
+        }
+        Err(BodyError::Transport(e)) => {
+            return ApiError::new(StatusCode::BAD_REQUEST, format!("body: {e}")).into_response();
         }
     };
     let rest = forwarded_rest(parts.uri.path());
@@ -180,20 +252,39 @@ pub async fn forward(
         }
     };
     let upgraded = resp.status() == StatusCode::SWITCHING_PROTOCOLS;
+    if upgraded && !is_upgrade(&parts.headers) {
+        // The client never asked; awaiting its side of the upgrade would
+        // park this task, and the plugin's connection with it, for good.
+        tracing::warn!(plugin = %name, "proxy: 101 to a request that did not ask to upgrade");
+        return ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("plugin {name:?}: answered 101 to a request that did not ask to upgrade"),
+        )
+        .into_response();
+    }
     if upgraded {
         let upstream = hyper::upgrade::on(&mut resp);
         let plugin = name.to_string();
         tokio::spawn(async move {
-            match (downstream.await, upstream.await) {
-                (Ok(a), Ok(b)) => {
-                    let (mut a, mut b) = (TokioIo::new(a), TokioIo::new(b));
-                    if let Err(e) = tokio::io::copy_bidirectional(&mut a, &mut b).await {
-                        tracing::debug!(plugin = %plugin, "proxied stream ended: {e}");
-                    }
+            // The client's side first: if it does not complete there is
+            // nothing to copy, and the plugin's side may never resolve.
+            let a = match downstream.await {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::debug!(plugin = %plugin, "upgrade failed downstream: {e}");
+                    return;
                 }
-                (Err(e), _) | (_, Err(e)) => {
-                    tracing::debug!(plugin = %plugin, "upgrade failed: {e}");
+            };
+            let b = match upstream.await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::debug!(plugin = %plugin, "upgrade failed upstream: {e}");
+                    return;
                 }
+            };
+            let (mut a, mut b) = (TokioIo::new(a), TokioIo::new(b));
+            if let Err(e) = tokio::io::copy_bidirectional(&mut a, &mut b).await {
+                tracing::debug!(plugin = %plugin, "proxied stream ended: {e}");
             }
         });
     }
@@ -230,7 +321,7 @@ mod tests {
             ("te", "trailers"),
             ("trailer", "x"),
             ("transfer-encoding", "chunked"),
-            ("connection", "keep-alive"),
+            ("connection", "Upgrade"),
             ("upgrade", "h2c"),
             ("accept", "text/html"),
             ("x-custom", "1"),
@@ -336,6 +427,89 @@ mod tests {
         assert_eq!(forwarded_rest("/v1/fleets"), "");
     }
 
+    #[test]
+    fn headers_named_by_connection_are_hop_by_hop() {
+        // RFC 9110 §7.6.1: every field name listed in `Connection` is
+        // hop-by-hop, whatever it is called.
+        let out = forwarded_headers(&headers(&[
+            ("connection", "keep-alive, X-Hop"),
+            ("x-hop", "1"),
+            ("accept", "text/html"),
+        ]));
+        let names: Vec<&str> = out.keys().map(|k| k.as_str()).collect();
+        assert_eq!(names, vec!["accept"]);
+        let resp = response_headers(
+            &headers(&[
+                ("connection", "close, x-resp-hop"),
+                ("x-resp-hop", "1"),
+                ("content-type", "text/html"),
+            ]),
+            false,
+        );
+        let names: Vec<&str> = resp.keys().map(|k| k.as_str()).collect();
+        assert_eq!(names, vec!["content-type"]);
+    }
+
+    #[test]
+    fn an_upgrade_is_both_headers_together() {
+        assert!(
+            !is_upgrade(&headers(&[("upgrade", "websocket")])),
+            "Upgrade alone is not an upgrade request"
+        );
+        assert!(!is_upgrade(&headers(&[("connection", "Upgrade")])));
+        assert!(is_upgrade(&headers(&[
+            ("connection", "Upgrade"),
+            ("upgrade", "websocket")
+        ])));
+        assert!(
+            is_upgrade(&headers(&[
+                ("connection", "keep-alive, upgrade"),
+                ("upgrade", "websocket")
+            ])),
+            "a token among others, in any case"
+        );
+        let out = forwarded_headers(&headers(&[
+            ("connection", "keep-alive, X-Hop, Upgrade"),
+            ("x-hop", "1"),
+            ("upgrade", "websocket"),
+        ]));
+        assert_eq!(
+            out.get("connection").map(|v| v.to_str().unwrap()),
+            Some("Upgrade"),
+            "rewritten: the names it carried are gone"
+        );
+        assert!(!out.contains_key("x-hop"));
+        let out = forwarded_headers(&headers(&[("upgrade", "h2c"), ("accept", "*/*")]));
+        let names: Vec<&str> = out.keys().map(|k| k.as_str()).collect();
+        assert_eq!(names, vec!["accept"], "a stray Upgrade is not forwarded");
+    }
+
+    /// A body whose first frame is a transport error.
+    struct Failing;
+
+    impl hyper::body::Body for Failing {
+        type Data = Bytes;
+        type Error = std::io::Error;
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, std::io::Error>>> {
+            std::task::Poll::Ready(Some(Err(std::io::Error::other("connection reset"))))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_too_large_body_and_a_broken_body_are_told_apart() {
+        let exact = Body::from(vec![b'x'; MAX_BODY]);
+        assert_eq!(read_body(exact).await.unwrap().len(), MAX_BODY);
+        let big = Body::from(vec![b'x'; MAX_BODY + 1]);
+        assert!(matches!(read_body(big).await, Err(BodyError::TooLarge)));
+        match read_body(Body::new(Failing)).await {
+            Err(BodyError::Transport(e)) => assert!(e.contains("connection reset"), "{e}"),
+            other => panic!("a broken body is not a 413: {other:?}"),
+        }
+    }
+
     proptest! {
         /// Whatever comes in, the daemon's credentials and the hop-by-hop
         /// set never go out, and connection/upgrade go out only together
@@ -346,11 +520,14 @@ mod tests {
             upgrade in proptest::bool::ANY,
         ) {
             let mut pairs: Vec<(String, String)> = names.iter().map(|n| (n.clone(), "v".to_string())).collect();
-            for n in ["authorization", "cookie", "host", "connection", "te", "transfer-encoding"] {
+            for n in ["authorization", "cookie", "host", "te", "transfer-encoding"] {
                 pairs.push((n.to_string(), "v".to_string()));
             }
             if upgrade {
+                pairs.push(("connection".to_string(), "Upgrade".to_string()));
                 pairs.push(("upgrade".to_string(), "websocket".to_string()));
+            } else {
+                pairs.push(("connection".to_string(), "keep-alive".to_string()));
             }
             let src = headers(&pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
             let out = forwarded_headers(&src);

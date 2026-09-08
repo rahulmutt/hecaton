@@ -34,10 +34,10 @@ pub fn resolve(file: &FleetFile, opts: &ResolveOptions) -> Result<FleetSpec, Con
             path: "name".to_string(),
             message: "required; set `name` in the file or pass --name".to_string(),
         })?;
-    if hecaton_core::is_reserved_fleet(&name) {
+    if let Some(why) = hecaton_core::reserved_fleet_reason(&name) {
         return Err(ConfigError::Invalid {
             path: "name".to_string(),
-            message: format!("{name:?} is reserved for the daemon's plugins"),
+            message: format!("{name:?} is {why}"),
         });
     }
     let host_layer = opts.host_claude_settings.as_ref().map(|s| {
@@ -261,6 +261,14 @@ crews:
         )
         .unwrap_err();
         assert!(err.to_string().starts_with("name: \"hecaton\" is reserved"));
+        // `fleets/watch` is the plugin host's watch route, so a fleet of
+        // that name could never be fetched there
+        let file = crate::parse("apiVersion: hecaton/v1\nkind: Fleet\nname: watch\n").unwrap();
+        let err = resolve(&file, &ResolveOptions::default()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "name: \"watch\" is reserved: it would shadow the plugin host's fleets/watch route"
+        );
     }
 
     #[test]

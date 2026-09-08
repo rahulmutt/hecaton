@@ -26,7 +26,8 @@ credentials, hook input, or sandbox rules.
 - `lint`, `test`, `fmt`, `precommit`, `audit` — defined in `mise.toml`.
 - `vendor-xterm` is a script, not a task: `scripts/vendor-xterm.sh` re-fetches
   and verifies the web plugin's assets against
-  `crates/hecaton-plugin-web/assets/VENDOR.md`.
+  `crates/hecaton-plugin-web/assets/VENDOR.md` (installing them only when
+  every digest matches); `--check` verifies the committed files offline.
 
 ## Conventions
 - Ports (`Materializer`, `AgentRunner`, `Clock`, `FleetStore`, `EventHandler`)

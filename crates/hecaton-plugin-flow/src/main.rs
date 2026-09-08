@@ -1,11 +1,19 @@
 //! `hecaton-plugin-flow`: read the daemon's environment, say hello, serve.
 //! Failures print `flow: …` to stderr and exit 1; that lands in the
-//! plugin's tmux window and `plugins/flow/logs/`.
+//! plugin's tmux window and `plugins/flow/logs/`. The SDK logs through
+//! `tracing`, so a stderr subscriber puts its lines in the same place.
 
 use hecaton_plugin_flow::FlowPlugin;
 use hecaton_plugin_sdk::{Env, Host, serve};
 
 fn run() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
     let env = Env::from_process()?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {

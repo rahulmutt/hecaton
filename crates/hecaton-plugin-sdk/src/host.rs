@@ -197,10 +197,7 @@ impl Host {
 
     /// `ws://` twin of `url`: the streams of §18.4.
     fn ws_url(&self, path: &str) -> String {
-        format!(
-            "{}/v1/plugin-host/{path}",
-            self.env.api_url.replacen("http://", "ws://", 1)
-        )
+        self.url(path).replacen("http://", "ws://", 1)
     }
 
     /// Opens one of the daemon's WebSocket routes with the bearer; a
@@ -233,7 +230,7 @@ impl Host {
             .await?
             .split();
         Ok(Attach {
-            rx: AttachRead { rx },
+            rx: AttachRead { rx, closed: None },
             tx: AttachWrite { tx },
         })
     }
@@ -245,6 +242,7 @@ impl Host {
             host: self.clone(),
             socket: None,
             backoff: BACKOFF_MIN,
+            retry_at: None,
         }
     }
 }
@@ -258,21 +256,67 @@ fn transport(e: tungstenite::Error) -> SdkError {
     SdkError::Transport(e.to_string())
 }
 
+/// Why the daemon ended an attach (plugins spec §18.4): 1000 when the
+/// window closed, 1003 for a text frame that was not a resize, 1011 when
+/// the runner's side failed; 1006 with the transport's error when the
+/// socket broke without a close frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseReason {
+    pub code: u16,
+    pub reason: String,
+}
+
 /// The reading half of an attach: terminal output.
 pub struct AttachRead {
     rx: SplitStream<Socket>,
+    closed: Option<CloseReason>,
 }
 
 impl AttachRead {
-    /// The next chunk of output; `None` once the daemon closed the stream.
+    /// The next chunk of output; `None` once the daemon closed the stream
+    /// (`close_reason` then says why).
     pub async fn read(&mut self) -> Option<Vec<u8>> {
+        if self.closed.is_some() {
+            return None;
+        }
         loop {
             match self.rx.next().await {
                 Some(Ok(Message::Binary(bytes))) => return Some(bytes.to_vec()),
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return None,
+                Some(Ok(Message::Close(frame))) => {
+                    self.closed = Some(match frame {
+                        Some(f) => CloseReason {
+                            code: u16::from(f.code),
+                            reason: f.reason.to_string(),
+                        },
+                        None => CloseReason {
+                            code: 1005,
+                            reason: String::new(),
+                        },
+                    });
+                    return None;
+                }
+                Some(Err(e)) => {
+                    self.closed = Some(CloseReason {
+                        code: 1006,
+                        reason: e.to_string(),
+                    });
+                    return None;
+                }
+                None => {
+                    self.closed = Some(CloseReason {
+                        code: 1006,
+                        reason: "the socket ended without a close frame".into(),
+                    });
+                    return None;
+                }
                 Some(Ok(_)) => {}
             }
         }
+    }
+
+    /// Why `read` returned `None`; `None` while the stream is open.
+    pub fn close_reason(&self) -> Option<&CloseReason> {
+        self.closed.as_ref()
     }
 }
 
@@ -321,6 +365,10 @@ impl Attach {
     pub async fn read(&mut self) -> Option<Vec<u8>> {
         self.rx.read().await
     }
+    /// Why `read` returned `None`; `None` while the stream is open.
+    pub fn close_reason(&self) -> Option<&CloseReason> {
+        self.rx.close_reason()
+    }
     pub async fn write(&mut self, bytes: &[u8]) -> Result<(), SdkError> {
         self.tx.write(bytes).await
     }
@@ -339,9 +387,13 @@ impl Attach {
 enum Frame {
     /// A complete fleets list.
     List(Vec<FleetRecord>),
-    /// A frame that is not a list (a pong, a ping, an unparsable body):
-    /// keep reading the same socket.
+    /// A frame that is not a list (a ping, a pong): keep reading the
+    /// same socket.
     Skipped,
+    /// A text frame that is not a list: the daemon speaks a dialect this
+    /// SDK does not; the socket is dropped and reconnected behind the
+    /// backoff rather than read again at once.
+    Bad(String),
     /// The socket is finished; a new one has to be opened.
     Closed,
 }
@@ -352,23 +404,32 @@ pub struct FleetWatch {
     host: Host,
     socket: Option<Socket>,
     backoff: Duration,
+    /// The deadline a `wait` in progress owes, kept across a cancelled
+    /// `next` so a caller that gives up on the sleep does not reconnect
+    /// unthrottled.
+    retry_at: Option<tokio::time::Instant>,
 }
 
 impl FleetWatch {
     /// The next complete list. Never ends: a refused handshake and a lost
     /// socket are both retried behind the same 1–10 s backoff — a daemon
     /// that accepts the handshake and then ends the stream at once must
-    /// not turn into a connect/close storm — and only a frame that
-    /// actually arrives resets it. Drop the watch to stop.
+    /// not turn into a connect/close storm — and only a list that
+    /// actually arrives resets it (pings do not). Drop the watch to stop.
     pub async fn next(&mut self) -> Vec<FleetRecord> {
         loop {
             if self.socket.is_none() {
+                // a wait a cancelled `next` left unserved comes first
+                if self.retry_at.is_some() {
+                    self.wait().await;
+                }
                 match self.host.connect("fleets/watch").await {
                     Ok(s) => self.socket = Some(s),
                     Err(e) => {
-                        eprintln!(
-                            "{}: fleets/watch: {e}; retrying in {:?}",
-                            self.host.env.name, self.backoff
+                        tracing::warn!(
+                            plugin = %self.host.env.name,
+                            "fleets/watch: {e}; retrying in {:?}",
+                            self.backoff
                         );
                         self.wait().await;
                         continue;
@@ -381,6 +442,15 @@ impl FleetWatch {
                     return list;
                 }
                 Frame::Skipped => {}
+                Frame::Bad(e) => {
+                    tracing::warn!(
+                        plugin = %self.host.env.name,
+                        "fleets/watch: bad frame ({e}); reconnecting in {:?}",
+                        self.backoff
+                    );
+                    self.socket = None;
+                    self.wait().await;
+                }
                 Frame::Closed => {
                     self.socket = None;
                     self.wait().await;
@@ -393,27 +463,35 @@ impl FleetWatch {
     /// gone — including the `None` the loop above has just ruled out, so
     /// an impossible state waits like any other loss instead of spinning.
     async fn frame(&mut self) -> Frame {
-        let name = self.host.env.name.clone();
         let Some(socket) = self.socket.as_mut() else {
             return Frame::Closed;
         };
         match socket.next().await {
             Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
                 Ok(list) => Frame::List(list),
-                Err(e) => {
-                    eprintln!("{name}: fleets/watch: bad frame: {e}");
-                    Frame::Skipped
-                }
+                Err(e) => Frame::Bad(e.to_string()),
             },
             Some(Ok(Message::Close(_))) | Some(Err(_)) | None => Frame::Closed,
             Some(Ok(_)) => Frame::Skipped,
         }
     }
 
-    /// Waits out the current backoff, then doubles it up to `BACKOFF_MAX`.
+    /// Waits out the current backoff. The deadline is fixed, and the
+    /// backoff doubled (up to `BACKOFF_MAX`), the moment the wait starts:
+    /// a `next` cancelled mid-sleep resumes the same deadline instead of
+    /// reconnecting at once.
     async fn wait(&mut self) {
-        tokio::time::sleep(self.backoff).await;
-        self.backoff = (self.backoff * 2).min(BACKOFF_MAX);
+        let until = match self.retry_at {
+            Some(t) => t,
+            None => {
+                let t = tokio::time::Instant::now() + self.backoff;
+                self.retry_at = Some(t);
+                self.backoff = (self.backoff * 2).min(BACKOFF_MAX);
+                t
+            }
+        };
+        tokio::time::sleep_until(until).await;
+        self.retry_at = None;
     }
 }
 
@@ -603,6 +681,71 @@ mod tests {
             .await
             .expect("reconnected once the daemon stopped closing");
         assert_eq!(after.len(), 1);
+    }
+
+    /// A frame the SDK cannot parse is a daemon speaking another dialect:
+    /// the socket is dropped and reconnected behind the backoff, not read
+    /// again in a loop that logs on every turn.
+    #[tokio::test]
+    async fn a_bad_watch_frame_reconnects_behind_the_backoff() {
+        let fake = FakeHost::start("tok", json!({}), vec![record("payments")]).await;
+        let host = Host::new(fake.env("web", std::path::Path::new("/s"))).unwrap();
+        let mut watch = host.watch_fleets();
+        assert_eq!(watch.next().await.len(), 1);
+        assert_eq!(fake.watch_connections(), 1);
+        fake.inject_watch_text("not a fleets list");
+        let quick = tokio::time::timeout(BACKOFF_MIN / 2, watch.next()).await;
+        assert!(quick.is_err(), "reconnected inside the backoff: {quick:?}");
+        let after = tokio::time::timeout(std::time::Duration::from_secs(5), watch.next())
+            .await
+            .expect("reconnected after the backoff");
+        assert_eq!(after.len(), 1);
+        assert_eq!(fake.watch_connections(), 2, "one reconnect, not a storm");
+    }
+
+    /// A `select!`-driven caller can cancel `next()` while it sleeps out
+    /// the backoff; the next call must still owe what is left of it.
+    #[tokio::test]
+    async fn a_cancelled_wait_still_owes_its_backoff() {
+        let fake = FakeHost::start("tok", json!({}), vec![record("payments")]).await;
+        let host = Host::new(fake.env("web", std::path::Path::new("/s"))).unwrap();
+        let mut watch = host.watch_fleets();
+        assert_eq!(watch.next().await.len(), 1);
+        fake.drop_watchers();
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < BACKOFF_MIN / 2 {
+            let cancelled =
+                tokio::time::timeout(std::time::Duration::from_millis(20), watch.next()).await;
+            assert!(cancelled.is_err(), "reconnected early: {cancelled:?}");
+        }
+        assert_eq!(
+            fake.watch_connections(),
+            1,
+            "every cancelled call reconnected without waiting"
+        );
+        let after = tokio::time::timeout(std::time::Duration::from_secs(5), watch.next())
+            .await
+            .expect("reconnected once the backoff was served");
+        assert_eq!(after.len(), 1);
+        assert_eq!(fake.watch_connections(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_attach_reader_reports_why_the_daemon_closed() {
+        let fake = FakeHost::start("tok", json!({}), vec![]).await;
+        let host = Host::new(fake.env("web", std::path::Path::new("/s"))).unwrap();
+        let mut a = host.attach("f/c/a").await.unwrap();
+        a.write(b"hi").await.unwrap();
+        assert_eq!(a.read().await.as_deref(), Some(&b"hi"[..]));
+        assert!(a.close_reason().is_none(), "still open");
+        fake.close_attaches(1011, "the terminal's writer failed");
+        assert_eq!(a.read().await, None);
+        let why = a.close_reason().expect("the daemon's close frame");
+        assert_eq!(
+            (why.code, why.reason.as_str()),
+            (1011, "the terminal's writer failed")
+        );
+        assert_eq!(a.read().await, None, "stays closed");
     }
 
     #[tokio::test]

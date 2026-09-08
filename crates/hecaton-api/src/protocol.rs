@@ -167,12 +167,32 @@ impl ResizeFrame {
         }
     }
 
-    /// `None` for anything but a well-formed frame with both dimensions
-    /// at least 1: a zero-sized terminal is a bug on the sender's side.
-    pub fn parse(text: &str) -> Option<Self> {
-        let frame: Self = serde_json::from_str(text).ok()?;
-        (frame.resize.cols >= 1 && frame.resize.rows >= 1).then_some(frame)
+    /// What a text frame on an attach socket is. A well-formed resize
+    /// with a zero dimension is `ZeroSized`, to be ignored rather than
+    /// refused: xterm.js's fit addon reports zeroes for a hidden
+    /// container, and closing the terminal over a cosmetic frame would
+    /// punish every client that does not guard against it.
+    pub fn parse(text: &str) -> TextFrame {
+        let Ok(frame) = serde_json::from_str::<Self>(text) else {
+            return TextFrame::Malformed;
+        };
+        if frame.resize.cols >= 1 && frame.resize.rows >= 1 {
+            TextFrame::Resize(frame)
+        } else {
+            TextFrame::ZeroSized
+        }
     }
+}
+
+/// A text frame on an attach socket, parsed (`ResizeFrame::parse`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextFrame {
+    /// A resize with both dimensions at least 1.
+    Resize(ResizeFrame),
+    /// A resize with a zero dimension: ignored.
+    ZeroSized,
+    /// Not a resize: the peer closes 1003.
+    Malformed,
 }
 
 #[cfg(test)]
@@ -276,16 +296,21 @@ mod tests {
         );
         assert_eq!(
             ResizeFrame::parse(r#"{"resize":{"cols":120,"rows":40}}"#),
-            Some(f)
+            TextFrame::Resize(f)
         );
+        for zero in [
+            r#"{"resize":{"cols":0,"rows":40}}"#,
+            r#"{"resize":{"cols":80,"rows":0}}"#,
+        ] {
+            assert_eq!(ResizeFrame::parse(zero), TextFrame::ZeroSized, "{zero}");
+        }
         for bad in [
             "junk",
-            r#"{"resize":{"cols":0,"rows":40}}"#,
             r#"{"resize":{"cols":80}}"#,
             r#"{"resize":{"cols":80,"rows":24},"x":1}"#,
             r#"{"cols":80,"rows":24}"#,
         ] {
-            assert_eq!(ResizeFrame::parse(bad), None, "{bad}");
+            assert_eq!(ResizeFrame::parse(bad), TextFrame::Malformed, "{bad}");
         }
     }
 }

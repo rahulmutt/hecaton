@@ -12,7 +12,7 @@ use hecaton_api::{
 };
 use hecaton_core::{
     AgentId, AgentName, AgentRunner, EventHandler, Fleet, FleetName, FleetRecord, FleetSecrets,
-    Keep, Outcome, is_reserved_fleet, plugin_id,
+    Keep, Outcome, is_reserved_fleet, plugin_id, reserved_fleet_reason,
 };
 use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
@@ -112,12 +112,14 @@ impl Daemon {
         let mut fleets = BTreeMap::new();
         for (record, secrets) in existing {
             match FleetName::try_from(record.spec.name.clone()) {
-                // The plugin host owns this name and already has an actor;
-                // a stored record under it predates the reservation (or was
-                // written by hand) and would fight it for tmux and state.
-                Ok(name) if is_reserved_fleet(name.as_str()) => tracing::error!(
+                // The plugin host owns `hecaton` and already has an actor;
+                // a stored record under a reserved name predates the
+                // reservation (or was written by hand) and would fight it
+                // for tmux and state, or could never be fetched.
+                Ok(name) if reserved_fleet_reason(name.as_str()).is_some() => tracing::error!(
                     fleet = %name,
-                    "ignoring a stored fleet named {name}: the name is reserved for the daemon's plugins"
+                    "ignoring a stored fleet named {name}: the name is {}",
+                    reserved_fleet_reason(name.as_str()).unwrap_or_default()
                 ),
                 Ok(name) => {
                     // Nothing about activation is persisted (§16.2): every
@@ -285,8 +287,13 @@ impl Daemon {
         // `replace_plugins` drops the activation rows of every plugin the
         // sync removed, and the plugin fleet's own actor snapshot is not
         // forwarded to `changes` — so this registry write ticks like the
-        // others, or `fleets/watch` keeps serving the removed rows.
-        self.bump();
+        // others, or `fleets/watch` keeps serving the removed rows. A
+        // sync that fails resolving does so before it replaces anything;
+        // the failures after `replace_plugins` are the actor being gone,
+        // which is shutdown, when no watcher is left to tell.
+        if report.is_ok() {
+            self.bump();
+        }
         report
     }
 
@@ -380,11 +387,11 @@ impl Daemon {
     }
 
     /// The `hecaton` fleet belongs to the plugin host: readable, never
-    /// written through the fleet API.
+    /// written through the fleet API. `watch` would shadow a route.
     fn reject_reserved(name: &FleetName) -> Result<(), DaemonError> {
-        if is_reserved_fleet(name.as_str()) {
+        if let Some(why) = reserved_fleet_reason(name.as_str()) {
             return Err(DaemonError::Invalid(format!(
-                "name: {:?} is reserved for the daemon's plugins",
+                "name: {:?} is {why}",
                 name.as_str()
             )));
         }

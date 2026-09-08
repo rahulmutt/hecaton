@@ -92,10 +92,12 @@ records and activation rows alike), pinging every 30 s; a consumer
 replaces its state on each frame and reconnects when the socket drops.
 `attach` opens a terminal on the agent's window: binary frames carry
 bytes both ways, a text frame must be a resize (`{ "resize": { "cols":
-120, "rows": 40 } }`, both at least 1) or the daemon closes with 1003;
-the daemon closes with 1000 when the window ends and 1011 on a runner
-failure. Both take the plugin's bearer on the handshake and answer the
-usual 401/403 before upgrading.
+120, "rows": 40 } }`) or the daemon closes with 1003; a resize with a
+zero dimension (what a hidden terminal's fit reports) is ignored, not
+refused. The daemon closes with 1000 when the window ends and 1011 on a
+runner failure. Both take the plugin's bearer on the handshake and answer
+the usual 401/403 before upgrading. Because `fleets/watch` sits beside
+`fleets/{name}`, `watch` is not a fleet name: `up` refuses it.
 
 ## 4. Daemon → plugin
 
@@ -171,8 +173,9 @@ and `/v1/plugins/<name>/<rest>?<query>` to `/v1/routes/<rest>?<query>`
 — `<rest>` crosses percent-encoded exactly as the client wrote it, and a
 `.` or `..` segment (its `%2e` spellings included) is refused with 400
 rather than forwarded — with the method, the body (1 MiB cap, 413 beyond), and the request
-headers minus `Authorization`, `Cookie`, `Host` and the hop-by-hop set
-(`Connection` and `Upgrade` are kept on an upgrade request). Two headers
+headers minus `Authorization`, `Cookie`, `Host`, the hop-by-hop set and
+whatever `Connection:` names (on an upgrade request `Upgrade` is kept and
+`Connection` is sent as exactly `Upgrade`). Two headers
 are added: `Authorization: Bearer <HECATON_PLUGIN_TOKEN>` (§2) and
 `X-Hecaton-Forwarded-Prefix: /v1/plugins/<name>`, the mount to build links
 from. The response streams back with its hop-by-hop headers removed; a
@@ -211,7 +214,7 @@ each: `{ route, direction, request, status, response }` for
 `daemon-to-plugin` and most `plugin-to-daemon` routes; `raw` (base64)
 replaces `request`/`response` for the kv byte bodies, `health.json` and
 `metrics.json`; `hello-bad-token.json` additionally carries a top-level
-`"token"` to send instead of the real one. daemon-to-plugin fixtures also
+`"token"` to send instead of the real one. Daemon-to-plugin fixtures also
 carry `headers`, the request headers the daemon sends.
 
 Fixtures with `"transport": "websocket"` (`attach-resize.json`,
@@ -220,7 +223,8 @@ are asserted by the SDK's stream test against `FakeHost`; `routes.json`
 is replayed through the SDK router alone — the daemon's proxy forwards
 requests unparsed.
 
-Two tests replay every fixture:
+Two tests replay the request/response fixtures (every fixture but the
+three just named):
 
 - `crates/hecaton-plugin-sdk/tests/conformance.rs` — every
   `daemon-to-plugin` fixture through the SDK's `router` (a real HTTP round
