@@ -6,19 +6,21 @@
 use std::sync::{Arc, LazyLock};
 
 use axum::body::Bytes;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use hecaton_api::{ResizeFrame, TextFrame};
+use hecaton_api::{PluginAction, ResizeFrame, TextFrame};
 use hecaton_plugin_sdk::SdkError;
 use hecaton_plugin_sdk::metrics::IntGauge;
 use sha2::{Digest, Sha256};
 
 use crate::plugin::Shared;
-use crate::state::AgentRow;
+use crate::review::{ReviewBody, render_message, validate};
+use crate::state::{AgentRow, now};
 
 pub const PREFIX_HEADER: &str = "x-hecaton-forwarded-prefix";
 
@@ -49,7 +51,10 @@ pub fn router(shared: Arc<Shared>) -> Router {
             "/agents/{fleet}/{crew}/{agent}/events.json",
             get(events_json),
         )
-        .route("/agents/{fleet}/{crew}/{agent}/review", get(review_page))
+        .route(
+            "/agents/{fleet}/{crew}/{agent}/review",
+            get(review_page).post(post_review),
+        )
         .route("/agents/{fleet}/{crew}/{agent}/diff.json", get(diff_json))
         .route("/agents/{fleet}/{crew}/{agent}/file", get(file_text))
         .route("/assets/{digest}/{file}", get(asset))
@@ -472,6 +477,52 @@ async fn review_page(
     match enabled_id(&shared, path) {
         Ok(id) => Html(review_html(&prefix(&headers), &id)).into_response(),
         Err(r) => r,
+    }
+}
+
+/// The submission (Spec C §4.4): validate, render one message, send it
+/// as a `send_text` with submit, and append the `review_sent` divider.
+/// A refused action is 502 with the daemon's text and leaves the draft
+/// to the page.
+async fn post_review(
+    State(shared): State<Arc<Shared>>,
+    Path(path): Path<(String, String, String)>,
+    body: Result<Json<ReviewBody>, JsonRejection>,
+) -> Response {
+    let id = match enabled_id(&shared, path) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    let Json(review) = match body {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.body_text()).into_response(),
+    };
+    if let Err(reason) = validate(&review) {
+        return (StatusCode::BAD_REQUEST, reason).into_response();
+    }
+    let message = render_message(&id, &review);
+    let n = review.comments.len();
+    let action = PluginAction::SendText {
+        text: message.clone(),
+        submit: true,
+    };
+    match shared.host.action(&id, &action).await {
+        Ok(()) => {
+            shared.reviews_total.with_label_values(&["sent"]).inc();
+            shared.review_comments_total.inc_by(n as u64);
+            shared.cache.push_event(
+                &id,
+                now(),
+                "review_sent",
+                format!("review sent ({n} comment{})", if n == 1 { "" } else { "s" }),
+                serde_json::json!({ "message": message, "comments": n }),
+            );
+            Json(serde_json::json!({})).into_response()
+        }
+        Err(e) => {
+            shared.reviews_total.with_label_values(&["failed"]).inc();
+            (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
+        }
     }
 }
 

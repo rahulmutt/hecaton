@@ -912,6 +912,23 @@ impl Harness {
         (status, headers, body)
     }
 
+    /// `POST /v1/routes<path>` with a JSON body as the daemon's proxy would
+    /// send it: the bearer and `X-Hecaton-Forwarded-Prefix: <prefix>`.
+    pub async fn post_route(&self, path: &str, prefix: &str, body: &Value) -> (u16, Vec<u8>) {
+        let resp = self
+            .http
+            .post(self.url(&format!("/v1/routes{path}")))
+            .bearer_auth(&self.token)
+            .header("x-hecaton-forwarded-prefix", prefix)
+            .json(body)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("Harness POST {path}: {e}"));
+        let status = resp.status().as_u16();
+        let body = resp.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
+        (status, body)
+    }
+
     pub async fn metrics(&self) -> String {
         self.http
             .get(self.url("/v1/metrics"))

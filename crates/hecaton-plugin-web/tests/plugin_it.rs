@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use hecaton_api::{AgentPhase, FleetRecord, FleetSpec};
+use hecaton_api::{AgentPhase, FleetRecord, FleetSpec, PluginAction};
 use hecaton_plugin_sdk::testing::{FakeHost, Harness, event, metric};
 use hecaton_plugin_sdk::{Env, Host};
 use hecaton_plugin_web::WebPlugin;
@@ -465,5 +465,126 @@ async fn the_review_page_and_its_data_routes_pass_the_workspace_through() {
     assert_eq!(
         (status, String::from_utf8_lossy(&body).as_ref()),
         (404, "no workspace for agent e2e/c/carol")
+    );
+}
+
+#[tokio::test]
+async fn a_review_is_one_send_text_and_a_divider_in_the_column() {
+    let (fake, _, h, _watch) = world().await;
+    h.activate(ALICE, json!({})).await.unwrap();
+    h.activate(BOB, json!({ "enabled": false })).await.unwrap();
+    fake.set_workspace(ALICE, sample_diff(), BTreeMap::new());
+    let review = json!({
+        "head": sample_diff().head,
+        "base_ref": "origin/main",
+        "summary": "Looks fine.",
+        "comments": [
+            { "path": "src/lib.rs", "side": "new", "line": 2, "text": "+fn b() { c() }", "body": "Name this." }
+        ]
+    });
+    let (status, body) = h
+        .post_route("/agents/e2e/c/alice/review", "/v1/plugins/web", &review)
+        .await;
+    assert_eq!(
+        (status, String::from_utf8_lossy(&body).as_ref()),
+        (200, "{}")
+    );
+    let expected = "Review of e2e/c/alice against origin/main at 3f9c2a1 (1 comment)\n\nsrc/lib.rs line 2 (new):\n> +fn b() { c() }\nName this.\n\nOverall:\nLooks fine.";
+    assert_eq!(
+        fake.actions_for(ALICE),
+        vec![PluginAction::SendText {
+            text: expected.to_string(),
+            submit: true
+        }]
+    );
+    // the divider
+    let (_, _, body) = h
+        .get_route("/agents/e2e/c/alice/events.json", "/v1/plugins/web")
+        .await;
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    let last = v["events"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["name"], "review_sent");
+    assert_eq!(last["summary"], "review sent (1 comment)");
+    assert_eq!(last["payload"]["message"], expected);
+    assert!(last["at"].as_u64().unwrap() > 1_700_000_000);
+    // refusals: not enabled, a bad body, the caps, nothing to send
+    let (status, _) = h
+        .post_route("/agents/e2e/c/bob/review", "/v1/plugins/web", &review)
+        .await;
+    assert_eq!(status, 404);
+    let (status, body) = h
+        .post_route(
+            "/agents/e2e/c/alice/review",
+            "/v1/plugins/web",
+            &json!({ "comments": [{ "path": "x" }] }),
+        )
+        .await;
+    assert_eq!(status, 400, "{}", String::from_utf8_lossy(&body));
+    let (status, body) = h
+        .post_route("/agents/e2e/c/alice/review", "/v1/plugins/web", &json!({}))
+        .await;
+    assert_eq!(
+        (status, String::from_utf8_lossy(&body).as_ref()),
+        (400, "nothing to send")
+    );
+    let many: Vec<Value> = (0..201)
+        .map(|i| json!({ "path": "a", "side": "new", "line": i, "text": "", "body": "b" }))
+        .collect();
+    let (status, body) = h
+        .post_route(
+            "/agents/e2e/c/alice/review",
+            "/v1/plugins/web",
+            &json!({ "comments": many }),
+        )
+        .await;
+    assert_eq!(
+        (status, String::from_utf8_lossy(&body).as_ref()),
+        (400, "comments: more than 200")
+    );
+    assert_eq!(
+        fake.actions_for(ALICE).len(),
+        1,
+        "no refused review was sent"
+    );
+    // the daemon refusing the action: 502 with its message, nothing recorded
+    fake.fail_actions(Some("f/c/a: tmux send-keys: no window"));
+    let (status, body) = h
+        .post_route("/agents/e2e/c/alice/review", "/v1/plugins/web", &review)
+        .await;
+    assert_eq!(status, 502);
+    assert!(
+        String::from_utf8_lossy(&body).contains("no window"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    fake.fail_actions(None);
+    let text = h.metrics().await;
+    assert_eq!(
+        metric(
+            &text,
+            "hecaton_plugin_web_reviews_total",
+            &[("outcome", "sent")]
+        ),
+        Some(1.0)
+    );
+    assert_eq!(
+        metric(
+            &text,
+            "hecaton_plugin_web_reviews_total",
+            &[("outcome", "failed")]
+        ),
+        Some(1.0)
+    );
+    assert_eq!(
+        metric(&text, "hecaton_plugin_web_review_comments_total", &[]),
+        Some(1.0)
+    );
+    let (_, _, body) = h
+        .get_route("/agents/e2e/c/alice/events.json?after=1", "/v1/plugins/web")
+        .await;
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        v["events"].as_array().unwrap().is_empty(),
+        "a failed send adds no divider"
     );
 }
