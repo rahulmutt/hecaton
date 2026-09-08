@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use hecaton_api::{
     EntryKind, FileDiff, FileStatus, TreeEntry, WORKSPACE_FILE_COUNT_LIMIT, WORKSPACE_FILE_LIMIT,
@@ -15,7 +15,7 @@ use hecaton_api::{
 };
 use hecaton_core::{AgentId, WorkspaceError, WorkspaceReader};
 
-use crate::layout::CrewPaths;
+use crate::layout::{AgentPaths, CrewPaths};
 use crate::materializer::Runtime;
 use crate::tools::Cmd;
 
@@ -61,14 +61,14 @@ const DIFF_FLAGS: &[&str] = &[
 const FILTER_KEYS: &str = r"^(filter\..*\.(clean|smudge|process)|extensions\.worktreeconfig)$";
 
 impl Runtime {
-    /// The agent's worktree and crew paths; `Missing` when the worktree
+    /// The agent's paths and its crew's; `Missing` when the worktree
     /// directory does not exist (not materialized, or purged).
-    fn workspace_of(&self, agent: &AgentId) -> Result<(PathBuf, CrewPaths), WorkspaceError> {
+    fn workspace_of(&self, agent: &AgentId) -> Result<(AgentPaths, CrewPaths), WorkspaceError> {
         let paths = self.layout.agent(agent);
         if !paths.workspace.is_dir() {
             return Err(WorkspaceError::Missing(agent.to_string()));
         }
-        Ok((paths.workspace, self.layout.crew(&agent.crew_ref())))
+        Ok((paths, self.layout.crew(&agent.crew_ref())))
     }
 
     /// One git call in the worktree, logged to the crew's `git.log` with
@@ -78,11 +78,18 @@ impl Runtime {
     /// a review page's `diff.json` runs one `diff -U3` per file, up to
     /// 500 of them at 256 KiB each, and `Workspace::git`'s full-output
     /// logging would grow `git.log` by the whole diff on every fetch.
+    ///
+    /// `GIT_CEILING_DIRECTORIES` is the agent's own root, the parent of
+    /// `workspace/`: the agent owns the worktree and can delete its `.git`
+    /// file, and repository discovery would then walk up and run every
+    /// command here in whatever repository contains the state root. git
+    /// only honours a ceiling that matches the resolved path, so it is
+    /// canonical.
     fn inspect_git(
         &self,
         id: &str,
         crew: &CrewPaths,
-        workspace: &Path,
+        paths: &AgentPaths,
         args: &[&str],
         accepted: &[i32],
     ) -> Result<String, WorkspaceError> {
@@ -99,15 +106,20 @@ impl Runtime {
         ] {
             cmd = cmd.env_remove(var);
         }
+        let ceiling = paths
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| paths.root.clone());
         cmd = cmd
             .env("GIT_OPTIONAL_LOCKS", "0")
             .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CEILING_DIRECTORIES", ceiling.display().to_string())
             .args(CONFIG.iter().copied())
             .args([
                 "-c".to_string(),
                 format!("core.hooksPath={}", no_hooks.display()),
             ])
-            .args(["-C".to_string(), workspace.display().to_string()])
+            .args(["-C".to_string(), paths.workspace.display().to_string()])
             .args(args.iter().copied());
         cmd.run_with_exit_codes(accepted)
             .map(|o| o.stdout)
@@ -222,8 +234,8 @@ fn confine(workspace: &Path, full: &Path) -> Result<(), WorkspaceError> {
 impl WorkspaceReader for Runtime {
     fn diff(&self, agent: &AgentId, base_ref: &str) -> Result<WorkspaceDiff, WorkspaceError> {
         let id = agent.to_string();
-        let (ws, crew) = self.workspace_of(agent)?;
-        let git = |args: &[&str], ok: &[i32]| self.inspect_git(&id, &crew, &ws, args, ok);
+        let (paths, crew) = self.workspace_of(agent)?;
+        let git = |args: &[&str], ok: &[i32]| self.inspect_git(&id, &crew, &paths, args, ok);
         let filters = git(
             &[
                 "config",
@@ -308,7 +320,7 @@ impl WorkspaceReader for Runtime {
 
     fn read_file(&self, agent: &AgentId, path: &str) -> Result<Vec<u8>, WorkspaceError> {
         check_path(path).map_err(WorkspaceError::InvalidPath)?;
-        let (ws, _) = self.workspace_of(agent)?;
+        let ws = self.workspace_of(agent)?.0.workspace;
         let full = ws.join(path);
         let meta = meta_of(&full)?;
         if !meta.is_file() {
@@ -353,7 +365,7 @@ impl WorkspaceReader for Runtime {
 
     fn list_dir(&self, agent: &AgentId, path: &str) -> Result<WorkspaceTree, WorkspaceError> {
         check_path(path).map_err(WorkspaceError::InvalidPath)?;
-        let (ws, _) = self.workspace_of(agent)?;
+        let ws = self.workspace_of(agent)?.0.workspace;
         let full = if path.is_empty() {
             ws.clone()
         } else {

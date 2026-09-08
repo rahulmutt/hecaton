@@ -251,8 +251,12 @@ credentials, hook input, or sandbox rules.
   --ignore-submodules=dirty` to every `diff`: the crew's `.git/config` is
   agent-writable, and the last two keep git out of a nested repository the
   agent committed as a gitlink, whose own config (its `diff.external`) the
-  `-c` overrides reach but the argv flags do not. Keep those when adding a
-  git call there.
+  `-c` overrides reach but the argv flags do not. They also set
+  `GIT_CEILING_DIRECTORIES` to the agent's own root (canonical — git ignores
+  a ceiling that does not match the resolved path), so that deleting the
+  worktree's `.git` file makes git refuse instead of discovering the
+  repository that holds the state root. Keep those when adding a git call
+  there.
 - A workspace `diff` refuses with `repository config sets <key>; workspace
   diff refused` when the crew's `.git/config` declares a
   `filter.<x>.<clean|smudge|process>`, or when it sets

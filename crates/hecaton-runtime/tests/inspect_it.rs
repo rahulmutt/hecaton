@@ -370,4 +370,16 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
         matches!(&e, WorkspaceError::Tool { subcommand, .. } if subcommand == "merge-base"),
         "{e}"
     );
+
+    // Last, because it breaks the worktree: with its `.git` file deleted —
+    // the agent owns the worktree — git discovery would walk up and run
+    // every command below in whatever repository contains the state root
+    // (under `target/tmp`, this checkout). `GIT_CEILING_DIRECTORIES` stops
+    // it at the agent's root, so the first call fails instead.
+    std::fs::remove_file(w.join(".git")).unwrap();
+    let e = rt.diff(&id, "origin/main").unwrap_err();
+    assert!(
+        matches!(&e, WorkspaceError::Tool { subcommand, .. } if subcommand == "config"),
+        "{e}"
+    );
 }
