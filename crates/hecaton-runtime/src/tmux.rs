@@ -444,7 +444,9 @@ impl AgentRunner for TmuxRunner {
     /// wraps it in bracketed-paste markers when the application asked for
     /// them, which is how Claude Code takes a multi-line paste as one
     /// message; `-d` deletes the buffer. Buffer names are unique per
-    /// process so two concurrent sends cannot swap texts.
+    /// process so two concurrent sends cannot swap texts; on a failed
+    /// paste (the target window gone, say) the buffer is deleted before
+    /// the error is returned, so failures do not leak buffers.
     fn send_text(&self, agent: &AgentId, text: &str, submit: bool) -> Result<(), RunnerError> {
         let id = agent.to_string();
         let target = Self::window_target(agent);
@@ -455,10 +457,13 @@ impl AgentRunner for TmuxRunner {
                 SEND_SEQ.fetch_add(1, Ordering::Relaxed)
             );
             self.run(&id, &["set-buffer", "-b", &buffer, "--", text])?;
-            self.run(
+            if let Err(err) = self.run(
                 &id,
                 &["paste-buffer", "-p", "-d", "-b", &buffer, "-t", &target],
-            )?;
+            ) {
+                let _ = self.run(&id, &["delete-buffer", "-b", &buffer]);
+                return Err(err);
+            }
         } else {
             self.run(&id, &["send-keys", "-t", &target, "-l", "--", text])?;
         }

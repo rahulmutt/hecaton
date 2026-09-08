@@ -407,3 +407,43 @@ fn send_text_with_newlines_arrives_as_one_paste() {
     );
     r.stop_crew(&crew).unwrap();
 }
+
+/// A `paste-buffer` failure (the target window gone, an agent dying
+/// concurrently with a `send_text`) must not leak the buffer `set-buffer`
+/// created: `send_text` deletes it itself before returning the error.
+#[test]
+fn send_text_deletes_the_buffer_when_paste_buffer_fails() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("tmux", false));
+        return;
+    };
+    let socket = format!("hecaton-test-paste-fail-{}", std::process::id());
+    let _server = KillServer {
+        tmux: tools.tmux.clone(),
+        socket: socket.clone(),
+    };
+    let r = TmuxRunner::new(tools.tmux.clone(), socket.clone());
+    let id: AgentId = "f/c/a".parse().unwrap();
+    let crew = id.crew_ref();
+    // The crew session (and its anchor window) exists, but the agent's own
+    // window was never created, so `paste-buffer -t` targets a window that
+    // is not there.
+    r.ensure_crew(&crew).unwrap();
+
+    let result = r.send_text(&id, "line one\nline two", true);
+    assert!(
+        result.is_err(),
+        "paste-buffer at a missing window must fail"
+    );
+
+    let buffers = std::process::Command::new(&tools.tmux)
+        .args(["-L", &socket, "list-buffers"])
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&buffers.stdout).contains("hecaton-send-"),
+        "the buffer set-buffer created must not survive a failed paste: {}",
+        String::from_utf8_lossy(&buffers.stdout)
+    );
+    r.stop_crew(&crew).unwrap();
+}
