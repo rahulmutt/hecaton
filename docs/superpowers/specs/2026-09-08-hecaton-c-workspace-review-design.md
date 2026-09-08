@@ -375,11 +375,11 @@ in `plugin_api.rs`; the web plugin's 400s carry the field path
 
 ## 8. Verify at implementation time
 
-| Assumption | Fallback |
-|---|---|
-| Claude Code takes a tmux bracketed paste of a multi-line text as one message and `Enter` submits it | send the review as a single line with comments separated by ` · `, or write it to `home/hecaton/reviews/<ts>.md` and send a one-line pointer (a daemon write path — a spec change) |
-| `git diff --no-index -- /dev/null <path>` inside a worktree exits 1 with a usable `added` patch | `diff -U3 --no-index` against an empty temp file under the crew's `logs/` |
-| `-c core.fsmonitor=false` on the command line overrides a repo-level `core.fsmonitor=<script>` (git 2.47) | `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` in the environment |
+| Assumption | Fallback | Verdict |
+|---|---|---|
+| Claude Code takes a tmux bracketed paste of a multi-line text as one message and `Enter` submits it | send the review as a single line with comments separated by ` · `, or write it to `home/hecaton/reviews/<ts>.md` and send a one-line pointer (a daemon write path — a spec change) | Pending — by-hand run of `mise run verify-claude` (not run at implementation; tmux_it proves the buffer paste against `cat`) |
+| `git diff --no-index -- /dev/null <path>` inside a worktree exits 1 with a usable `added` patch | `diff -U3 --no-index` against an empty temp file under the crew's `logs/` | Verified 2026-09-08 (inspect_it: the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree) |
+| `-c core.fsmonitor=false` on the command line overrides a repo-level `core.fsmonitor=<script>` (git 2.47) | `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` in the environment | Verified 2026-09-08 (inspect_it: the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree) |
 
 ## 9. Build order
 
@@ -420,3 +420,27 @@ No write access of any kind, no `git log` or commits tab, no `?base=`
 override, no event persistence or history, no hunk expansion inline, no
 threading of the agent's reply back to a comment, no resolve state, no
 terminal in the review page, no per-plugin filesystem grants.
+
+## 12. Refinements from the plan (2026-09-08)
+
+- **`check_path` lives in `hecaton-api::workspace`**, not `hecaton-core`
+  (§3.1 said core): the web plugin validates comment paths with the same
+  rule and may depend on `hecaton-api` only; the function is pure, like
+  `ResizeFrame::parse` already there.
+- **The submission body carries `base_ref`** beside `head` (§4.4), so the
+  message header names the base without a second diff call.
+- **`Cmd::run_with_exit_codes`**: `git diff --no-index` exits 1 when the
+  files differ; the runtime treats that as the answer.
+- **A renamed file's per-file diff names both paths** (`-- <old> <new>`);
+  with the new path alone git reports an addition.
+- **`old_path` is always serialized**, `null` when absent, as §2.2's
+  example shows.
+- **`FakeHost::fail_actions`** stands in for a runner failure so the web
+  plugin's 502 path is tested through the harness.
+- **`Ports.workspace` landed with the daemon routes** (build order item 3,
+  not 1), since the binary wires it to the runtime implementation.
+- **§8 verdicts**: the `diff --no-index` and `core.fsmonitor=false`
+  assumptions are recorded at implementation, against real git
+  (`inspect_it`); the bracketed paste against the real `claude`
+  (`verify-claude`) is left pending — a by-hand run, not run at
+  implementation.

@@ -46,9 +46,10 @@ a repository.
 - `docs/plugin-protocol.md` — the wire contract for plugins in any language.
 
 ## Status
-Spec A and Spec B (plugins) are complete: plugin workloads, the event
-protocol, the `flow` and `web` plugins, the proxied plugin mount with
-browser sessions, attach and `fleets/watch`.
+Spec A, Spec B (plugins) and Spec C (workspace reads and browser code
+review) are complete: plugin workloads, the event protocol, the `flow` and
+`web` plugins, the proxied plugin mount with browser sessions, attach and
+`fleets/watch`, and the web plugin's review page.
 
 ### Upgrading to Spec B phase 1
 - Fleet files rename the reserved `flow: {}` settings block to `plugins: {}`
@@ -81,3 +82,13 @@ browser sessions, attach and `fleets/watch`.
 - `stop_crew` now kills every tmux session grouped with the crew's.
 - `mise run package-plugins` assembles `web` next to `flow`; `test` and
   `e2e` depend on it.
+
+### Upgrading to Spec C
+- `hecaton-plugin.yaml` may declare `needs: [workspace]` for the three
+  read-only worktree routes (plugin-protocol §3 "Workspace"). The web
+  plugin's manifest now declares `actions` and `workspace` and observes
+  every hook event; re-run `mise run package-plugins`.
+- `hecaton-plugin-sdk`: `Host::{workspace_diff, workspace_file,
+  workspace_tree}`, `FakeHost::{set_workspace, fail_actions}`,
+  `Harness::post_route` are new; nothing existing changed.
+- `send_text` with a newline is now a bracketed paste on tmux.

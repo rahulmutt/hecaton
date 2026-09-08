@@ -236,3 +236,16 @@ credentials, hook input, or sandbox rules.
   on `…Key=void 0`; `.gitleaks.toml` keeps the default ruleset and
   allowlists exactly the three vendored files by anchored path. Anything
   else under `assets/` is still scanned.
+- `send_text` with a newline goes through `set-buffer` + `paste-buffer -p -d`
+  (a bracketed paste), single lines through `send-keys -l`. The e2e's
+  `fake-claude` records a paste line by line; the real `claude` takes it as
+  one message (`verify-claude`).
+- Workspace git calls (`hecaton-runtime/src/inspect.rs`) set
+  `GIT_OPTIONAL_LOCKS=0` and `-c core.fsmonitor=false -c core.hooksPath=<empty>`
+  and pass `--no-ext-diff --no-textconv` to every `diff`: the crew's
+  `.git/config` is agent-writable. Keep those when adding a git call there.
+- A workspace route's two 404s differ on purpose: `no workspace for agent`
+  (no worktree yet) and `no such path`; the SDK maps only the second to
+  `None`.
+- `web`'s event buffer is memory only: after a plugin restart the review
+  page's column is empty until new events arrive (no observer catch-up).

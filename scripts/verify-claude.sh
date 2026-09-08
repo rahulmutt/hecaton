@@ -163,6 +163,9 @@ browser_login() {
   if [ -n "$LOGIN" ]; then
     say ">>> Open this once in a browser, now (valid 60 s; it becomes a session cookie):"
     say ">>>     $LOGIN"
+    say ">>> Then click 'review' beside $AGENT: comment on a line, add a summary, Send review."
+    say ">>> The verdict (Spec C §8): the agent's terminal shows ONE pasted message, and the"
+    say ">>> activity column shows 'review sent' followed by the agent's tool calls."
     say ">>> Through a reverse proxy: replace only the origin ($URL), keep the path and"
     say ">>> query. If the proxy signs you in first, or the code lapses, mint a fresh one:"
     say ">>>     XDG_STATE_HOME=$XDG_STATE_HOME $HECATON plugin open web"
