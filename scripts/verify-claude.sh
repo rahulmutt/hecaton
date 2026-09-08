@@ -8,9 +8,12 @@
 # read, whether onboarding appeared, and HOME relocation (nono's own $HOME).
 #
 # Your real $HOME stays: the client needs ~/.claude for credentials and the
-# host settings layer. Only the three XDG roots move to target/tmp/verify-claude,
-# so your real hecaton state is untouched. Nothing secret is printed: no
-# settings.json, no hosts.yml, no token, no hook secret.
+# host settings layer. Only the three XDG roots move: config and state to
+# target/tmp/verify-claude, wiped every run, and data to target/tmp/verify-data,
+# kept across runs so the pinned claude (a 200 MB download into the shared
+# MISE_DATA_DIR) is fetched once per version, not once per run. Your real
+# hecaton state is untouched. Nothing secret is printed: no settings.json,
+# no hosts.yml, no token, no hook secret.
 #
 # HECATON_VERIFY_FAKE=1 swaps in `hecaton dev fake-claude`, an empty tool table
 # and no host defaults — the maintainers' self-test of this script.
@@ -18,6 +21,7 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT="$REPO/target/tmp/verify-claude"
+DATA="$REPO/target/tmp/verify-data"   # survives runs: tool installs only
 FLEET=verify
 CREW=c
 AGENT=a
@@ -27,7 +31,7 @@ FAKE="${HECATON_VERIFY_FAKE:-0}"
 
 export XDG_CONFIG_HOME="$ROOT/xdg/config"
 export XDG_STATE_HOME="$ROOT/xdg/state"
-export XDG_DATA_HOME="$ROOT/xdg/data"
+export XDG_DATA_HOME="$DATA"
 unset HECATON_API_URL
 STATE="$XDG_STATE_HOME/hecaton"
 SERVER="$STATE/server"
@@ -53,7 +57,8 @@ cleanup() {
     fi
   fi
   tmux -L "$SOCKET" kill-server >/dev/null 2>&1 || true
-  say "state kept for inspection under $STATE (delete target/tmp/verify-claude when done)"
+  say "state kept for inspection under $STATE (delete target/tmp/verify-claude when done;"
+  say "tool installs stay in target/tmp/verify-data so the next run skips the download)"
 }
 trap cleanup EXIT
 

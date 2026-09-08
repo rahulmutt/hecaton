@@ -79,5 +79,5 @@ run = [
 ]
 
 [tasks.verify-claude]
-description = "By-hand spec §8.1 check: a real claude under a scratch daemon (XDG roots under target/tmp/verify-claude, your HOME kept for credentials); pauses for you to attach and type one prompt, then prints a report to paste back"
+description = "By-hand spec §8.1 check: a real claude under a scratch daemon (config and state under target/tmp/verify-claude, wiped each run; tool installs kept under target/tmp/verify-data; your HOME kept for credentials); pauses for you to attach and type one prompt, then prints a report to paste back"
 run = "scripts/verify-claude.sh"
