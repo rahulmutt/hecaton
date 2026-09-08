@@ -54,6 +54,7 @@ pub(crate) struct Cmd {
     env_removals: Vec<String>,
     cwd: Option<PathBuf>,
     log: Option<PathBuf>,
+    log_stdout: bool,
 }
 
 #[derive(Debug)]
@@ -90,6 +91,7 @@ impl Cmd {
             env_removals: Vec::new(),
             cwd: None,
             log: None,
+            log_stdout: true,
         }
     }
     pub(crate) fn args<I: IntoIterator<Item = S>, S: Into<String>>(mut self, a: I) -> Self {
@@ -120,6 +122,17 @@ impl Cmd {
     /// Append `$ argv`, stdout and stderr to this file after the run.
     pub(crate) fn log(mut self, file: &Path) -> Self {
         self.log = Some(file.to_path_buf());
+        self.log_stdout = true;
+        self
+    }
+    /// `log` without the stdout: `$ argv`, stderr and the exit status
+    /// only. For a command whose output is the payload of a request
+    /// rather than a trace worth keeping — `inspect.rs` runs one
+    /// `diff -U3` per file per page load, and logging those would grow the
+    /// crew's `git.log` by the whole diff on every fetch.
+    pub(crate) fn log_argv_only(mut self, file: &Path) -> Self {
+        self.log = Some(file.to_path_buf());
+        self.log_stdout = false;
         self
     }
     pub(crate) fn tool(&self) -> String {
@@ -219,9 +232,10 @@ impl Cmd {
                 let _ = std::fs::create_dir_all(dir);
             }
             if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(log) {
+                let logged_stdout = if self.log_stdout { stdout.as_str() } else { "" };
                 let _ = writeln!(
                     f,
-                    "$ {} {}\n{stdout}{stderr}[exit {}]",
+                    "$ {} {}\n{logged_stdout}{stderr}[exit {}]",
                     self.tool(),
                     self.args.join(" "),
                     out.status
@@ -294,6 +308,32 @@ mod tests {
         assert!(logged.contains("$ sh -c echo out"));
         assert!(logged.contains("err\n"), "stderr is logged even on success");
         assert!(logged.contains("[exit exit status: 3]"));
+    }
+
+    /// `log_argv_only` keeps the command and its exit status (and stderr,
+    /// which a failure needs) but never the stdout: `inspect.rs` logs one
+    /// `diff -U3` per file per page load, and the full diffs would grow
+    /// `git.log` by megabytes a fetch.
+    #[test]
+    fn an_argv_only_log_records_the_command_and_exit_but_no_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("logs").join("git.log");
+        // The marker is upper-cased by the command, so it appears in the
+        // stdout but not in the argv the log does keep.
+        let out = Cmd::new(Path::new("/bin/sh"))
+            .args(["-c", "echo the-diff | tr a-z A-Z; echo loud >&2"])
+            .log_argv_only(&log)
+            .run()
+            .unwrap();
+        assert_eq!(out.stdout, "THE-DIFF\n", "the caller still gets stdout");
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !logged.contains("THE-DIFF"),
+            "stdout must not be logged: {logged:?}"
+        );
+        assert!(logged.contains("$ sh -c echo the-diff | tr a-z A-Z; echo loud >&2"));
+        assert!(logged.contains("loud\n"), "stderr is still logged");
+        assert!(logged.contains("[exit exit status: 0]"));
     }
 
     #[test]

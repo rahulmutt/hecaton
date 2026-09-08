@@ -451,3 +451,15 @@ terminal in the review page, no per-plugin filesystem grants.
   an argument. `send_text` fills the buffer with `load-buffer -b
   hecaton-send-<n> -` and hands the text to the client on its stdin; the
   `paste-buffer -p -d` and the delete-on-failure cleanup are unchanged.
+- **`inspect.rs` logs its git calls argv-only** (§3.2): the crew's
+  `git.log` keeps `$ argv`, stderr and the exit status, not the stdout.
+  `Workspace::git`'s full-output logging is unchanged, but one `diff.json`
+  fetch runs up to 500 `diff -U3` calls of 256 KiB each, and logging those
+  would grow the file by the whole diff on every page load
+  (`Cmd::log_argv_only`).
+- **`read_file` checks the open handle, not the path** (§3.2): after
+  `check_path`, `symlink_metadata` and the canonical-prefix check it opens
+  the file once and requires the handle to be a regular file with the same
+  `(dev, ino)`, then takes the size from that handle and reads from it —
+  the agent owns the worktree and could otherwise swap the final component
+  for a symlink between the check and the read.

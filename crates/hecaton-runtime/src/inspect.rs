@@ -5,6 +5,8 @@
 //! daemon.
 
 use std::collections::BTreeSet;
+use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use hecaton_api::{
@@ -41,9 +43,13 @@ impl Runtime {
         Ok((paths.workspace, self.layout.crew(&agent.crew_ref())))
     }
 
-    /// One git call in the worktree, logged to the crew's `git.log` like
-    /// `Workspace::git`, with the same `GIT_*` scrub, no optional locks,
-    /// fsmonitor off and hooks pointed at an empty directory.
+    /// One git call in the worktree, logged to the crew's `git.log` with
+    /// the same `GIT_*` scrub as `Workspace::git`, no optional locks,
+    /// fsmonitor off and hooks pointed at an empty directory. The log
+    /// keeps the argv, stderr and the exit status but not the stdout:
+    /// a review page's `diff.json` runs one `diff -U3` per file, up to
+    /// 500 of them at 256 KiB each, and `Workspace::git`'s full-output
+    /// logging would grow `git.log` by the whole diff on every fetch.
     fn inspect_git(
         &self,
         id: &str,
@@ -54,7 +60,8 @@ impl Runtime {
     ) -> Result<String, WorkspaceError> {
         let no_hooks = crew.root.join("no-hooks");
         let _ = std::fs::create_dir_all(&no_hooks);
-        let mut cmd = Cmd::new(&self.tools.git).log(&crew.root.join("logs").join("git.log"));
+        let mut cmd =
+            Cmd::new(&self.tools.git).log_argv_only(&crew.root.join("logs").join("git.log"));
         for var in [
             "GIT_DIR",
             "GIT_WORK_TREE",
@@ -259,12 +266,40 @@ impl WorkspaceReader for Runtime {
             return Err(WorkspaceError::NotAFile);
         }
         confine(&ws, &full)?;
-        if meta.len() > WORKSPACE_FILE_LIMIT {
-            return Err(WorkspaceError::TooLarge {
-                limit: WORKSPACE_FILE_LIMIT,
-            });
+        // The checks above ran on a path; the agent owns the worktree and
+        // can replace that file with a symlink to /etc/shadow between them
+        // and the open. So open once and check the *handle*: it must be a
+        // regular file and the very inode the `symlink_metadata` above
+        // described, and the size check and the bytes both come from it.
+        // (An `O_NOFOLLOW` open would say the same in one step, but that
+        // needs a `libc` dependency this workspace does not have.)
+        let file = std::fs::File::open(&full).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                WorkspaceError::NoSuchPath
+            } else {
+                io_error(&full, e)
+            }
+        })?;
+        let opened = file.metadata().map_err(|e| io_error(&full, e))?;
+        if !opened.is_file() || (opened.dev(), opened.ino()) != (meta.dev(), meta.ino()) {
+            return Err(WorkspaceError::NotAFile);
         }
-        std::fs::read(&full).map_err(|e| io_error(&full, e))
+        let too_large = WorkspaceError::TooLarge {
+            limit: WORKSPACE_FILE_LIMIT,
+        };
+        if opened.len() > WORKSPACE_FILE_LIMIT {
+            return Err(too_large);
+        }
+        // The file can still grow between that `fstat` and the read, so the
+        // read itself is bounded rather than trusting the size.
+        let mut buf = Vec::new();
+        file.take(WORKSPACE_FILE_LIMIT + 1)
+            .read_to_end(&mut buf)
+            .map_err(|e| io_error(&full, e))?;
+        if buf.len() as u64 > WORKSPACE_FILE_LIMIT {
+            return Err(too_large);
+        }
+        Ok(buf)
     }
 
     fn list_dir(&self, agent: &AgentId, path: &str) -> Result<WorkspaceTree, WorkspaceError> {
