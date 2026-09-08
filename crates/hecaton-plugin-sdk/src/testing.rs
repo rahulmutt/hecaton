@@ -19,10 +19,11 @@ use axum::{Json, Router};
 use hecaton_api::{
     CHAIN_BUDGET_MS, EntryKind, ErrorBody, FleetRecord, HelloRequest, HelloResponse, HookEvent,
     InterceptRequest, InterceptResponse, KvKeys, PluginAction, ResizeFrame, TextFrame, Timestamp,
-    TreeEntry, WorkspaceDiff, WorkspaceTree,
+    TreeEntry, WorkspaceDiff, WorkspaceTree, WorkspaceVersion,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, watch};
 
 use crate::{Env, Host, Plugin, SdkError, bind, run};
@@ -271,6 +272,10 @@ fn router(inner: Arc<Inner>) -> Router {
         .route(
             "/v1/plugin-host/agents/{fleet}/{crew}/{agent}/workspace/tree",
             get(workspace_tree),
+        )
+        .route(
+            "/v1/plugin-host/agents/{fleet}/{crew}/{agent}/workspace/version",
+            get(workspace_version),
         )
         .route("/v1/plugin-host/kv", get(list_keys))
         .route(
@@ -566,6 +571,35 @@ async fn workspace_tree(
             Some(tree) => Json(tree).into_response(),
             None => error(StatusCode::NOT_FOUND, "no such path"),
         }
+    })
+}
+
+/// The same derivation as `hecaton_core::fakes::fake_fingerprint` (this
+/// crate may not depend on core): `sha256(head \0 (path \0 bytes \0)*)`.
+/// `docs/plugin-protocol/workspace-version.json` holds it for its files.
+fn fake_fingerprint(head: &str, files: &BTreeMap<String, Vec<u8>>) -> String {
+    let mut h = Sha256::new();
+    h.update(head.as_bytes());
+    h.update([0]);
+    for (path, bytes) in files {
+        h.update(path.as_bytes());
+        h.update([0]);
+        h.update(bytes);
+        h.update([0]);
+    }
+    hex::encode(h.finalize())
+}
+
+async fn workspace_version(
+    State(inner): State<Arc<Inner>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<(String, String, String)>,
+) -> Response {
+    with_workspace(&inner, &headers, id, |diff, files| {
+        Json(WorkspaceVersion {
+            head: diff.head.clone(),
+            fingerprint: fake_fingerprint(&diff.head, files),
+        })
     })
 }
 

@@ -155,6 +155,9 @@ async fn workspace_routes_are_gated_by_capability_activation_and_the_path_rule()
     let tree = web.workspace_tree("f/c/a", "").await.unwrap();
     assert_eq!(tree.entries.len(), 2);
     assert_eq!(tree.entries[1].name, "src");
+    let ver = web.workspace_version("f/c/a").await.unwrap();
+    assert_eq!(ver.head, "h".repeat(40));
+    assert_eq!(ver.fingerprint.len(), 64);
     // the version: the diff's head and a 64-hex fingerprint over the files
     let web_tok = token(&w, "web").await;
     let flow_tok = token(&w, "flow").await;

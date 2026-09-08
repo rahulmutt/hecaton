@@ -62,6 +62,7 @@ daemon by `crates/hecaton-server/tests/events_it.rs` (§6).
 | `GET agents/{fleet}/{crew}/{agent}/workspace/diff` | `workspace` | — | `WorkspaceDiff` | 200 | `workspace-diff.json` |
 | `GET agents/…/workspace/file?path=<rel>` | `workspace` | — | raw bytes | 200 | `workspace-file.json` |
 | `GET agents/…/workspace/tree?path=<rel>` | `workspace` | — | `{ path, entries }` | 200 | `workspace-tree.json` |
+| `GET agents/…/workspace/version` | `workspace` | — | `{ head, fingerprint }` | 200 | `workspace-version.json` |
 | `GET agents/…/workspace/*`, agent not active for this plugin | `workspace` | — | `{ "error": "plugin is not active for agent <id>" }` | 404 | (as for actions) |
 | `GET agents/…/workspace/*`, no worktree yet | `workspace` | — | `{ "error": "no workspace for agent <id>" }` | 404 | (asserted by `workspace_it.rs`, §6) |
 | `POST agents/{fleet}/{crew}/{agent}/actions` | `actions` | one of the three action shapes below | `{}` | 200 | `action.json` |
@@ -119,6 +120,10 @@ recursive); the empty path is the root. `path` is relative, `/`-separated,
 at most 4096 bytes, with no empty, `.` or `..` segment, no `\`, no NUL and
 no `.git` segment, else 400 `workspace: invalid path: <reason>`. Two 404
 texts: `no workspace for agent <id>` (no worktree) and `no such path`.
+`version` (Spec D) answers `{ head, fingerprint }`: `head` is the
+worktree's `HEAD`, `fingerprint` 64 hex chars over `HEAD`, the merge-base
+and the size and mtime of every changed or untracked path — equal values
+mean `diff` would answer the same; compare, never parse.
 
 ## 4. Daemon → plugin
 
@@ -230,7 +235,7 @@ never activates simply never runs for that agent.
 
 ## 6. Conformance
 
-`docs/plugin-protocol/*.json` holds twenty-one fixtures, one JSON object
+`docs/plugin-protocol/*.json` holds twenty-two fixtures, one JSON object
 each: `{ route, direction, request, status, response }` for
 `daemon-to-plugin` and most `plugin-to-daemon` routes; `raw` (base64)
 replaces `request`/`response` for the kv byte bodies, `health.json` and

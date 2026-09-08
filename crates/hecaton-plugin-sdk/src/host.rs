@@ -9,7 +9,7 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use hecaton_api::{
     ErrorBody, FleetRecord, HelloRequest, HelloResponse, KvKeys, PLUGIN_PROTOCOL, PluginAction,
-    ResizeFrame, WorkspaceDiff, WorkspaceTree,
+    ResizeFrame, WorkspaceDiff, WorkspaceTree, WorkspaceVersion,
 };
 use serde::de::DeserializeOwned;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -242,6 +242,18 @@ impl Host {
             "agents/{agent}/workspace/tree?path={}",
             urlencode(path)
         ))))
+        .await
+    }
+
+    /// `GET agents/{id}/workspace/version` (Spec D §2.2): a cheap
+    /// fingerprint of the worktree; equal values mean `workspace_diff`
+    /// would answer the same. 404 `no workspace for agent …` before the
+    /// worktree exists.
+    pub async fn workspace_version(&self, agent: &str) -> Result<WorkspaceVersion, SdkError> {
+        self.json(
+            self.http
+                .get(self.url(&format!("agents/{agent}/workspace/version"))),
+        )
         .await
     }
 

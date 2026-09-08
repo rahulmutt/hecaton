@@ -24,7 +24,7 @@ fn fixtures() -> BTreeMap<String, Value> {
     }
     assert_eq!(
         out.len(),
-        21,
+        22,
         "every fixture accounted for: {:?}",
         out.keys()
     );
@@ -270,6 +270,23 @@ async fn the_host_sends_every_plugin_to_daemon_fixture_and_reads_the_answer() {
         )
         .unwrap(),
         fx["workspace-tree"]["response"]
+    );
+    assert_eq!(
+        serde_json::to_value(
+            host.workspace_version("payments/backend/bob")
+                .await
+                .unwrap()
+        )
+        .unwrap(),
+        fx["workspace-version"]["response"]
+    );
+    let e = host
+        .workspace_version("payments/backend/nobody")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "daemon: HTTP 404: no workspace for agent payments/backend/nobody"
     );
     // an agent with no workspace is the other 404, surfaced as an error
     let e = host
