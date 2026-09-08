@@ -483,8 +483,15 @@ async function pollEvents() {{
       latestFp = w.fingerprint;
       if (w.fingerprint !== rendered && !(pendingDiff && pendingDiff.fp === w.fingerprint) && !fetching) {{
         fetching = true;
-        try {{ pendingDiff = {{ diff: await fetchDiff(), fp: w.fingerprint }}; }}
-        catch (e) {{ console.warn("diff", e); }}
+        try {{
+          pendingDiff = {{ diff: await fetchDiff(), fp: w.fingerprint }};
+          const banner = document.getElementById("banner");
+          if (banner.textContent.startsWith("diff: ")) banner.textContent = "";
+        }}
+        catch (e) {{
+          if (diff === null) {{ const banner = document.getElementById("banner"); banner.style.color = "#b00"; banner.textContent = "diff: " + e.message; }}
+          else console.warn("diff", e);
+        }}
         finally {{ fetching = false; }}
       }}
     }} else if (diff === null && !fetching) {{
