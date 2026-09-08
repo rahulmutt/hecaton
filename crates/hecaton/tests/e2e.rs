@@ -1534,6 +1534,39 @@ fn web_journey() {
             .any(|e| e["name"] == "PreToolUse"),
         "{events}"
     );
+    // the version rides on events.json and changes when the worktree does
+    let fp0 = events["workspace"]["fingerprint"]
+        .as_str()
+        .unwrap_or_else(|| panic!("workspace in {events}"))
+        .to_string();
+    assert_eq!(fp0.len(), 64);
+    assert_eq!(events["workspace"]["head"], diff["head"]);
+    fs::write(
+        w.agent_dir("alice").join("workspace/NOTES.md"),
+        "agent notes\nmore\n",
+    )
+    .unwrap();
+    let (_, _, body) = raw_get(
+        &format!("{mount}agents/e2e/c/alice/events.json"),
+        &[("Cookie", &cookie)],
+    );
+    let again: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_ne!(again["workspace"]["fingerprint"], fp0, "{again}");
+    let (_, _, body) = raw_get(
+        &format!("{mount}agents/e2e/c/alice/diff.json"),
+        &[("Cookie", &cookie)],
+    );
+    let diff2: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let notes2 = diff2["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == "NOTES.md")
+        .unwrap();
+    assert!(
+        notes2["patch"].as_str().unwrap().contains("+more"),
+        "{notes2}"
+    );
     let review = serde_json::json!({
         "head": diff["head"],
         "base_ref": diff["base_ref"],
@@ -1609,6 +1642,7 @@ fn web_journey() {
             && m.contains("hecaton_plugin_web_terminals_total 1")
             && m.contains("hecaton_plugin_web_terminals_open 0")
             && m.contains("hecaton_plugin_web_reviews_total{outcome=\"sent\"} 1")
+            && m.contains("hecaton_plugin_web_diff_refreshes_total")
         {
             break;
         }

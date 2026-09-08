@@ -170,10 +170,10 @@ the fingerprint through `textContent` like every other value.
 
 ## 7. Verify at implementation time
 
-| Assumption | Fallback |
-|---|---|
-| `symlink_metadata().modified()` has sub-second resolution on the host filesystem, so an edit within the same second still changes the fingerprint | hash the first 4 KiB of each changed file as well |
-| Scrolling the previously-top file header back into view after a render feels stable in the browser | restore the raw `scrollTop` only |
+| Assumption | Fallback | Verdict |
+|---|---|---|
+| `symlink_metadata().modified()` has sub-second resolution on the host filesystem, so an edit within the same second still changes the fingerprint | hash the first 4 KiB of each changed file as well | Verified 2026-09-08 (inspect_it: an edit within the same second changed the fingerprint) |
+| Scrolling the previously-top file header back into view after a render feels stable in the browser | restore the raw `scrollTop` only | Pending — by-hand `verify-claude` |
 
 ## 8. Build order
 
@@ -201,3 +201,11 @@ the fingerprint through `textContent` like every other value.
 
 No server push (WebSocket or SSE) for the diff; no per-file incremental
 rendering; no history of versions; no change to the submission.
+
+## 11. Refinements from the plan (2026-09-08)
+
+- **`diff_refreshes_total` counts `diff.json` responses**, the one server-side event per refresh; the browser's applies are not observable.
+- **The fakes' fingerprint** is `sha256(head \0 (path \0 bytes \0)*)` over the file map, in core and in the SDK alike, so `workspace-version.json` holds a derivable value.
+- **The first diff comes from the first poll**, which carries the fingerprint; `loadDiff()` is the manual reload and the path that shows a daemon refusal in the banner.
+- **`anchorComments` is checked with `node` by hand** (not a `mise.toml` tool); the Rust test asserts the function's presence.
+- **`save()` strips `editing` and `typing`**, so a reload never reopens a comment box (a Spec C deferred minor).

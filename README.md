@@ -92,3 +92,9 @@ review) are complete: plugin workloads, the event protocol, the `flow` and
   workspace_tree}`, `FakeHost::{set_workspace, fail_actions}`,
   `Harness::post_route` are new; nothing existing changed.
 - `send_text` with a newline is now a bracketed paste on tmux.
+
+### Upgrading to Spec D
+- `GET agents/…/workspace/version` is a fourth `workspace` route
+  (plugin-protocol §3); `Host::workspace_version` is new; nothing existing
+  changed. The web plugin's `events.json` gains a `workspace` field; re-run
+  `mise run package-plugins`.

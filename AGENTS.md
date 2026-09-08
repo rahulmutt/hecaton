@@ -270,5 +270,11 @@ credentials, hook input, or sandbox rules.
 - A workspace route's two 404s differ on purpose: `no workspace for agent`
   (no worktree yet) and `no such path`; the SDK maps only the second to
   `None`.
+- The workspace `version` fingerprint covers `HEAD`, the merge-base and the
+  size and mtime of every changed or untracked path — content, not index
+  state: a byte-identical `git add` is invisible by design, and a same-size
+  rewrite within the filesystem's mtime resolution is the theoretical miss.
+  The review page applies a changed diff automatically (3 s rate limit),
+  but never while a comment box is open.
 - `web`'s event buffer is memory only: after a plugin restart the review
   page's column is empty until new events arrive (no observer catch-up).

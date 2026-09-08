@@ -140,11 +140,14 @@ reads an agent's worktree through the daemon — `GET
 through the `WorkspaceReader` port, which the runtime implements over
 `git` in the worktree with the repository's config escape hatches
 closed. The diff is the worktree against the merge-base with
-`origin/<crew ref>`, committed, uncommitted and untracked alike. `web`
-observes every hook event into a per-agent buffer and serves a review
-page: the diff with line comments, a collapsible activity column, and a
-submit that renders one message and sends it through `send_text`, which
-tmux delivers as a bracketed paste when the text has newlines.
+`origin/<crew ref>`, committed, uncommitted and untracked alike. A
+fourth route, `version`, answers a cheap fingerprint of the worktree
+(Spec D) that the review page polls through `events.json` to refresh
+the diff live. `web` observes every hook event into a per-agent buffer
+and serves a review page: the diff with line comments, a collapsible
+activity column, and a submit that renders one message and sends it
+through `send_text`, which tmux delivers as a bracketed paste when the
+text has newlines.
 
 ## Non-obvious decisions
 - **Merge is a left fold, not associative.** `null` means "delete relative to the
