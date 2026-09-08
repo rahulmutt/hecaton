@@ -252,8 +252,13 @@ pub fn package_command(args: &PluginPackageArgs) -> Result<String> {
 /// plugin's mount. Nothing is launched.
 pub fn open_command(args: &PluginOpenArgs) -> Result<String> {
     let client = Client::connect(args.api_url.as_deref())?;
-    let name: hecaton_core::AgentName = args
-        .name
+    open_with(&client, &args.name)
+}
+
+/// The command against a connected client: the name is validated here,
+/// the mount root gains its slash (a bare mount is the admin purge route).
+fn open_with(client: &Client, name: &str) -> Result<String> {
+    let name: hecaton_core::AgentName = name
         .parse()
         .map_err(|e: hecaton_core::NameError| anyhow!("plugin name: {e}"))?;
     Ok(format!(
@@ -266,6 +271,32 @@ pub fn open_command(args: &PluginOpenArgs) -> Result<String> {
 mod tests {
     use super::*;
     use hecaton_api::AgentPhase;
+
+    #[test]
+    fn open_asks_for_a_session_on_the_mount_root_and_prints_the_url() {
+        let (url, rx) = crate::testutil::stub_server(
+            "200 OK",
+            r#"{"login_url":"http://127.0.0.1:7643/v1/login/abc123?to=/v1/plugins/web/"}"#,
+        );
+        let client = Client::new(url, "t".into());
+        assert_eq!(
+            open_with(&client, "web").unwrap(),
+            "http://127.0.0.1:7643/v1/login/abc123?to=/v1/plugins/web/\n"
+        );
+        let raw = rx.recv().unwrap();
+        assert!(raw.starts_with("POST /v1/sessions HTTP/1.1"), "{raw}");
+        let body: serde_json::Value =
+            serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body, serde_json::json!({ "to": "/v1/plugins/web/" }));
+        // a bad name never reaches the daemon
+        let e = open_with(
+            &Client::new("http://127.0.0.1:1".into(), "t".into()),
+            "Nope",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.starts_with("plugin name: "), "{e}");
+    }
 
     #[test]
     fn renders_the_plugin_table_and_sync_report() {

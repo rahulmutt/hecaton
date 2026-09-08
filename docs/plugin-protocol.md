@@ -213,7 +213,7 @@ each: `{ route, direction, request, status, response }` for
 `daemon-to-plugin` and most `plugin-to-daemon` routes; `raw` (base64)
 replaces `request`/`response` for the kv byte bodies, `health.json` and
 `metrics.json`; `hello-bad-token.json` additionally carries a top-level
-`"token"` to send instead of the real one. daemon-to-plugin fixtures also
+`"token"` to send instead of the real one. Daemon-to-plugin fixtures also
 carry `headers`, the request headers the daemon sends.
 
 Fixtures with `"transport": "websocket"` (`attach-resize.json`,
@@ -222,7 +222,8 @@ are asserted by the SDK's stream test against `FakeHost`; `routes.json`
 is replayed through the SDK router alone — the daemon's proxy forwards
 requests unparsed.
 
-Two tests replay every fixture:
+Two tests replay the request/response fixtures (every fixture but the
+three just named):
 
 - `crates/hecaton-plugin-sdk/tests/conformance.rs` — every
   `daemon-to-plugin` fixture through the SDK's `router` (a real HTTP round

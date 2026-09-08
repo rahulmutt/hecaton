@@ -124,7 +124,7 @@ and passes a 101 through as raw bytes. A browser gets in through `hecaton
 plugin open <name>`: a 60 s single-use code becomes a 12 h in-memory
 session cookie, accepted on the mount from the daemon's origin only.
 Every daemon → plugin call now carries the plugin's own token and the SDK
-router checks it. `GET /v1/plugin-host/agents/{id}/attach` bridges a
+router checks it. `GET /v1/plugin-host/agents/{fleet}/{crew}/{agent}/attach` bridges a
 WebSocket to `AgentRunner::attach` — on tmux a throwaway session grouped
 with the crew's, in a `portable-pty` PTY — and `fleets/watch` sends the
 whole fleets list on every actor snapshot or activation change. `web`

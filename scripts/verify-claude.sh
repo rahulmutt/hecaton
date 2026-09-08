@@ -197,7 +197,7 @@ else
   say
   say ">>> Now attach in another terminal:"
   say ">>>     tmux -L $SOCKET attach -t $FLEET/$CREW"
-  say ">>> or click $AGENT on the browser page above and type there."
+  if [ "$WEB" = 1 ]; then say ">>> or click $AGENT on the browser page above and type there."; fi
   say ">>> Wait for Claude's prompt, type one message (e.g. \"say hi\"), wait for the reply,"
   say ">>> detach with Ctrl-b then d, and come back here."
   ONBOARD=""

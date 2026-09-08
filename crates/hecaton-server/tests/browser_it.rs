@@ -37,12 +37,19 @@ async fn a_login_code_becomes_a_cookie_once() {
     );
     assert_eq!(s, 200, "{v}");
     let url = v["login_url"].as_str().unwrap().to_string();
+    // the harness origin is a placeholder (the e2e checks the real one);
+    // what is asserted here is the path: a login route with a code in it
+    let path = url.trim_start_matches(w.daemon.origin()).to_string();
+    let code = path
+        .strip_prefix("/v1/login/")
+        .and_then(|rest| rest.split_once('?'))
+        .map(|(code, _)| code)
+        .unwrap_or_else(|| panic!("a login path: {url}"));
     assert!(
-        url.starts_with(&format!("{}/v1/login/", w.daemon.origin())),
+        !code.is_empty() && code.chars().all(|c| c.is_ascii_alphanumeric()),
         "{url}"
     );
     assert!(url.ends_with("?to=/v1/plugins/web/"), "{url}");
-    let path = url.trim_start_matches(w.daemon.origin()).to_string();
     let (s, _) = w.api.call("POST", "/v1/sessions", None, Some(&json!({})));
     assert_eq!(s, 401, "admin only");
     let (s, v) = w
