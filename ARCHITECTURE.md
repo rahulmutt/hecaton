@@ -272,7 +272,9 @@ tmux delivers as a bracketed paste when the text has newlines.
   would sit beside `home/`; the typed routes keep one audited set of git
   invocations, in a repository an agent can write to (Spec C PC-1, PC-2).
 - **A review is a paste.** The review reaches the agent as one
-  `send_text`; `TmuxRunner` sends multi-line text through a named buffer
-  and `paste-buffer -p`, so Claude Code takes it as one message; a
-  literal newline through `send-keys -l` is Ctrl-J to the application
-  (Spec C PC-5).
+  `send_text`; `TmuxRunner` fills a named buffer with `load-buffer -`
+  from the tmux client's stdin (an argv over 16 KiB is refused, and a
+  review may be 64 KiB) and sends it with `paste-buffer -p`, which Claude
+  Code is expected to take as one message — verify with `mise run
+  verify-claude` (Spec C §8, pending). A literal newline through
+  `send-keys -l` is Ctrl-J to the application (Spec C PC-5).
