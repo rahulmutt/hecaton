@@ -1642,7 +1642,7 @@ fn web_journey() {
             && m.contains("hecaton_plugin_web_terminals_total 1")
             && m.contains("hecaton_plugin_web_terminals_open 0")
             && m.contains("hecaton_plugin_web_reviews_total{outcome=\"sent\"} 1")
-            && m.contains("hecaton_plugin_web_diff_refreshes_total")
+            && m.contains("hecaton_plugin_web_diff_refreshes_total 2")
         {
             break;
         }

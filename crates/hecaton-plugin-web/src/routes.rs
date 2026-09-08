@@ -307,7 +307,7 @@ function anchorComments(diff, comments) {{
     if (l.kind === "meta") continue;
     exact.add(f.path + " " + l.side + " " + l.line + " " + l.text);
     const k = f.path + " " + l.side + " " + l.text;
-    byText.set(k, (byText.get(k) || []).concat([l.line]));
+    const a = byText.get(k); if (a) a.push(l.line); else byText.set(k, [l.line]);
   }}
   const stale = [];
   for (const c of comments) {{
@@ -377,6 +377,7 @@ function render() {{
   if (!diff) {{ root.appendChild(el("p", "", "loading diff...")); return; }}
   document.getElementById("meta").textContent = "against " + diff.base_ref + " at " + diff.head.slice(0, 7) + (diff.truncated ? " (file list truncated)" : "");
   const stale = anchorComments(diff, draft.comments);
+  for (const c of stale) {{ delete c.editing; delete c.typing; }}
   save();
   if (stale.length) {{
     const box = el("div"); box.id = "stale"; box.appendChild(el("strong", "", "no longer in the diff (still sent):"));

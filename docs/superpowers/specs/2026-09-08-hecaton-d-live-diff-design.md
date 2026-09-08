@@ -209,3 +209,4 @@ rendering; no history of versions; no change to the submission.
 - **The first diff comes from the first poll**, which carries the fingerprint; `loadDiff()` is the manual reload and the path that shows a daemon refusal in the banner.
 - **`anchorComments` is checked with `node` by hand** (not a `mise.toml` tool); the Rust test asserts the function's presence.
 - **`save()` strips `editing` and `typing`**, so a reload never reopens a comment box (a Spec C deferred minor).
+- **The mtime is hashed as `{seconds}.{nanoseconds:09}`** (`(size, mtime, mtime_nsec)` from `symlink_metadata`), information-equivalent to §2.3's nanoseconds since the epoch.

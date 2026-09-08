@@ -234,6 +234,16 @@ async fn workspace_routes_are_gated_by_capability_activation_and_the_path_rule()
     let (s, v) = w.api.plugin(
         &web_tok,
         "GET",
+        "/v1/plugin-host/agents/f/c/zed/workspace/version",
+        None,
+    );
+    assert_eq!(
+        (s, v["error"].as_str()),
+        (404, Some("plugin is not active for agent f/c/zed"))
+    );
+    let (s, v) = w.api.plugin(
+        &web_tok,
+        "GET",
         "/v1/plugin-host/agents/f/c/a/workspace/file?path=big",
         None,
     );
