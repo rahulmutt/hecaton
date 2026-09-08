@@ -376,3 +376,94 @@ async fn observed_events_feed_the_activity_column_of_enabled_agents() {
         Some(3.0)
     );
 }
+
+fn sample_diff() -> hecaton_api::WorkspaceDiff {
+    use hecaton_api::{FileDiff, FileStatus, WorkspaceDiff};
+    WorkspaceDiff {
+        base_ref: "origin/main".into(),
+        merge_base: "m".repeat(40),
+        head: "3f9c2a1".to_string() + &"0".repeat(33),
+        files: vec![FileDiff {
+            path: "src/lib.rs".into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            uncommitted: true,
+            binary: false,
+            patch: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n fn a() {}\n-fn b() {}\n+fn b() { c() }\n".into(),
+            truncated: false,
+        }],
+        truncated: false,
+    }
+}
+
+#[tokio::test]
+async fn the_review_page_and_its_data_routes_pass_the_workspace_through() {
+    let (fake, _, h, _watch) = world().await;
+    h.activate(ALICE, json!({})).await.unwrap();
+    h.activate(BOB, json!({ "enabled": false })).await.unwrap();
+    fake.set_workspace(
+        ALICE,
+        sample_diff(),
+        BTreeMap::from([(
+            "src/lib.rs".to_string(),
+            b"fn a() {}\nfn b() { c() }\n".to_vec(),
+        )]),
+    );
+    let (status, headers, body) = h
+        .get_route("/agents/e2e/c/alice/review", "/v1/plugins/web")
+        .await;
+    assert_eq!(status, 200);
+    assert!(
+        headers
+            .iter()
+            .any(|(k, v)| k == "content-type" && v.starts_with("text/html"))
+    );
+    let page = String::from_utf8(body).unwrap();
+    assert!(page.contains(r#"const prefix = "/v1/plugins/web""#));
+    assert!(page.contains("e2e/c/alice"));
+
+    let (status, _, body) = h
+        .get_route("/agents/e2e/c/alice/diff.json", "/v1/plugins/web")
+        .await;
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v, serde_json::to_value(sample_diff()).unwrap(), "unchanged");
+
+    let (status, headers, body) = h
+        .get_route(
+            "/agents/e2e/c/alice/file?path=src/lib.rs",
+            "/v1/plugins/web",
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert!(
+        headers
+            .iter()
+            .any(|(k, v)| k == "content-type" && v == "text/plain; charset=utf-8")
+    );
+    assert_eq!(body, b"fn a() {}\nfn b() { c() }\n");
+    let (status, _, body) = h
+        .get_route("/agents/e2e/c/alice/file?path=nope", "/v1/plugins/web")
+        .await;
+    assert_eq!(
+        (status, String::from_utf8_lossy(&body).as_ref()),
+        (404, "no such path")
+    );
+
+    // the daemon's refusals cross as they are: bob is hidden here, carol
+    // has no workspace at the fake
+    for path in ["review", "diff.json", "file?path=x", "events.json"] {
+        let (status, _, _) = h
+            .get_route(&format!("/agents/e2e/c/bob/{path}"), "/v1/plugins/web")
+            .await;
+        assert_eq!(status, 404, "{path}");
+    }
+    h.activate("e2e/c/carol", json!({})).await.unwrap();
+    let (status, _, body) = h
+        .get_route("/agents/e2e/c/carol/diff.json", "/v1/plugins/web")
+        .await;
+    assert_eq!(
+        (status, String::from_utf8_lossy(&body).as_ref()),
+        (404, "no workspace for agent e2e/c/carol")
+    );
+}

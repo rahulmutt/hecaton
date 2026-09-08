@@ -13,6 +13,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use hecaton_api::{ResizeFrame, TextFrame};
+use hecaton_plugin_sdk::SdkError;
 use hecaton_plugin_sdk::metrics::IntGauge;
 use sha2::{Digest, Sha256};
 
@@ -48,6 +49,9 @@ pub fn router(shared: Arc<Shared>) -> Router {
             "/agents/{fleet}/{crew}/{agent}/events.json",
             get(events_json),
         )
+        .route("/agents/{fleet}/{crew}/{agent}/review", get(review_page))
+        .route("/agents/{fleet}/{crew}/{agent}/diff.json", get(diff_json))
+        .route("/agents/{fleet}/{crew}/{agent}/file", get(file_text))
         .route("/assets/{digest}/{file}", get(asset))
         .with_state(shared)
 }
@@ -97,7 +101,7 @@ pub fn index_html(prefix: &str, rows: &[AgentRow]) -> String {
     let mut body = String::new();
     for r in rows {
         body.push_str(&format!(
-            "<tr><td><a href=\"{p}/agents/{id}\">{id}</a></td><td>{phase}</td><td>{msg}</td></tr>\n",
+            "<tr><td><a href=\"{p}/agents/{id}\">{id}</a> <a class=\"review\" href=\"{p}/agents/{id}/review\">review</a></td><td>{phase}</td><td>{msg}</td></tr>\n",
             p = html_escape(prefix),
             id = html_escape(&r.id),
             phase = html_escape(&phase_label(r)),
@@ -127,6 +131,11 @@ async function refresh() {{
       a.href = prefix + "/agents/" + r.id;
       a.textContent = r.id;
       const c1 = document.createElement("td"); c1.appendChild(a);
+      const rv = document.createElement("a");
+      rv.className = "review";
+      rv.href = prefix + "/agents/" + r.id + "/review";
+      rv.textContent = "review";
+      c1.append(" ", rv);
       const c2 = document.createElement("td"); c2.textContent = r.phase;
       const c3 = document.createElement("td"); c3.textContent = r.message;
       tr.append(c1, c2, c3);
@@ -189,6 +198,222 @@ term.focus();
     )
 }
 
+/// A JSON string literal safe inside `<script>`: `serde_json` escapes
+/// quotes, backslashes and control characters; `<`, `>` and `&` are
+/// escaped here so no value can close the element.
+fn js_string(s: &str) -> String {
+    serde_json::to_string(s)
+        .unwrap_or_else(|_| "\"\"".into())
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+}
+
+/// The review page (Spec C §4.3): the diff with gutter comments on the
+/// left, the activity column on the right, the draft in `localStorage`.
+/// Everything the script renders goes through `textContent`; the id and
+/// prefix reach the script as JSON string literals.
+pub fn review_html(prefix: &str, id: &str) -> String {
+    let p_json = js_string(prefix);
+    let id_json = js_string(id);
+    format!(
+        r##"<!doctype html>
+<html><head><meta charset="utf-8"><title>review {id}</title>
+<style>
+body{{font:13px system-ui,sans-serif;margin:0;display:flex;flex-direction:column;height:100vh}}
+header{{padding:.5rem 1rem;border-bottom:1px solid #ddd;display:flex;gap:1rem;align-items:center}}
+main{{flex:1;display:flex;min-height:0}}
+#diff{{flex:1;overflow:auto;padding:0 1rem 7rem}}
+#side{{width:26rem;border-left:1px solid #ddd;display:flex;flex-direction:column;min-height:0}}
+#side.collapsed{{width:2.2rem}}
+#side.collapsed #events,#side.collapsed #side-title{{display:none}}
+#side-head{{display:flex;align-items:center;padding:.3rem;border-bottom:1px solid #eee}}
+#events{{flex:1;overflow:auto;font:12px ui-monospace,monospace;padding:.4rem}}
+.ev{{padding:.2rem .3rem;border-bottom:1px solid #eee;cursor:pointer}}
+.ev .t{{color:#888;margin-right:.4rem}}
+.ev .n{{color:#57606a;margin-right:.4rem}}
+.ev pre{{white-space:pre-wrap;margin:.2rem 0 0;color:#555;max-height:16em;overflow:auto}}
+.ev.divider{{background:#fff6d5;font-weight:600}}
+.file{{margin:1rem 0;border:1px solid #ddd;border-radius:4px}}
+.file h3{{margin:0;padding:.4rem .6rem;background:#f6f8fa;font-size:13px;font-weight:600;display:flex;gap:.6rem;align-items:center}}
+.badge{{font-weight:normal;color:#b35900}}
+.file h3 a{{font-weight:normal;margin-left:auto}}
+table.hunk{{border-collapse:collapse;width:100%;font:12px ui-monospace,monospace}}
+table.hunk td{{padding:0 .4rem;white-space:pre;vertical-align:top}}
+td.ln{{color:#999;text-align:right;width:3em;user-select:none;cursor:pointer}}
+td.ln:hover{{background:#dbe9ff}}
+tr.add td.code{{background:#e6ffec}} tr.del td.code{{background:#ffebe9}} tr.hdr td{{background:#f1f8ff;color:#57606a}}
+tr.comment td{{background:#fff8c5;white-space:normal;padding:.4rem .6rem}}
+tr.comment textarea{{width:100%;min-height:4em;box-sizing:border-box}}
+#stale{{border:1px solid #f0c36d;background:#fff8e1;padding:.5rem 1rem;margin:1rem 0}}
+footer{{position:fixed;bottom:0;left:0;right:0;border-top:1px solid #ddd;background:#fff;padding:.5rem 1rem;display:flex;gap:1rem;align-items:flex-start}}
+footer textarea{{flex:1;min-height:3.5em}}
+#banner{{margin-top:.3rem}}
+</style></head>
+<body>
+<header><a href="{p}/">agents</a> <strong>{id}</strong> <a href="{p}/agents/{id}">terminal</a> <span id="meta"></span></header>
+<main>
+<div id="diff"><p id="loading">loading diff...</p></div>
+<aside id="side"><div id="side-head"><button id="collapse" title="collapse or expand the activity column">&#8677;</button><span id="side-title" style="margin-left:.5rem">activity &middot; <span id="phase"></span> <span id="unread"></span></span></div><div id="events"><p id="no-events">no events yet; the daemon delivers no history</p></div></aside>
+</main>
+<footer><textarea id="summary" placeholder="Overall summary (optional)"></textarea><div><div id="count">0 comments</div><button id="reload">Reload diff</button> <button id="send">Send review</button><div id="banner"></div></div></footer>
+<script>
+const prefix = {p_json};
+const id = {id_json};
+const key = "hecaton-review/" + id;
+let diff = null;
+let pending = null;
+let draft = {{ comments: [], summary: "", collapsed: false }};
+try {{ const s = localStorage.getItem(key); if (s) draft = Object.assign(draft, JSON.parse(s)); }} catch (e) {{}}
+function save() {{ try {{ localStorage.setItem(key, JSON.stringify(draft)); }} catch (e) {{}} }}
+function el(tag, cls, text) {{ const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }}
+const anchorOf = (c) => c.path + " " + c.side + " " + c.line + " " + c.text;
+
+function parsePatch(patch) {{
+  const hunks = []; let h = null; let o = 0, n = 0;
+  for (const raw of patch.split("\n")) {{
+    const m = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(raw);
+    if (m) {{ o = +m[1]; n = +m[2]; h = {{ header: raw, lines: [] }}; hunks.push(h); continue; }}
+    if (!h) continue;
+    if (raw.startsWith("+")) h.lines.push({{ kind: "add", side: "new", line: n++, text: raw }});
+    else if (raw.startsWith("-")) h.lines.push({{ kind: "del", side: "old", line: o++, text: raw }});
+    else if (raw.startsWith(" ")) h.lines.push({{ kind: "ctx", side: "new", line: n++, oldLine: o++, text: raw }});
+    else if (raw.startsWith("\\")) h.lines.push({{ kind: "meta", text: raw }});
+  }}
+  return hunks;
+}}
+
+function commentRow(c, editing) {{
+  const tr = el("tr", "comment"); const td = el("td"); td.colSpan = 3;
+  if (editing) {{
+    const ta = el("textarea"); ta.value = c.body || "";
+    const ok = el("button", "", "Save comment"); const no = el("button", "", "Cancel");
+    ok.onclick = () => {{ if (!ta.value.trim()) return; c.body = ta.value; delete c.editing; if (!draft.comments.includes(c)) draft.comments.push(c); pending = null; save(); render(); }};
+    no.onclick = () => {{ delete c.editing; pending = null; render(); }};
+    td.append(ta, ok, " ", no);
+    setTimeout(() => ta.focus(), 0);
+  }} else {{
+    const body = el("div", "", c.body); body.style.whiteSpace = "pre-wrap";
+    const edit = el("button", "", "Edit"); const del = el("button", "", "Delete");
+    edit.onclick = () => {{ c.editing = true; render(); }};
+    del.onclick = () => {{ draft.comments = draft.comments.filter((x) => x !== c); save(); render(); }};
+    td.append(body, edit, " ", del);
+  }}
+  tr.appendChild(td); return tr;
+}}
+
+function sameLine(c, f, l) {{ return c.path === f.path && c.side === l.side && c.line === l.line && c.text === l.text; }}
+
+function renderFile(f) {{
+  const box = el("div", "file");
+  const h3 = el("h3");
+  h3.append(el("span", "", f.status), el("span", "", f.old_path ? f.old_path + " -> " + f.path : f.path));
+  if (f.uncommitted) h3.appendChild(el("span", "badge", "uncommitted"));
+  if (f.binary) h3.appendChild(el("span", "badge", "binary"));
+  if (f.truncated) h3.appendChild(el("span", "badge", "patch truncated"));
+  if (f.status !== "deleted") {{ const a = el("a", "", "view file"); a.href = prefix + "/agents/" + id + "/file?path=" + encodeURIComponent(f.path); a.target = "_blank"; h3.appendChild(a); }}
+  box.appendChild(h3);
+  if (f.binary) return box;
+  const table = el("table", "hunk");
+  for (const h of parsePatch(f.patch)) {{
+    const hdr = el("tr", "hdr"); const td = el("td", "", h.header); td.colSpan = 3; hdr.appendChild(td); table.appendChild(hdr);
+    for (const l of h.lines) {{
+      const tr = el("tr", l.kind);
+      const oldNo = l.kind === "del" ? l.line : l.kind === "ctx" ? l.oldLine : "";
+      const newNo = l.kind === "add" || l.kind === "ctx" ? l.line : "";
+      const c1 = el("td", "ln", String(oldNo)); const c2 = el("td", "ln", String(newNo)); const c3 = el("td", "code", l.text);
+      if (l.kind !== "meta") {{
+        const start = () => {{ pending = {{ path: f.path, side: l.side, line: l.line, text: l.text, body: "" }}; render(); }};
+        c1.onclick = start; c2.onclick = start;
+      }}
+      tr.append(c1, c2, c3); table.appendChild(tr);
+      if (l.kind === "meta") continue;
+      for (const c of draft.comments.filter((c) => sameLine(c, f, l))) table.appendChild(commentRow(c, !!c.editing));
+      if (pending && sameLine(pending, f, l)) table.appendChild(commentRow(pending, true));
+    }}
+  }}
+  box.appendChild(table); return box;
+}}
+
+function render() {{
+  const root = document.getElementById("diff"); root.replaceChildren();
+  if (!diff) {{ root.appendChild(el("p", "", "loading diff...")); return; }}
+  document.getElementById("meta").textContent = "against " + diff.base_ref + " at " + diff.head.slice(0, 7) + (diff.truncated ? " (file list truncated)" : "");
+  const anchors = new Set();
+  for (const f of diff.files) for (const h of parsePatch(f.patch)) for (const l of h.lines) if (l.kind !== "meta") anchors.add(anchorOf({{ path: f.path, side: l.side, line: l.line, text: l.text }}));
+  const stale = draft.comments.filter((c) => !anchors.has(anchorOf(c)));
+  if (stale.length) {{
+    const box = el("div"); box.id = "stale"; box.appendChild(el("strong", "", "no longer in the diff (still sent):"));
+    for (const c of stale) {{ const row = el("div", "", c.path + " line " + c.line + " (" + c.side + "): " + c.body + " "); const del = el("button", "", "Delete"); del.onclick = () => {{ draft.comments = draft.comments.filter((x) => x !== c); save(); render(); }}; row.appendChild(del); box.appendChild(row); }}
+    root.appendChild(box);
+  }}
+  if (!diff.files.length) root.appendChild(el("p", "", "no changes against " + diff.base_ref));
+  for (const f of diff.files) root.appendChild(renderFile(f));
+  document.getElementById("count").textContent = draft.comments.length + " comment" + (draft.comments.length === 1 ? "" : "s");
+  document.getElementById("summary").value = draft.summary;
+}}
+
+async function loadDiff() {{
+  const banner = document.getElementById("banner"); banner.textContent = "";
+  try {{
+    const r = await fetch(prefix + "/agents/" + id + "/diff.json");
+    if (!r.ok) {{ banner.style.color = "#b00"; banner.textContent = "diff: " + (await r.text()); return; }}
+    diff = await r.json(); pending = null; render();
+  }} catch (e) {{ banner.style.color = "#b00"; banner.textContent = "diff: " + e; }}
+}}
+
+async function send() {{
+  const banner = document.getElementById("banner"); banner.textContent = "";
+  const comments = draft.comments.map((c) => ({{ path: c.path, side: c.side, line: c.line, text: c.text, body: c.body }}));
+  const body = {{ head: diff ? diff.head : "", base_ref: diff ? diff.base_ref : "", summary: draft.summary, comments }};
+  try {{
+    const r = await fetch(prefix + "/agents/" + id + "/review", {{ method: "POST", headers: {{ "content-type": "application/json" }}, body: JSON.stringify(body) }});
+    if (r.ok) {{ draft.comments = []; draft.summary = ""; save(); render(); banner.style.color = "#080"; banner.textContent = "review sent"; }}
+    else {{ banner.style.color = "#b00"; banner.textContent = "send failed: " + (await r.text()); }}
+  }} catch (e) {{ banner.style.color = "#b00"; banner.textContent = "send failed: " + e; }}
+}}
+
+let lastSeq = 0, unread = 0;
+const side = document.getElementById("side");
+function renderEvent(e) {{
+  const row = el("div", "ev" + (e.name === "review_sent" ? " divider" : ""));
+  row.append(el("span", "t", new Date(e.at * 1000).toLocaleTimeString()), el("span", "n", e.name), el("span", "s", e.summary));
+  const pre = el("pre", "", JSON.stringify(e.payload, null, 2) + (e.payload_truncated ? "\n(truncated)" : "")); pre.hidden = true;
+  row.appendChild(pre); row.onclick = () => {{ pre.hidden = !pre.hidden; }};
+  return row;
+}}
+async function pollEvents() {{
+  try {{
+    const r = await (await fetch(prefix + "/agents/" + id + "/events.json?after=" + lastSeq)).json();
+    document.getElementById("phase").textContent = r.phase;
+    const box = document.getElementById("events");
+    const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 24;
+    for (const e of r.events) {{ box.appendChild(renderEvent(e)); lastSeq = e.seq; if (side.classList.contains("collapsed")) unread++; }}
+    if (lastSeq > 0) document.getElementById("no-events").hidden = true;
+    document.getElementById("unread").textContent = unread ? "(" + unread + " new)" : "";
+    if (r.events.length && atBottom) box.scrollTop = box.scrollHeight;
+  }} catch (e) {{ console.warn("events", e); }}
+}}
+
+function applyCollapse() {{ side.classList.toggle("collapsed", !!draft.collapsed); if (!draft.collapsed) {{ unread = 0; document.getElementById("unread").textContent = ""; }} }}
+document.getElementById("collapse").onclick = () => {{ draft.collapsed = !draft.collapsed; save(); applyCollapse(); }};
+document.getElementById("reload").onclick = loadDiff;
+document.getElementById("send").onclick = send;
+document.getElementById("summary").oninput = (ev) => {{ draft.summary = ev.target.value; save(); }};
+applyCollapse();
+render();
+loadDiff();
+pollEvents();
+setInterval(pollEvents, {poll});
+</script>
+</body></html>
+"##,
+        p = html_escape(prefix),
+        id = html_escape(id),
+        poll = INDEX_POLL_MS,
+    )
+}
+
 async fn index(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Html<String> {
     Html(index_html(&prefix(&headers), &shared.cache.rows()))
 }
@@ -197,16 +422,95 @@ async fn agents_json(State(shared): State<Arc<Shared>>) -> Json<Vec<AgentRow>> {
     Json(shared.cache.rows())
 }
 
+/// A daemon refusal crosses to the browser with its status and text; a
+/// transport failure is a 502.
+fn sdk_error(e: SdkError) -> Response {
+    match e {
+        SdkError::Status { status, message } => (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            message,
+        )
+            .into_response(),
+        other => (StatusCode::BAD_GATEWAY, other.to_string()).into_response(),
+    }
+}
+
+/// The agent id for an enabled agent, else the 404 to answer.
+///
+/// `Response` is large (it carries an extensions map); every caller
+/// returns the `Err` straight back out rather than matching on it, so
+/// boxing would only add an allocation on the hot path for no benefit.
+#[allow(clippy::result_large_err)]
+fn enabled_id(
+    shared: &Shared,
+    (fleet, crew, agent): (String, String, String),
+) -> Result<String, Response> {
+    let id = format!("{fleet}/{crew}/{agent}");
+    if shared.cache.is_enabled(&id) {
+        Ok(id)
+    } else {
+        Err((StatusCode::NOT_FOUND, "no such agent").into_response())
+    }
+}
+
 async fn terminal(
     State(shared): State<Arc<Shared>>,
     headers: HeaderMap,
-    Path((fleet, crew, agent)): Path<(String, String, String)>,
+    Path(path): Path<(String, String, String)>,
 ) -> Response {
-    let id = format!("{fleet}/{crew}/{agent}");
-    if !shared.cache.is_enabled(&id) {
-        return (StatusCode::NOT_FOUND, "no such agent").into_response();
+    match enabled_id(&shared, path) {
+        Ok(id) => Html(terminal_html(&prefix(&headers), &id)).into_response(),
+        Err(r) => r,
     }
-    Html(terminal_html(&prefix(&headers), &id)).into_response()
+}
+
+async fn review_page(
+    State(shared): State<Arc<Shared>>,
+    headers: HeaderMap,
+    Path(path): Path<(String, String, String)>,
+) -> Response {
+    match enabled_id(&shared, path) {
+        Ok(id) => Html(review_html(&prefix(&headers), &id)).into_response(),
+        Err(r) => r,
+    }
+}
+
+async fn diff_json(
+    State(shared): State<Arc<Shared>>,
+    Path(path): Path<(String, String, String)>,
+) -> Response {
+    let id = match enabled_id(&shared, path) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    match shared.host.workspace_diff(&id).await {
+        Ok(diff) => Json(diff).into_response(),
+        Err(e) => sdk_error(e),
+    }
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default)]
+struct FileQuery {
+    path: String,
+}
+
+async fn file_text(
+    State(shared): State<Arc<Shared>>,
+    Path(path): Path<(String, String, String)>,
+    Query(q): Query<FileQuery>,
+) -> Response {
+    let id = match enabled_id(&shared, path) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+    match shared.host.workspace_file(&id, &q.path).await {
+        Ok(Some(bytes)) => {
+            ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], bytes).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "no such path").into_response(),
+        Err(e) => sdk_error(e),
+    }
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -218,13 +522,13 @@ struct AfterQuery {
 /// The activity column's poll: entries after `after`, and the phase.
 async fn events_json(
     State(shared): State<Arc<Shared>>,
-    Path((fleet, crew, agent)): Path<(String, String, String)>,
+    Path(path): Path<(String, String, String)>,
     q: Result<Query<AfterQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
-    let id = format!("{fleet}/{crew}/{agent}");
-    if !shared.cache.is_enabled(&id) {
-        return (StatusCode::NOT_FOUND, "no such agent").into_response();
-    }
+    let id = match enabled_id(&shared, path) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
     let after = match q {
         Ok(Query(q)) => q.after,
         Err(e) => return (StatusCode::BAD_REQUEST, e.body_text()).into_response(),
@@ -234,13 +538,13 @@ async fn events_json(
 
 async fn bridge_route(
     State(shared): State<Arc<Shared>>,
-    Path((fleet, crew, agent)): Path<(String, String, String)>,
+    Path(path): Path<(String, String, String)>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let id = format!("{fleet}/{crew}/{agent}");
-    if !shared.cache.is_enabled(&id) {
-        return (StatusCode::NOT_FOUND, "no such agent").into_response();
-    }
+    let id = match enabled_id(&shared, path) {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
     ws.on_upgrade(move |socket| bridge(socket, shared, id))
 }
 
@@ -455,5 +759,42 @@ mod tests {
         assert_eq!(forwardable(1006), 1011);
         assert_eq!(forwardable(1015), 1011);
         assert_eq!(forwardable(2000), 1011);
+    }
+
+    #[test]
+    fn the_review_page_links_its_routes_through_the_prefix_and_escapes_the_id() {
+        let page = review_html("/v1/plugins/web", "f/c/a");
+        assert!(page.contains(r#"const prefix = "/v1/plugins/web""#));
+        assert!(page.contains(r#"const id = "f/c/a""#));
+        assert!(page.contains("/diff.json"), "fetches the diff");
+        assert!(page.contains("/events.json?after="), "polls the column");
+        assert!(
+            page.contains(r#"href="/v1/plugins/web/agents/f/c/a""#),
+            "back to the terminal"
+        );
+        assert!(page.contains(r#"id="collapse""#));
+        assert!(page.contains("hecaton-review/"), "the draft key");
+        let page = review_html("/p", "<x>&");
+        assert!(page.contains("&lt;x&gt;&amp;") && !page.contains("<x>"));
+        assert!(
+            page.contains("const id = \"\\u003cx\\u003e\\u0026\""),
+            "the id reaches the script as a JSON literal with <, > and & escaped: {page}"
+        );
+        let rows = vec![AgentRow {
+            id: "f/c/a".into(),
+            phase: AgentPhase::Ready,
+            message: String::new(),
+        }];
+        let index = index_html("/v1/plugins/web", &rows);
+        assert!(
+            index.contains(
+                r#"<a class="review" href="/v1/plugins/web/agents/f/c/a/review">review</a>"#
+            ),
+            "{index}"
+        );
+        assert!(
+            index.contains(r#"prefix + "/agents/" + r.id + "/review""#),
+            "the refresh script too"
+        );
     }
 }
