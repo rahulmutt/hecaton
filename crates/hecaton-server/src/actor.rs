@@ -280,6 +280,9 @@ impl Actor {
 
     async fn event(&mut self, agent: AgentId, name: String, at: Timestamp) {
         if name == READY_EVENT {
+            // The one line that dates an agent's readiness: the tick that
+            // follows logs the phase, not when it was reached.
+            tracing::info!(agent = %agent, fleet = %self.name, "agent ready ({READY_EVENT} received)");
             agent_ready(&mut self.record.status, &agent, at);
             self.persist().await;
         } else if let Some(a) = self.record.status.agents.get_mut(&agent.to_string()) {

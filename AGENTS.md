@@ -74,6 +74,14 @@ credentials, hook input, or sandbox rules.
   dir is `home/tmp` via `TMPDIR`/`CLAUDE_CODE_TMPDIR` — nothing under `/tmp`
   is granted. Both were found by `mise run verify-claude` against the real
   `claude`, not by the e2e (the fake needs neither).
+- tmux answers `has-session -t =<crew>` with "no current target" while its
+  server is up with no session at all — the moment another crew's
+  `new-session` on the same socket is starting it. `TmuxRunner` reads that
+  as absent like "can't find session"; before it did, every daemon start
+  with two crews (verify-claude's plugins fleet plus the fleet under test)
+  failed its first pass and waited out the 30 s resync before `up` could
+  proceed. The actor logs `agent ready (SessionStart received)`, the only
+  line that dates readiness; the tick after it logs the phase.
 - `Workspace::git` (`crates/hecaton-runtime/src/workspace.rs`) scrubs
   `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_PREFIX`/`GIT_COMMON_DIR` from
   every git call via `Cmd::env_remove`, and the integration-test `git`

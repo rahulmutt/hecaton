@@ -161,15 +161,19 @@ impl TmuxRunner {
     }
 
     /// tmux exits non-zero with "no server running" / "can't find" /
-    /// "error connecting" when nothing exists; those are "absent", not
-    /// errors.
+    /// "error connecting" when nothing exists, and with "no current
+    /// target" when the server is up but holds no session at all (the
+    /// moment between another crew's `new-session` starting the server and
+    /// its session existing — two crews on one socket race there at daemon
+    /// start); all of those are "absent", not errors.
     fn run_optional(&self, id: &str, args: &[&str]) -> Result<Option<String>, RunnerError> {
         match self.cmd().args(args.iter().copied()).run() {
             Ok(o) => Ok(Some(o.stdout)),
             Err(f)
                 if f.stderr.contains("no server running")
                     || f.stderr.contains("can't find")
-                    || f.stderr.contains("error connecting") =>
+                    || f.stderr.contains("error connecting")
+                    || f.stderr.contains("no current target") =>
             {
                 Ok(None)
             }
