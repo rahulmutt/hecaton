@@ -228,7 +228,7 @@ pub fn review_html(prefix: &str, id: &str) -> String {
 body{{font:13px system-ui,sans-serif;margin:0;display:flex;flex-direction:column;height:100vh}}
 header{{padding:.5rem 1rem;border-bottom:1px solid #ddd;display:flex;gap:1rem;align-items:center}}
 main{{flex:1;display:flex;min-height:0}}
-#diff{{flex:1;overflow:auto;padding:0 1rem 7rem}}
+#diff{{flex:1;overflow:auto;padding:0 1rem 7rem;position:relative}}
 #side{{width:26rem;border-left:1px solid #ddd;display:flex;flex-direction:column;min-height:0}}
 #side.collapsed{{width:2.2rem}}
 #side.collapsed #events,#side.collapsed #side-title{{display:none}}
@@ -254,9 +254,11 @@ tr.comment textarea{{width:100%;min-height:4em;box-sizing:border-box}}
 footer{{position:fixed;bottom:0;left:0;right:0;border-top:1px solid #ddd;background:#fff;padding:.5rem 1rem;display:flex;gap:1rem;align-items:flex-start}}
 footer textarea{{flex:1;min-height:3.5em}}
 #banner{{margin-top:.3rem}}
+#age{{color:#57606a;padding:0 .3rem;border-radius:3px;transition:background 1.2s}}
+#age.flash{{background:#fff3b0;transition:none}}
 </style></head>
 <body>
-<header><a href="{p}/">agents</a> <strong>{id}</strong> <a href="{p}/agents/{id}">terminal</a> <span id="meta"></span></header>
+<header><a href="{p}/">agents</a> <strong>{id}</strong> <a href="{p}/agents/{id}">terminal</a> <span id="meta"></span> <span id="age"></span></header>
 <main>
 <div id="diff"><p id="loading">loading diff...</p></div>
 <aside id="side"><div id="side-head"><button id="collapse" title="collapse or expand the activity column">&#8677;</button><span id="side-title" style="margin-left:.5rem">activity &middot; <span id="phase"></span> <span id="unread"></span></span></div><div id="events"><p id="no-events">no events yet; the daemon delivers no history</p></div></aside>
@@ -268,9 +270,16 @@ const id = {id_json};
 const key = "hecaton-review/" + id;
 let diff = null;
 let pending = null;
+let rendered = null;
+let latestFp = null;
+let pendingDiff = null;
+let lastApplied = 0;
+let renderedAt = null;
+const APPLY_MIN_MS = 3000;
 let draft = {{ comments: [], summary: "", collapsed: false }};
 try {{ const s = localStorage.getItem(key); if (s) draft = Object.assign(draft, JSON.parse(s)); }} catch (e) {{}}
-function save() {{ try {{ localStorage.setItem(key, JSON.stringify(draft)); }} catch (e) {{}} }}
+const transient = (k, v) => (k === "editing" || k === "typing") ? undefined : v;
+function save() {{ try {{ localStorage.setItem(key, JSON.stringify(draft, transient)); }} catch (e) {{}} }}
 function el(tag, cls, text) {{ const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }}
 const anchorOf = (c) => c.path + " " + c.side + " " + c.line + " " + c.text;
 
@@ -288,13 +297,35 @@ function parsePatch(patch) {{
   return hunks;
 }}
 
+// Spec D PD-4: a comment keeps its exact anchor; otherwise the lines of the
+// same path and side with the same text are collected — exactly one hit
+// re-anchors the comment to that line number, none or several make it
+// stale. Returns the stale comments; re-anchored ones are updated in place.
+function anchorComments(diff, comments) {{
+  const exact = new Set(); const byText = new Map();
+  for (const f of diff.files) for (const h of parsePatch(f.patch)) for (const l of h.lines) {{
+    if (l.kind === "meta") continue;
+    exact.add(f.path + " " + l.side + " " + l.line + " " + l.text);
+    const k = f.path + " " + l.side + " " + l.text;
+    byText.set(k, (byText.get(k) || []).concat([l.line]));
+  }}
+  const stale = [];
+  for (const c of comments) {{
+    if (exact.has(anchorOf(c))) continue;
+    const hits = byText.get(c.path + " " + c.side + " " + c.text) || [];
+    if (hits.length === 1) c.line = hits[0]; else stale.push(c);
+  }}
+  return stale;
+}}
+
 function commentRow(c, editing) {{
   const tr = el("tr", "comment"); const td = el("td"); td.colSpan = 3;
   if (editing) {{
-    const ta = el("textarea"); ta.value = c.body || "";
+    const ta = el("textarea"); ta.value = c.typing !== undefined ? c.typing : (c.body || "");
+    ta.oninput = () => {{ c.typing = ta.value; }};
     const ok = el("button", "", "Save comment"); const no = el("button", "", "Cancel");
-    ok.onclick = () => {{ if (!ta.value.trim()) return; c.body = ta.value; delete c.editing; if (!draft.comments.includes(c)) draft.comments.push(c); pending = null; save(); render(); }};
-    no.onclick = () => {{ delete c.editing; pending = null; render(); }};
+    ok.onclick = () => {{ if (!ta.value.trim()) return; c.body = ta.value; delete c.editing; delete c.typing; if (!draft.comments.includes(c)) draft.comments.push(c); pending = null; save(); render(); maybeApply(); }};
+    no.onclick = () => {{ delete c.editing; delete c.typing; pending = null; render(); maybeApply(); }};
     td.append(ta, ok, " ", no);
     setTimeout(() => ta.focus(), 0);
   }} else {{
@@ -308,9 +339,10 @@ function commentRow(c, editing) {{
 }}
 
 function sameLine(c, f, l) {{ return c.path === f.path && c.side === l.side && c.line === l.line && c.text === l.text; }}
+function boxOpen() {{ return pending !== null || draft.comments.some((c) => c.editing); }}
 
 function renderFile(f) {{
-  const box = el("div", "file");
+  const box = el("div", "file"); box.dataset.path = f.path;
   const h3 = el("h3");
   h3.append(el("span", "", f.status), el("span", "", f.old_path ? f.old_path + " -> " + f.path : f.path));
   if (f.uncommitted) h3.appendChild(el("span", "badge", "uncommitted"));
@@ -344,9 +376,8 @@ function render() {{
   const root = document.getElementById("diff"); root.replaceChildren();
   if (!diff) {{ root.appendChild(el("p", "", "loading diff...")); return; }}
   document.getElementById("meta").textContent = "against " + diff.base_ref + " at " + diff.head.slice(0, 7) + (diff.truncated ? " (file list truncated)" : "");
-  const anchors = new Set();
-  for (const f of diff.files) for (const h of parsePatch(f.patch)) for (const l of h.lines) if (l.kind !== "meta") anchors.add(anchorOf({{ path: f.path, side: l.side, line: l.line, text: l.text }}));
-  const stale = draft.comments.filter((c) => !anchors.has(anchorOf(c)));
+  const stale = anchorComments(diff, draft.comments);
+  save();
   if (stale.length) {{
     const box = el("div"); box.id = "stale"; box.appendChild(el("strong", "", "no longer in the diff (still sent):"));
     for (const c of stale) {{ const row = el("div", "", c.path + " line " + c.line + " (" + c.side + "): " + c.body + " "); const del = el("button", "", "Delete"); del.onclick = () => {{ draft.comments = draft.comments.filter((x) => x !== c); save(); render(); }}; row.appendChild(del); box.appendChild(row); }}
@@ -355,16 +386,63 @@ function render() {{
   if (!diff.files.length) root.appendChild(el("p", "", "no changes against " + diff.base_ref));
   for (const f of diff.files) root.appendChild(renderFile(f));
   document.getElementById("count").textContent = draft.comments.length + " comment" + (draft.comments.length === 1 ? "" : "s");
-  document.getElementById("summary").value = draft.summary;
+  const summary = document.getElementById("summary");
+  if (summary.value !== draft.summary) summary.value = draft.summary;
 }}
 
+// Keep the reader's place across a re-render: the file whose header was at
+// or above the top of the viewport is scrolled back to the top when it is
+// still there; otherwise the raw offset is restored.
+function renderKeepingScroll() {{
+  const root = document.getElementById("diff");
+  const top = root.scrollTop;
+  const files = Array.from(root.querySelectorAll(".file"));
+  const above = files.filter((f) => f.offsetTop <= top);
+  const topPath = above.length ? above[above.length - 1].dataset.path : null;
+  render();
+  const again = topPath === null ? null : Array.from(root.querySelectorAll(".file")).find((f) => f.dataset.path === topPath);
+  root.scrollTop = again ? again.offsetTop : top;
+}}
+
+function fmtAge(ms) {{
+  const s = Math.floor(ms / 1000);
+  if (s < 1) return "just now";
+  if (s < 60) return s + " s ago";
+  return Math.floor(s / 60) + " min ago";
+}}
+function tickAge() {{
+  const age = document.getElementById("age");
+  age.textContent = renderedAt === null ? "" : "· updated " + fmtAge(Date.now() - renderedAt);
+}}
+function flashAge() {{
+  const age = document.getElementById("age");
+  age.classList.add("flash");
+  setTimeout(() => age.classList.remove("flash"), 200);
+}}
+
+function applyDiff(d, fp) {{
+  diff = d; rendered = fp; pendingDiff = null; pending = null;
+  lastApplied = Date.now(); renderedAt = lastApplied;
+  renderKeepingScroll(); tickAge(); flashAge();
+}}
+// Spec D PD-3: a waiting diff is applied when no comment box is open and
+// at least APPLY_MIN_MS have passed since the last apply; the next poll or
+// the next Save/Cancel tries again otherwise.
+function maybeApply() {{
+  if (pendingDiff && !boxOpen() && Date.now() - lastApplied >= APPLY_MIN_MS) applyDiff(pendingDiff.diff, pendingDiff.fp);
+}}
+
+async function fetchDiff() {{
+  const r = await fetch(prefix + "/agents/" + id + "/diff.json");
+  if (!r.ok) throw new Error(await r.text());
+  return await r.json();
+}}
+// Manual "Reload diff": unconditional, and the way a daemon refusal reaches
+// the banner.
 async function loadDiff() {{
   const banner = document.getElementById("banner"); banner.textContent = "";
-  try {{
-    const r = await fetch(prefix + "/agents/" + id + "/diff.json");
-    if (!r.ok) {{ banner.style.color = "#b00"; banner.textContent = "diff: " + (await r.text()); return; }}
-    diff = await r.json(); pending = null; render();
-  }} catch (e) {{ banner.style.color = "#b00"; banner.textContent = "diff: " + e; }}
+  try {{ applyDiff(await fetchDiff(), latestFp); }}
+  catch (e) {{ banner.style.color = "#b00"; banner.textContent = "diff: " + e.message; }}
 }}
 
 async function send() {{
@@ -378,7 +456,7 @@ async function send() {{
   }} catch (e) {{ banner.style.color = "#b00"; banner.textContent = "send failed: " + e; }}
 }}
 
-let lastSeq = 0, unread = 0;
+let lastSeq = 0, unread = 0, fetching = false;
 const side = document.getElementById("side");
 function renderEvent(e) {{
   const row = el("div", "ev" + (e.name === "review_sent" ? " divider" : ""));
@@ -387,6 +465,9 @@ function renderEvent(e) {{
   row.appendChild(pre); row.onclick = () => {{ pre.hidden = !pre.hidden; }};
   return row;
 }}
+// One poll drives both columns (Spec D PD-2): the events, and the
+// worktree's version — a new fingerprint fetches the diff once and parks
+// it until maybeApply lets it through.
 async function pollEvents() {{
   try {{
     const r = await (await fetch(prefix + "/agents/" + id + "/events.json?after=" + lastSeq)).json();
@@ -397,6 +478,20 @@ async function pollEvents() {{
     if (lastSeq > 0) document.getElementById("no-events").hidden = true;
     document.getElementById("unread").textContent = unread ? "(" + unread + " new)" : "";
     if (r.events.length && atBottom) box.scrollTop = box.scrollHeight;
+    const w = r.workspace;
+    if (w) {{
+      latestFp = w.fingerprint;
+      if (w.fingerprint !== rendered && !(pendingDiff && pendingDiff.fp === w.fingerprint) && !fetching) {{
+        fetching = true;
+        try {{ pendingDiff = {{ diff: await fetchDiff(), fp: w.fingerprint }}; }}
+        catch (e) {{ console.warn("diff", e); }}
+        finally {{ fetching = false; }}
+      }}
+    }} else if (diff === null && !fetching) {{
+      // no version: surface the daemon's reason once
+      fetching = true; try {{ await loadDiff(); }} finally {{ fetching = false; }}
+    }}
+    maybeApply();
   }} catch (e) {{ console.warn("events", e); }}
 }}
 
@@ -407,9 +502,9 @@ document.getElementById("send").onclick = send;
 document.getElementById("summary").oninput = (ev) => {{ draft.summary = ev.target.value; save(); }};
 applyCollapse();
 render();
-loadDiff();
 pollEvents();
 setInterval(pollEvents, {poll});
+setInterval(tickAge, 1000);
 </script>
 </body></html>
 "##,
@@ -847,6 +942,20 @@ mod tests {
         );
         assert!(page.contains(r#"id="collapse""#));
         assert!(page.contains("hecaton-review/"), "the draft key");
+        assert!(
+            page.contains("function anchorComments("),
+            "re-anchoring is a standalone function"
+        );
+        assert!(page.contains(r#"id="age""#), "the indicator");
+        assert!(
+            page.contains("const APPLY_MIN_MS = 3000;"),
+            "the apply rate limit"
+        );
+        assert!(page.contains("r.workspace"), "the poll reads the version");
+        assert!(
+            !page.contains("loadDiff();\npollEvents();"),
+            "the first diff comes from the first poll"
+        );
         let page = review_html("/p", "<x>&");
         assert!(page.contains("&lt;x&gt;&amp;") && !page.contains("<x>"));
         assert!(
