@@ -59,9 +59,10 @@ pub struct ReviewBody {
     pub comments: Vec<Comment>,
 }
 
-/// A NUL would end the message at the tmux client's argv, and nothing
-/// downstream has any use for one. `path` is not checked here: `check_path`
-/// already refuses NUL, with its own reason.
+/// Nothing downstream renders a NUL usefully: it is not valid in a ref, a
+/// path or a diff line, and it truncates wherever the message meets a C
+/// string on its way to the pane. `path` is not checked here — the shared
+/// `check_path` already refuses NUL, with its own reason.
 fn no_nul(field: &str, value: &str) -> Result<(), String> {
     if value.contains('\0') {
         return Err(format!("{field}: contains NUL"));
@@ -305,9 +306,9 @@ mod tests {
     }
 
     /// The per-field caps leave the rendered message unbounded: 200
-    /// comments, each with a 4096-byte `path` and a 4096-byte `text`,
-    /// pass `validate` and render over 1.6 MiB. The route checks the
-    /// rendered length against `MAX_MESSAGE_BYTES`.
+    /// comments, each with a `path` at the 4096-byte path limit and a
+    /// 4096-byte `text`, pass `validate` and render past 1.6 MiB. The
+    /// route checks the rendered length against `MAX_MESSAGE_BYTES`.
     #[test]
     fn a_valid_review_can_still_render_a_message_past_the_message_cap() {
         let big = ReviewBody {

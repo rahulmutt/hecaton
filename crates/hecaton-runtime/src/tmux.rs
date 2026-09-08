@@ -460,7 +460,7 @@ impl AgentRunner for TmuxRunner {
     /// One line goes through `send-keys -l`. Text with a newline goes
     /// through a named buffer and `paste-buffer -p` (Spec C §3.3): `-p`
     /// wraps it in bracketed-paste markers when the application asked for
-    /// them, which a multi-line paste is expected to arrive on as one
+    /// them, on which a multi-line paste is expected to arrive as one
     /// message (verify with `mise run verify-claude`; Spec C §8, pending);
     /// `-d` deletes the buffer. The buffer is filled by `load-buffer -`
     /// from the tmux client's stdin, not by `set-buffer -- <text>`: the
