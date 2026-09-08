@@ -9,7 +9,7 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use hecaton_api::{
     ErrorBody, FleetRecord, HelloRequest, HelloResponse, KvKeys, PLUGIN_PROTOCOL, PluginAction,
-    ResizeFrame,
+    ResizeFrame, WorkspaceDiff, WorkspaceTree,
 };
 use serde::de::DeserializeOwned;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -19,6 +19,9 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use crate::{Env, SdkError};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// `workspace_diff` alone: a first diff of a large repository can outlast
+/// the client's 10 s.
+const DIFF_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct Host {
@@ -193,6 +196,53 @@ impl Host {
             )
             .await?;
         Ok(keys.keys)
+    }
+
+    /// `GET agents/{id}/workspace/diff` (Spec C §2.2): the agent's
+    /// worktree against the crew's base. Needs `workspace` and an active
+    /// pair; 404 `no workspace for agent …` before the worktree exists.
+    pub async fn workspace_diff(&self, agent: &str) -> Result<WorkspaceDiff, SdkError> {
+        self.json(
+            self.http
+                .get(self.url(&format!("agents/{agent}/workspace/diff")))
+                .timeout(DIFF_TIMEOUT),
+        )
+        .await
+    }
+
+    /// `GET agents/{id}/workspace/file?path=`: the bytes, `None` when the
+    /// worktree exists and the path does not (`no such path`); every
+    /// other refusal — no worktree, not a file, over 1 MiB, a bad path —
+    /// is the daemon's status and message.
+    pub async fn workspace_file(
+        &self,
+        agent: &str,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, SdkError> {
+        let (status, bytes) = self
+            .send(self.http.get(self.url(&format!(
+                "agents/{agent}/workspace/file?path={}",
+                urlencode(path)
+            ))))
+            .await?;
+        match status {
+            200..=299 => Ok(Some(bytes)),
+            404 => match Self::status_error(status, &bytes) {
+                SdkError::Status { message, .. } if message == "no such path" => Ok(None),
+                e => Err(e),
+            },
+            _ => Err(Self::status_error(status, &bytes)),
+        }
+    }
+
+    /// `GET agents/{id}/workspace/tree?path=`: one directory listing; the
+    /// empty path is the root.
+    pub async fn workspace_tree(&self, agent: &str, path: &str) -> Result<WorkspaceTree, SdkError> {
+        self.json(self.http.get(self.url(&format!(
+            "agents/{agent}/workspace/tree?path={}",
+            urlencode(path)
+        ))))
+        .await
     }
 
     /// `ws://` twin of `url`: the streams of §18.4.

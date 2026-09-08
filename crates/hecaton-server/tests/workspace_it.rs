@@ -1,10 +1,7 @@
 //! Spec C §2.2 against the real daemon: the capability gate, the active
 //! pair, the two 404s, the 413 and the 400, with `FakeWorkspace` behind.
-//!
-//! `Host::workspace_*` (the SDK methods) arrive in Task 4; until then this
-//! test asserts only the raw `w.api.plugin`/`w.api.raw_get` routes. Task 4
-//! adds back the `web.workspace_diff`/`web.workspace_file`/
-//! `web.workspace_tree`/`flow.workspace_diff` assertions.
+//! Exercises both the raw `w.api.plugin`/`w.api.raw_get` routes and the
+//! SDK's `Host::workspace_*` against the same daemon.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod support;
@@ -115,8 +112,8 @@ async fn wait_active(w: &World, agent: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workspace_routes_are_gated_by_capability_activation_and_the_path_rule() {
     let w = world().await;
-    let _web = start_silent(&w, "web").await;
-    let _flow = start_silent(&w, "flow").await;
+    let web = start_silent(&w, "web").await;
+    let flow = start_silent(&w, "flow").await;
     let (s, v) = w.api.admin(
         "POST",
         "/v1/fleets",
@@ -140,6 +137,24 @@ async fn workspace_routes_are_gated_by_capability_activation_and_the_path_rule()
         ]),
     );
 
+    // the diff, with the crew's ref as the base
+    let got = web.workspace_diff("f/c/a").await.unwrap();
+    assert_eq!(got.base_ref, "origin/release");
+    assert_eq!(got.files, diff().files);
+    assert!(
+        w.h.workspace
+            .calls()
+            .contains(&"diff f/c/a origin/release".to_string())
+    );
+    // file and tree
+    assert_eq!(
+        web.workspace_file("f/c/a", "src/lib.rs").await.unwrap(),
+        Some(b"fn a() {}\n".to_vec())
+    );
+    assert_eq!(web.workspace_file("f/c/a", "nope").await.unwrap(), None);
+    let tree = web.workspace_tree("f/c/a", "").await.unwrap();
+    assert_eq!(tree.entries.len(), 2);
+    assert_eq!(tree.entries[1].name, "src");
     // the raw statuses: 403 without the capability, 404 for an active pair
     // with no worktree, 404 for a pair that is not active, 413, 400
     let web_tok = token(&w, "web").await;
@@ -155,6 +170,8 @@ async fn workspace_routes_are_gated_by_capability_activation_and_the_path_rule()
         v["error"],
         "capability \"workspace\" not declared in hecaton-plugin.yaml"
     );
+    let e = flow.workspace_diff("f/c/a").await.unwrap_err();
+    assert!(e.to_string().starts_with("daemon: HTTP 403"), "{e}");
     let (s, v) = w.api.plugin(
         &web_tok,
         "GET",

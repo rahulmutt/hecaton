@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use hecaton_api::{FleetRecord, HookEvent, InterceptResponse, PluginAction};
+use hecaton_api::{FleetRecord, HookEvent, InterceptResponse, PluginAction, WorkspaceDiff};
 use hecaton_plugin_sdk::testing::FakeHost;
 use hecaton_plugin_sdk::{Host, Plugin, bind, run};
 use serde_json::{Value, json};
@@ -24,7 +24,7 @@ fn fixtures() -> BTreeMap<String, Value> {
     }
     assert_eq!(
         out.len(),
-        18,
+        21,
         "every fixture accounted for: {:?}",
         out.keys()
     );
@@ -237,6 +237,54 @@ async fn the_host_sends_every_plugin_to_daemon_fixture_and_reads_the_answer() {
         serde_json::to_value(host.kv_list("state/").await.unwrap()).unwrap(),
         fx["kv-list"]["response"]["keys"]
     );
+
+    let diff: WorkspaceDiff =
+        serde_json::from_value(fx["workspace-diff"]["response"].clone()).unwrap();
+    let file = b64(fx["workspace-file"]["raw"].as_str().unwrap());
+    fake.set_workspace(
+        "payments/backend/bob",
+        diff.clone(),
+        BTreeMap::from([("src/lib.rs".to_string(), file.clone())]),
+    );
+    assert_eq!(
+        serde_json::to_value(host.workspace_diff("payments/backend/bob").await.unwrap()).unwrap(),
+        fx["workspace-diff"]["response"]
+    );
+    assert_eq!(
+        host.workspace_file("payments/backend/bob", "src/lib.rs")
+            .await
+            .unwrap(),
+        Some(file)
+    );
+    assert_eq!(
+        host.workspace_file("payments/backend/bob", "nope")
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        serde_json::to_value(
+            host.workspace_tree("payments/backend/bob", "src")
+                .await
+                .unwrap()
+        )
+        .unwrap(),
+        fx["workspace-tree"]["response"]
+    );
+    // an agent with no workspace is the other 404, surfaced as an error
+    let e = host
+        .workspace_diff("payments/backend/nobody")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "daemon: HTTP 404: no workspace for agent payments/backend/nobody"
+    );
+    let e = host
+        .workspace_file("payments/backend/nobody", "x")
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("no workspace"), "{e}");
 }
 
 /// The two WebSocket fixtures: one frame each, asserted against `FakeHost`

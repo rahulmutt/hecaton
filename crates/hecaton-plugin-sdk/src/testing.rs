@@ -17,14 +17,19 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use hecaton_api::{
-    CHAIN_BUDGET_MS, ErrorBody, FleetRecord, HelloRequest, HelloResponse, HookEvent,
+    CHAIN_BUDGET_MS, EntryKind, ErrorBody, FleetRecord, HelloRequest, HelloResponse, HookEvent,
     InterceptRequest, InterceptResponse, KvKeys, PluginAction, ResizeFrame, TextFrame, Timestamp,
+    TreeEntry, WorkspaceDiff, WorkspaceTree,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, watch};
 
 use crate::{Env, Host, Plugin, SdkError, bind, run};
+
+/// One agent's `set_workspace`: the diff and a flat relative-path → bytes
+/// map `file`/`tree` are derived from.
+type Workspace = (WorkspaceDiff, BTreeMap<String, Vec<u8>>);
 
 struct Inner {
     token: String,
@@ -45,6 +50,9 @@ struct Inner {
     resizes: Mutex<Vec<(String, Value)>>,
     attaches: Mutex<Vec<String>>,
     kv: Mutex<BTreeMap<String, (Vec<u8>, bool)>>,
+    workspaces: Mutex<BTreeMap<String, Workspace>>,
+    /// `fail_actions`: while set, `POST agents/…/actions` answers 500.
+    action_failure: Mutex<Option<String>>,
 }
 
 /// A fake daemon, started on `127.0.0.1:0`, that a real `Host` can talk to.
@@ -69,6 +77,8 @@ impl FakeHost {
             resizes: Mutex::new(Vec::new()),
             attaches: Mutex::new(Vec::new()),
             kv: Mutex::new(BTreeMap::new()),
+            workspaces: Mutex::new(BTreeMap::new()),
+            action_failure: Mutex::new(None),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -181,6 +191,32 @@ impl FakeHost {
             .map(|(_, action)| action)
             .collect()
     }
+
+    /// What the three workspace routes answer for `agent`: the diff as
+    /// given (its `base_ref` kept), and `file`/`tree` from a flat map of
+    /// relative path → bytes. An agent never set has no workspace.
+    pub fn set_workspace(
+        &self,
+        agent: &str,
+        diff: WorkspaceDiff,
+        files: BTreeMap<String, Vec<u8>>,
+    ) {
+        self.inner
+            .workspaces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(agent.to_string(), (diff, files));
+    }
+
+    /// While `Some`, every `POST agents/…/actions` answers 500 with that
+    /// message — the daemon's runner failing.
+    pub fn fail_actions(&self, message: Option<&str>) {
+        *self
+            .inner
+            .action_failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = message.map(str::to_string);
+    }
 }
 
 fn error(status: StatusCode, message: impl Into<String>) -> Response {
@@ -223,6 +259,18 @@ fn router(inner: Arc<Inner>) -> Router {
         .route(
             "/v1/plugin-host/agents/{fleet}/{crew}/{agent}/attach",
             get(attach),
+        )
+        .route(
+            "/v1/plugin-host/agents/{fleet}/{crew}/{agent}/workspace/diff",
+            get(workspace_diff),
+        )
+        .route(
+            "/v1/plugin-host/agents/{fleet}/{crew}/{agent}/workspace/file",
+            get(workspace_file),
+        )
+        .route(
+            "/v1/plugin-host/agents/{fleet}/{crew}/{agent}/workspace/tree",
+            get(workspace_tree),
         )
         .route("/v1/plugin-host/kv", get(list_keys))
         .route(
@@ -414,6 +462,113 @@ async fn attach(
     })
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct PathQuery {
+    path: String,
+}
+
+/// The entries directly under `path` in a flat path map; `None` when
+/// nothing lives there (the same shape `hecaton_core::fakes` derives).
+fn tree_of(files: &BTreeMap<String, Vec<u8>>, path: &str) -> Option<WorkspaceTree> {
+    let prefix = if path.is_empty() {
+        String::new()
+    } else {
+        format!("{path}/")
+    };
+    let mut entries: BTreeMap<String, TreeEntry> = BTreeMap::new();
+    for (key, bytes) in files {
+        let Some(rest) = key.strip_prefix(&prefix) else {
+            continue;
+        };
+        match rest.split_once('/') {
+            Some((dir, _)) => {
+                entries.entry(dir.to_string()).or_insert(TreeEntry {
+                    name: dir.to_string(),
+                    kind: EntryKind::Dir,
+                    size: None,
+                });
+            }
+            None => {
+                entries.insert(
+                    rest.to_string(),
+                    TreeEntry {
+                        name: rest.to_string(),
+                        kind: EntryKind::File,
+                        size: Some(bytes.len() as u64),
+                    },
+                );
+            }
+        }
+    }
+    if entries.is_empty() && !path.is_empty() {
+        return None;
+    }
+    Some(WorkspaceTree {
+        path: path.to_string(),
+        entries: entries.into_values().collect(),
+    })
+}
+
+fn with_workspace<T: IntoResponse>(
+    inner: &Inner,
+    headers: &HeaderMap,
+    (fleet, crew, agent): (String, String, String),
+    f: impl FnOnce(&WorkspaceDiff, &BTreeMap<String, Vec<u8>>) -> T,
+) -> Response {
+    if let Some(resp) = unauthorized(inner, headers) {
+        return resp;
+    }
+    let id = format!("{fleet}/{crew}/{agent}");
+    let ws = inner.workspaces.lock().unwrap_or_else(|e| e.into_inner());
+    match ws.get(&id) {
+        Some((diff, files)) => f(diff, files).into_response(),
+        None => error(
+            StatusCode::NOT_FOUND,
+            format!("no workspace for agent {id}"),
+        ),
+    }
+}
+
+async fn workspace_diff(
+    State(inner): State<Arc<Inner>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<(String, String, String)>,
+) -> Response {
+    with_workspace(&inner, &headers, id, |diff, _| Json(diff.clone()))
+}
+
+async fn workspace_file(
+    State(inner): State<Arc<Inner>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<(String, String, String)>,
+    Query(q): Query<PathQuery>,
+) -> Response {
+    with_workspace(&inner, &headers, id, |_, files| match files.get(&q.path) {
+        Some(bytes) => {
+            ([(CONTENT_TYPE, "application/octet-stream")], bytes.clone()).into_response()
+        }
+        None => error(StatusCode::NOT_FOUND, "no such path"),
+    })
+}
+
+async fn workspace_tree(
+    State(inner): State<Arc<Inner>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<(String, String, String)>,
+    Query(q): Query<PathQuery>,
+) -> Response {
+    with_workspace(&inner, &headers, id, |_, files| {
+        if files.contains_key(&q.path) {
+            return error(StatusCode::BAD_REQUEST, "not a directory");
+        }
+        match tree_of(files, &q.path) {
+            Some(tree) => Json(tree).into_response(),
+            None => error(StatusCode::NOT_FOUND, "no such path"),
+        }
+    })
+}
+
 async fn post_action(
     State(inner): State<Arc<Inner>>,
     headers: HeaderMap,
@@ -422,6 +577,14 @@ async fn post_action(
 ) -> Response {
     if let Some(resp) = unauthorized(&inner, &headers) {
         return resp;
+    }
+    if let Some(message) = inner
+        .action_failure
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, message);
     }
     let Json(action) = match body {
         Ok(b) => b,
