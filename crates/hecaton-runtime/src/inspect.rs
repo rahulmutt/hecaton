@@ -193,11 +193,14 @@ impl WorkspaceReader for Runtime {
         let merge_base = git(&["merge-base", base_ref, "HEAD"], &[0])?
             .trim()
             .to_string();
-        let mut files = parse_name_status(&git(
-            &["diff", "--name-status", "-z", "--find-renames", &merge_base],
-            &[0],
-        )?);
-        let dirty = split_z(&git(&["diff", "--name-only", "-z", "HEAD"], &[0])?);
+        let mut name_status_args: Vec<&str> = vec!["diff"];
+        name_status_args.extend(DIFF_FLAGS);
+        name_status_args.extend(["--name-status", "-z", "--find-renames", &merge_base]);
+        let mut files = parse_name_status(&git(&name_status_args, &[0])?);
+        let mut name_only_args: Vec<&str> = vec!["diff"];
+        name_only_args.extend(DIFF_FLAGS);
+        name_only_args.extend(["--name-only", "-z", "HEAD"]);
+        let dirty = split_z(&git(&name_only_args, &[0])?);
         let untracked = split_z(&git(
             &["ls-files", "--others", "--exclude-standard", "-z"],
             &[0],
