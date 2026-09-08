@@ -18,6 +18,57 @@ fn wait_for(mut f: impl FnMut() -> bool) {
     }
 }
 
+/// Two crews on one socket race at daemon start: the first `new-session`
+/// brings the server up, and for a moment it has no session at all. tmux
+/// then answers `has-session -t =<crew>` with "no current target" rather
+/// than "can't find session", and that must read as absent, not as a
+/// failed step — a failed step waits out the whole resync cadence.
+#[test]
+fn ensure_crew_on_a_server_with_no_sessions_creates_the_session() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("tmux", false));
+        return;
+    };
+    let socket = format!("hecaton-test-empty-{}", std::process::id());
+    let r = TmuxRunner::new(tools.tmux.clone(), socket.clone());
+    let tmux = |args: &[&str]| {
+        std::process::Command::new(&tools.tmux)
+            .args(["-L", &socket])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    // A server that stays up with zero sessions (the transient state
+    // caught mid-race, held still).
+    let out = tmux(&[
+        "-f",
+        "/dev/null",
+        "start-server",
+        ";",
+        "set",
+        "-g",
+        "exit-empty",
+        "off",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let probe = tmux(&["has-session", "-t", "=f/c"]);
+    assert!(
+        String::from_utf8_lossy(&probe.stderr).contains("no current target"),
+        "the precondition this test exists for: {}",
+        String::from_utf8_lossy(&probe.stderr)
+    );
+
+    let crew = "f/c/a".parse::<AgentId>().unwrap().crew_ref();
+    let created = r.ensure_crew(&crew);
+    let kill = tmux(&["kill-server"]);
+    created.unwrap();
+    assert!(kill.status.success());
+}
+
 #[test]
 fn session_window_observe_exit_respawn_and_teardown() {
     let Some(tools) = support::tools() else {

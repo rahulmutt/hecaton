@@ -26,7 +26,9 @@ use crate::daemon::{Daemon, DaemonError};
 use crate::hooks;
 use crate::plugins::{PluginAddr, PluginError};
 use crate::proxy;
-use crate::sessions::{COOKIE, MOUNT_PREFIX, cookie_value, login_target, same_origin, set_cookie};
+use crate::sessions::{
+    COOKIE, CodeRejected, MOUNT_PREFIX, cookie_value, login_target, same_origin, set_cookie,
+};
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -137,8 +139,10 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
     let plugin_host = crate::plugin_api::router().layer(DefaultBodyLimit::max(1 << 20));
     // The plugin mount authenticates itself (bearer or session cookie),
     // so it sits outside the admin middleware. `/v1/plugins/{name}` with
-    // no slash stays the purge route.
+    // no slash stays the purge route for DELETE; a GET there is a browser
+    // whose URL lost its final `/`, sent on to the mount.
     let mount = Router::new()
+        .route("/v1/plugins/{name}", get(mount_root_redirect))
         .route("/v1/plugins/{name}/", any(proxy_root))
         .route("/v1/plugins/{name}/{*rest}", any(proxy_rest));
     Router::new()
@@ -387,6 +391,23 @@ async fn proxy_root(
     proxied(&state, &name, req).await
 }
 
+/// `GET /v1/plugins/{name}`: a 308 to the mount root proper. Nothing is
+/// checked or revealed; the mount authenticates the follow-up itself.
+async fn mount_root_redirect(Path(name): Path<String>) -> Response {
+    match name.parse::<AgentName>() {
+        Ok(name) => (
+            StatusCode::PERMANENT_REDIRECT,
+            [(LOCATION, format!("{MOUNT_PREFIX}{name}/"))],
+        )
+            .into_response(),
+        Err(_) => ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("plugin {name:?} has no routes"),
+        )
+        .into_response(),
+    }
+}
+
 /// `rest` is captured only so the route matches; the proxy reads it back
 /// off the raw path, because `Path` percent-decodes what it captures.
 async fn proxy_rest(
@@ -470,18 +491,62 @@ fn authenticate_browser_or_admin(state: &AppState, headers: &HeaderMap) -> Resul
             Err(unauthorized())
         };
     }
+    let hdr = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .to_string()
+    };
     match cookie_value(headers, COOKIE) {
         Some(id) if state.daemon.sessions().is_valid(&id) => {
             if same_origin(headers, state.daemon.origin()) {
                 Ok(())
             } else {
+                tracing::warn!(
+                    host = hdr("host"),
+                    sec_fetch_site = hdr("sec-fetch-site"),
+                    origin = hdr("origin"),
+                    "proxy: session cookie refused as cross-origin"
+                );
                 Err(ApiError::new(
                     StatusCode::FORBIDDEN,
                     "cross-origin request refused",
                 ))
             }
         }
-        _ => Err(unauthorized()),
+        found => {
+            // Names only: a value is a credential. Tells apart a browser that
+            // withheld the cookie from a proxy that stripped the header and
+            // from a session this daemon never issued (a restart, say).
+            tracing::warn!(
+                host = hdr("host"),
+                sec_fetch_site = hdr("sec-fetch-site"),
+                cookies = cookie_names(headers),
+                session_cookie = match found {
+                    Some(_) => "present but not a live session",
+                    None => "absent",
+                },
+                "proxy: no bearer and no live session cookie"
+            );
+            Err(unauthorized())
+        }
+    }
+}
+
+/// The names of every cookie sent, for the log; values stay out of it.
+fn cookie_names(headers: &HeaderMap) -> String {
+    let names: Vec<&str> = headers
+        .get_all("cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|line| line.split(';'))
+        .filter_map(|pair| pair.trim().split_once('=').map(|(k, _)| k.trim()))
+        .collect();
+    if names.is_empty() {
+        "-".to_string()
+    } else {
+        names.join(",")
     }
 }
 
@@ -492,13 +557,25 @@ struct LoginQuery {
 }
 
 /// `GET /v1/login/{code}`: the browser's end. A live code becomes a session
-/// cookie and a 303 to `to`; anything else is a plain-text 404 — the page
-/// is for a human who pasted a stale URL, not for a client parsing JSON.
+/// cookie and a 303 to `to`; anything else is a plain-text 404 naming why
+/// — the page is for a human who pasted a stale URL, not for a client
+/// parsing JSON. Every attempt is logged with the headers that show which
+/// way it came (a reverse proxy rewrites `Host`; a prefetch or a redirect
+/// through an identity provider shows in `Sec-Fetch-Site`), never the code.
 async fn login(
     State(state): State<AppState>,
+    headers: HeaderMap,
     code: Result<Path<String>, PathRejection>,
     q: Result<Query<LoginQuery>, QueryRejection>,
 ) -> Response {
+    let hdr = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .to_string()
+    };
+    let (host, site, agent) = (hdr("host"), hdr("sec-fetch-site"), hdr("user-agent"));
     let to = match q {
         Ok(Query(q)) => match login_target(q.to.as_deref()) {
             Some(to) => to,
@@ -513,15 +590,31 @@ async fn login(
         Err(e) => return (StatusCode::BAD_REQUEST, e.body_text()).into_response(),
     };
     let Ok(Path(code)) = code else {
-        return (StatusCode::NOT_FOUND, "unknown or expired login code").into_response();
+        return (StatusCode::NOT_FOUND, CodeRejected::Unknown.to_string()).into_response();
     };
     match state.daemon.sessions().redeem(&code) {
-        Some(id) => (
-            StatusCode::SEE_OTHER,
-            [(LOCATION, to), (SET_COOKIE, set_cookie(&id))],
-        )
-            .into_response(),
-        None => (StatusCode::NOT_FOUND, "unknown or expired login code").into_response(),
+        Ok(id) => {
+            tracing::info!(
+                host,
+                sec_fetch_site = site,
+                user_agent = agent,
+                "login: code redeemed, session cookie set"
+            );
+            (
+                StatusCode::SEE_OTHER,
+                [(LOCATION, to), (SET_COOKIE, set_cookie(&id))],
+            )
+                .into_response()
+        }
+        Err(why) => {
+            tracing::warn!(
+                host,
+                sec_fetch_site = site,
+                user_agent = agent,
+                "login refused: {why}"
+            );
+            (StatusCode::NOT_FOUND, why.to_string()).into_response()
+        }
     }
 }
 

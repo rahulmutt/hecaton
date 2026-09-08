@@ -8,9 +8,12 @@
 # read, whether onboarding appeared, and HOME relocation (nono's own $HOME).
 #
 # Your real $HOME stays: the client needs ~/.claude for credentials and the
-# host settings layer. Only the three XDG roots move to target/tmp/verify-claude,
-# so your real hecaton state is untouched. Nothing secret is printed: no
-# settings.json, no hosts.yml, no token, no hook secret.
+# host settings layer. Only the three XDG roots move: config and state to
+# target/tmp/verify-claude, wiped every run, and data to target/tmp/verify-data,
+# kept across runs so the pinned claude (a 200 MB download into the shared
+# MISE_DATA_DIR) is fetched once per version, not once per run. Your real
+# hecaton state is untouched. Nothing secret is printed: no settings.json,
+# no hosts.yml, no token, no hook secret.
 #
 # HECATON_VERIFY_FAKE=1 swaps in `hecaton dev fake-claude`, an empty tool table
 # and no host defaults — the maintainers' self-test of this script.
@@ -18,6 +21,7 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT="$REPO/target/tmp/verify-claude"
+DATA="$REPO/target/tmp/verify-data"   # survives runs: tool installs only
 FLEET=verify
 CREW=c
 AGENT=a
@@ -27,7 +31,7 @@ FAKE="${HECATON_VERIFY_FAKE:-0}"
 
 export XDG_CONFIG_HOME="$ROOT/xdg/config"
 export XDG_STATE_HOME="$ROOT/xdg/state"
-export XDG_DATA_HOME="$ROOT/xdg/data"
+export XDG_DATA_HOME="$DATA"
 unset HECATON_API_URL
 STATE="$XDG_STATE_HOME/hecaton"
 SERVER="$STATE/server"
@@ -53,7 +57,8 @@ cleanup() {
     fi
   fi
   tmux -L "$SOCKET" kill-server >/dev/null 2>&1 || true
-  say "state kept for inspection under $STATE (delete target/tmp/verify-claude when done)"
+  say "state kept for inspection under $STATE (delete target/tmp/verify-claude when done;"
+  say "tool installs stay in target/tmp/verify-data so the next run skips the download)"
 }
 trap cleanup EXIT
 
@@ -147,16 +152,25 @@ else
   UP=failed
 fi
 
-if [ "$WEB" = 1 ] && [ "$UP" = ok ]; then
+# The login URL is single use and lives 60 s from the moment it is minted,
+# so it is minted right when you are told to open it (fake mode: once, as
+# the smoke check). A second visit to a spent URL says why it was refused,
+# and server.log records every attempt with the Host and Sec-Fetch-Site it
+# arrived with.
+browser_login() {
   hr "browser terminal (plugins spec §14)"
   LOGIN="$("$HECATON" plugin open web 2>/dev/null || true)"
   if [ -n "$LOGIN" ]; then
-    say ">>> Open this once in a browser (valid 60 s; it becomes a session cookie):"
+    say ">>> Open this once in a browser, now (valid 60 s; it becomes a session cookie):"
     say ">>>     $LOGIN"
+    say ">>> Through a reverse proxy: replace only the origin ($URL), keep the path and"
+    say ">>> query. If the proxy signs you in first, or the code lapses, mint a fresh one:"
+    say ">>>     XDG_STATE_HOME=$XDG_STATE_HOME $HECATON plugin open web"
   else
     say "plugin open web failed; see $SERVER/server.log"
   fi
-fi
+}
+if [ "$WEB" = 1 ] && [ "$UP" = ok ] && [ "$FAKE" = 1 ]; then browser_login; fi
 
 metrics() { curl -sf "$URL/metrics" 2>/dev/null | grep '^hecaton_hook_events_total' || say "(no hook events counted yet)"; }
 
@@ -178,6 +192,8 @@ if [ "$FAKE" = 1 ]; then
   ONBOARD="n (fake)"
   sleep 2
 else
+  say
+  if [ "$WEB" = 1 ]; then browser_login; fi
   say
   say ">>> Now attach in another terminal:"
   say ">>>     tmux -L $SOCKET attach -t $FLEET/$CREW"

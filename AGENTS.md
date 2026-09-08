@@ -20,7 +20,9 @@ credentials, hook input, or sandbox rules.
   (`HOME` is overridden, so it never touches your real state).
 - `verify-claude` — the interactive spec §8.1 check with a real `claude`
   (`scripts/verify-claude.sh`); `HECATON_VERIFY_FAKE=1` self-tests it with
-  `dev fake-claude`.
+  `dev fake-claude`. Its data root (`target/tmp/verify-data`, the shared
+  `MISE_DATA_DIR`) is kept across runs so claude downloads once per
+  version; config and state under `target/tmp/verify-claude` are wiped.
 - `lint`, `test`, `fmt`, `precommit`, `audit` — defined in `mise.toml`.
 - `vendor-xterm` is a script, not a task: `scripts/vendor-xterm.sh` re-fetches
   and verifies the web plugin's assets against
@@ -72,6 +74,14 @@ credentials, hook input, or sandbox rules.
   dir is `home/tmp` via `TMPDIR`/`CLAUDE_CODE_TMPDIR` — nothing under `/tmp`
   is granted. Both were found by `mise run verify-claude` against the real
   `claude`, not by the e2e (the fake needs neither).
+- tmux answers `has-session -t =<crew>` with "no current target" while its
+  server is up with no session at all — the moment another crew's
+  `new-session` on the same socket is starting it. `TmuxRunner` reads that
+  as absent like "can't find session"; before it did, every daemon start
+  with two crews (verify-claude's plugins fleet plus the fleet under test)
+  failed its first pass and waited out the 30 s resync before `up` could
+  proceed. The actor logs `agent ready (SessionStart received)`, the only
+  line that dates readiness; the tick after it logs the phase.
 - `Workspace::git` (`crates/hecaton-runtime/src/workspace.rs`) scrubs
   `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_PREFIX`/`GIT_COMMON_DIR` from
   every git call via `Cmd::env_remove`, and the integration-test `git`
@@ -192,12 +202,24 @@ credentials, hook input, or sandbox rules.
 - The root of a plugin mount forwards to `/v1/routes` (no slash); axum's
   `nest` answers the nested `/` there and 404s `/v1/routes/`. A plugin's
   `routes()` router registers `/`, not `/index`.
-- Cookie-authenticated proxy requests need `Sec-Fetch-Site: same-origin`
+- Cookie-authenticated proxy requests need `Sec-Fetch-Site: same-origin`,
   or an `Origin` equal to the exact `http://127.0.0.1:<port>` of the login
-  URL; `localhost` is another origin. A test client that sends neither
-  passes (a navigation sends neither).
+  URL (`localhost` is another origin) or whose authority is the request's
+  `Host` (a WebSocket handshake through a reverse proxy: no
+  `Sec-Fetch-Site`, `Origin` the proxy's hostname — found by
+  `verify-claude` behind one, as `[disconnected]` on the terminal page). A
+  test client that sends none of them passes (a navigation sends none).
+- `/v1/plugins/<name>` without the trailing slash is the admin purge
+  route, so a browser there got 401 `missing or invalid admin token`
+  even with a good cookie; a GET there is now a 308 to the mount, and a
+  login `to` of a bare mount root gains its slash. Found by
+  `verify-claude` through a reverse proxy, where the URL's final `/`
+  went missing in the copy.
 - `hecaton plugin open <name>` prints a URL valid for 60 s, once. Opening
-  it twice is a 404 by design.
+  it twice is a 404 by design; the body says `already used Ns ago` or
+  `expired Ns ago` (remembered 10 min), and server.log records every
+  attempt with its `Host`, `Sec-Fetch-Site` and `User-Agent` — read those
+  before blaming a reverse proxy or a prefetching browser.
 - The web plugin's assets are `include_bytes!` of `assets/`; the crate
   does not build without them. Run `scripts/vendor-xterm.sh` after a
   fresh clone only if the files are missing — they are committed.
