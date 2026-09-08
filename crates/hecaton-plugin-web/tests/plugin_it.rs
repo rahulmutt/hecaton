@@ -153,10 +153,23 @@ async fn pages_link_through_the_forwarded_prefix_and_assets_are_served() {
     let (status, _, _) = h.get_route("/agents/e2e/c/bob/ws", "/v1/plugins/web").await;
     assert_ne!(status, 200, "and no bridge");
 
+    // the bytes are the committed files, whatever their size this week
     for (file, kind, len) in [
-        ("xterm.js", "text/javascript", 488663),
-        ("xterm.css", "text/css", 7112),
-        ("addon-fit.js", "text/javascript", 1521),
+        (
+            "xterm.js",
+            "text/javascript",
+            include_bytes!("../assets/xterm.js").len(),
+        ),
+        (
+            "xterm.css",
+            "text/css",
+            include_bytes!("../assets/xterm.css").len(),
+        ),
+        (
+            "addon-fit.js",
+            "text/javascript",
+            include_bytes!("../assets/addon-fit.js").len(),
+        ),
     ] {
         let (status, headers, body) = h
             .get_route(&format!("/assets/{digest}/{file}"), "/v1/plugins/web")

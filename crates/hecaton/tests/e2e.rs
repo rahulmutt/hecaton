@@ -1157,6 +1157,20 @@ fn web_package() -> Option<PathBuf> {
 }
 
 /// `GET` with explicit headers, no redirects followed: status, headers, body.
+/// The sha256 `crates/hecaton-plugin-web/assets/VENDOR.md` records for
+/// `file`: the last backticked field of its table row.
+fn vendored_sha256(file: &str) -> String {
+    let vendor = include_str!("../../hecaton-plugin-web/assets/VENDOR.md");
+    let row = vendor
+        .lines()
+        .find(|l| l.starts_with(&format!("| `{file}` |")))
+        .unwrap_or_else(|| panic!("VENDOR.md has no row for {file}"));
+    row.rsplit('`')
+        .nth(1)
+        .unwrap_or_else(|| panic!("no digest in {row:?}"))
+        .to_string()
+}
+
 fn raw_get(url: &str, headers: &[(&str, &str)]) -> (u16, Vec<(String, String)>, String) {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
@@ -1344,11 +1358,20 @@ fn web_journey() {
         page.contains(&format!("{marker}{digest}/xterm.js")),
         "{page}"
     );
+    // the served bundle is the one VENDOR.md records, byte for byte
     let (status, _, js) = raw_get(
         &format!("{mount}assets/{digest}/xterm.js"),
         &[("Cookie", &cookie)],
     );
-    assert_eq!((status, js.len()), (200, 488663));
+    assert_eq!(status, 200);
+    assert_eq!(
+        {
+            use sha2::Digest as _;
+            hex::encode(sha2::Sha256::digest(js.as_bytes()))
+        },
+        vendored_sha256("xterm.js"),
+        "the served xterm.js is not the vendored one"
+    );
 
     // the terminal: through the proxy, the plugin and the daemon's attach
     // to alice's tmux window — fake-claude's pane appears, typed bytes
