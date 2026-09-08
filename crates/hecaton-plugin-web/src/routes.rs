@@ -7,7 +7,7 @@ use std::sync::{Arc, LazyLock};
 
 use axum::body::Bytes;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
@@ -44,6 +44,10 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/agents.json", get(agents_json))
         .route("/agents/{fleet}/{crew}/{agent}", get(terminal))
         .route("/agents/{fleet}/{crew}/{agent}/ws", get(bridge_route))
+        .route(
+            "/agents/{fleet}/{crew}/{agent}/events.json",
+            get(events_json),
+        )
         .route("/assets/{digest}/{file}", get(asset))
         .with_state(shared)
 }
@@ -203,6 +207,29 @@ async fn terminal(
         return (StatusCode::NOT_FOUND, "no such agent").into_response();
     }
     Html(terminal_html(&prefix(&headers), &id)).into_response()
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default)]
+struct AfterQuery {
+    after: u64,
+}
+
+/// The activity column's poll: entries after `after`, and the phase.
+async fn events_json(
+    State(shared): State<Arc<Shared>>,
+    Path((fleet, crew, agent)): Path<(String, String, String)>,
+    q: Result<Query<AfterQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let id = format!("{fleet}/{crew}/{agent}");
+    if !shared.cache.is_enabled(&id) {
+        return (StatusCode::NOT_FOUND, "no such agent").into_response();
+    }
+    let after = match q {
+        Ok(Query(q)) => q.after,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.body_text()).into_response(),
+    };
+    Json(shared.cache.events_after(&id, after)).into_response()
 }
 
 async fn bridge_route(

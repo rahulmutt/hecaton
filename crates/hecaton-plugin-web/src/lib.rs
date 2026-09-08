@@ -10,4 +10,7 @@ pub mod state;
 
 pub use config::{ConfigError, WebConfig, parse};
 pub use plugin::{Shared, WebPlugin};
-pub use state::{AgentRow, Cache, rows_of};
+pub use state::{
+    AgentRow, Cache, EVENT_BUFFER, Entry, Events, PAYLOAD_LIMIT, cut_payload, now, rows_of,
+    summarize,
+};

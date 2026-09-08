@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use hecaton_api::{AgentPhase, FleetRecord, FleetSpec};
-use hecaton_plugin_sdk::testing::{FakeHost, Harness, metric};
+use hecaton_plugin_sdk::testing::{FakeHost, Harness, event, metric};
 use hecaton_plugin_sdk::{Env, Host};
 use hecaton_plugin_web::WebPlugin;
 use serde_json::{Value, json};
@@ -316,4 +316,63 @@ async fn the_bridge_relays_bytes_and_resizes_to_the_daemon_attach() {
     );
     assert!(connect_async(req).await.is_err());
     assert_eq!(fake.attaches().len(), 1);
+}
+
+#[tokio::test]
+async fn observed_events_feed_the_activity_column_of_enabled_agents() {
+    let (fake, _, h, _watch) = world().await;
+    h.activate(ALICE, json!({})).await.unwrap();
+    h.activate(BOB, json!({ "enabled": false })).await.unwrap();
+    fake.set_fleets(vec![fleet(&[(ALICE, AgentPhase::Ready)])]);
+    h.observe(vec![
+        event(
+            ALICE,
+            "PreToolUse",
+            json!({ "tool_name": "Bash", "tool_input": { "command": "cargo test" } }),
+        ),
+        event(BOB, "Stop", json!({})),
+        event(
+            ALICE,
+            "Notification",
+            json!({ "message": "x".repeat(6000) }),
+        ),
+        event(ALICE, "Stop", json!({})),
+    ])
+    .await;
+    let (status, _, body) = h
+        .get_route("/agents/e2e/c/alice/events.json", "/v1/plugins/web")
+        .await;
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["phase"], "ready");
+    let events = v["events"].as_array().unwrap();
+    assert_eq!(events.len(), 3, "{v}");
+    assert_eq!(events[0]["seq"], 1);
+    assert_eq!(events[0]["summary"], "Bash: cargo test");
+    assert_eq!(events[1]["payload_truncated"], true);
+    assert_eq!(events[1]["payload"]["truncated"], true);
+    assert_eq!(events[2]["summary"], "turn ended");
+    let (status, _, body) = h
+        .get_route("/agents/e2e/c/alice/events.json?after=2", "/v1/plugins/web")
+        .await;
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["events"].as_array().unwrap().len(), 1);
+    assert_eq!(v["events"][0]["seq"], 3);
+    let (status, _, _) = h
+        .get_route("/agents/e2e/c/bob/events.json", "/v1/plugins/web")
+        .await;
+    assert_eq!(
+        status, 404,
+        "hidden agents have no column and their events were dropped"
+    );
+    let (status, _, _) = h
+        .get_route("/agents/e2e/c/alice/events.json?after=x", "/v1/plugins/web")
+        .await;
+    assert_eq!(status, 400);
+    let text = h.metrics().await;
+    assert_eq!(
+        metric(&text, "hecaton_plugin_web_events_buffered_total", &[]),
+        Some(3.0)
+    );
 }
