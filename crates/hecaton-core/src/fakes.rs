@@ -362,6 +362,8 @@ impl Clock for FakeClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     fn id(s: &str) -> AgentId {
         s.parse().unwrap()
@@ -451,22 +453,64 @@ mod tests {
         assert_eq!(c.now(), Timestamp(1));
     }
 
+    /// Drains `reader` on a thread: one message per read, ending at EOF or
+    /// an error. A fake that never wakes its reader then fails `next` after
+    /// a bound instead of hanging the test (and its mutation run).
+    fn reads(mut reader: Box<dyn Read + Send>) -> mpsc::Receiver<io::Result<Vec<u8>>> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8];
+            loop {
+                let r = reader.read(&mut buf).map(|n| buf[..n].to_vec());
+                let done = !matches!(&r, Ok(v) if !v.is_empty());
+                if tx.send(r).is_err() || done {
+                    break;
+                }
+            }
+        });
+        rx
+    }
+
+    fn next(rx: &mpsc::Receiver<io::Result<Vec<u8>>>) -> Vec<u8> {
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("the fake reader stalled")
+            .expect("the fake reader failed")
+    }
+
+    #[test]
+    fn set_fail_observe_fails_every_observe_until_cleared() {
+        let r = FakeRunner::default();
+        let fleet: FleetName = "f".parse().unwrap();
+        r.set_fail_observe(true);
+        let e = r.observe(&fleet).unwrap_err().to_string();
+        assert!(e.contains("fake observe failure"), "{e}");
+        assert!(r.observe(&fleet).is_err(), "keeps failing until cleared");
+        r.set_fail_observe(false);
+        assert!(r.observe(&fleet).is_ok());
+    }
+
+    #[test]
+    fn send_text_is_recorded_and_failable() {
+        let r = FakeRunner::default();
+        r.send_text(&id("f/c/a"), "hi", true).unwrap();
+        assert_eq!(r.calls(), vec!["send_text f/c/a \"hi\" submit=true"]);
+        r.fail_next("send_text", "f/c/a \"no\" submit=false", "no window");
+        assert!(r.send_text(&id("f/c/a"), "no", false).is_err());
+    }
+
     #[test]
     fn the_fake_pty_echoes_records_resizes_and_closes() {
-        use std::io::{Read, Write};
         let r = FakeRunner::default();
         let pty = r.attach(&id("f/c/a")).unwrap();
-        let mut reader = pty.reader().unwrap();
+        let rx = reads(pty.reader().unwrap());
         let mut writer = pty.writer().unwrap();
         writer.write_all(b"hi").unwrap();
-        let mut buf = [0u8; 8];
-        assert_eq!(reader.read(&mut buf).unwrap(), 2);
-        assert_eq!(&buf[..2], b"hi");
+        assert_eq!(next(&rx), b"hi");
         pty.resize(120, 40).unwrap();
         assert_eq!(r.resizes(), vec![("f/c/a".to_string(), 120, 40)]);
         assert!(r.close_attach(&id("f/c/a")), "an open attach was closed");
         assert!(!r.close_attach(&id("f/c/a")), "and only once");
-        assert_eq!(reader.read(&mut buf).unwrap(), 0, "EOF after close");
+        assert_eq!(next(&rx), b"", "EOF after close");
         assert_eq!(
             writer.write_all(b"x").unwrap_err().kind(),
             std::io::ErrorKind::BrokenPipe
@@ -474,9 +518,9 @@ mod tests {
         assert!(r.calls().contains(&"attach f/c/a".to_string()));
         // dropping the stream closes it too
         let pty = r.attach(&id("f/c/b")).unwrap();
-        let mut reader = pty.reader().unwrap();
+        let rx = reads(pty.reader().unwrap());
         drop(pty);
-        assert_eq!(reader.read(&mut buf).unwrap(), 0);
+        assert_eq!(next(&rx), b"", "EOF after drop");
         r.fail_next("attach", "f/c/c", "no window");
         assert!(r.attach(&id("f/c/c")).is_err());
     }

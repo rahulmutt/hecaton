@@ -10,6 +10,8 @@ allow = [
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Workspace path dependencies carry no version; every crate is `publish = false`.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
