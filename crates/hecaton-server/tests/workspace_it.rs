@@ -155,10 +155,35 @@ async fn workspace_routes_are_gated_by_capability_activation_and_the_path_rule()
     let tree = web.workspace_tree("f/c/a", "").await.unwrap();
     assert_eq!(tree.entries.len(), 2);
     assert_eq!(tree.entries[1].name, "src");
-    // the raw statuses: 403 without the capability, 404 for an active pair
-    // with no worktree, 404 for a pair that is not active, 413, 400
+    // the version: the diff's head and a 64-hex fingerprint over the files
     let web_tok = token(&w, "web").await;
     let flow_tok = token(&w, "flow").await;
+    let (s, v) = w.api.plugin(
+        &web_tok,
+        "GET",
+        "/v1/plugin-host/agents/f/c/a/workspace/version",
+        None,
+    );
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["head"], "h".repeat(40));
+    assert_eq!(v["fingerprint"].as_str().unwrap().len(), 64);
+    assert!(
+        w.h.workspace
+            .calls()
+            .contains(&"version f/c/a origin/release".to_string())
+    );
+    let (s, v) = w.api.plugin(
+        &web_tok,
+        "GET",
+        "/v1/plugin-host/agents/f/c/b/workspace/version",
+        None,
+    );
+    assert_eq!(
+        (s, v["error"].as_str()),
+        (404, Some("no workspace for agent f/c/b"))
+    );
+    // the raw statuses: 403 without the capability, 404 for an active pair
+    // with no worktree, 404 for a pair that is not active, 413, 400
     let (s, v) = w.api.plugin(
         &flow_tok,
         "GET",
@@ -172,6 +197,17 @@ async fn workspace_routes_are_gated_by_capability_activation_and_the_path_rule()
     );
     let e = flow.workspace_diff("f/c/a").await.unwrap_err();
     assert!(e.to_string().starts_with("daemon: HTTP 403"), "{e}");
+    let (s, v) = w.api.plugin(
+        &flow_tok,
+        "GET",
+        "/v1/plugin-host/agents/f/c/a/workspace/version",
+        None,
+    );
+    assert_eq!(s, 403, "{v}");
+    assert_eq!(
+        v["error"],
+        "capability \"workspace\" not declared in hecaton-plugin.yaml"
+    );
     let (s, v) = w.api.plugin(
         &web_tok,
         "GET",

@@ -9,7 +9,9 @@ use axum::http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use hecaton_api::{Capability, KvKeys, PluginAction, WorkspaceDiff, WorkspaceTree};
+use hecaton_api::{
+    Capability, KvKeys, PluginAction, WorkspaceDiff, WorkspaceTree, WorkspaceVersion,
+};
 use hecaton_core::{AgentId, AgentName, FleetName, FleetRecord, is_reserved_fleet};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -48,6 +50,10 @@ pub(crate) fn router() -> Router<AppState> {
         .route(
             "/v1/plugin-host/agents/{fleet}/{crew}/{agent}/workspace/tree",
             get(workspace_tree),
+        )
+        .route(
+            "/v1/plugin-host/agents/{fleet}/{crew}/{agent}/workspace/version",
+            get(workspace_version),
         )
 }
 
@@ -239,6 +245,27 @@ async fn workspace_tree(
         .await
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
     Ok(Json(tree))
+}
+
+/// Spec D §2.2: the worktree's fingerprint against the crew's base, gated
+/// like `diff`.
+async fn workspace_version(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    path: Result<Path<(String, String, String)>, PathRejection>,
+) -> Result<Json<WorkspaceVersion>, ApiError> {
+    let agent = workspace_caller(&state, &headers, path).await?;
+    let base_ref = state
+        .daemon
+        .base_ref(&agent)
+        .await
+        .ok_or(DaemonError::NotFound)?;
+    let ws = state.daemon.workspace();
+    let id = agent.clone();
+    let version = tokio::task::spawn_blocking(move || ws.version(&id, &base_ref))
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    Ok(Json(version))
 }
 
 #[derive(Debug, Default, Deserialize)]
