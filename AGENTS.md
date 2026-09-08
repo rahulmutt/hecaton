@@ -196,8 +196,17 @@ credentials, hook input, or sandbox rules.
   or an `Origin` equal to the exact `http://127.0.0.1:<port>` of the login
   URL; `localhost` is another origin. A test client that sends neither
   passes (a navigation sends neither).
+- `/v1/plugins/<name>` without the trailing slash is the admin purge
+  route, so a browser there got 401 `missing or invalid admin token`
+  even with a good cookie; a GET there is now a 308 to the mount, and a
+  login `to` of a bare mount root gains its slash. Found by
+  `verify-claude` through a reverse proxy, where the URL's final `/`
+  went missing in the copy.
 - `hecaton plugin open <name>` prints a URL valid for 60 s, once. Opening
-  it twice is a 404 by design.
+  it twice is a 404 by design; the body says `already used Ns ago` or
+  `expired Ns ago` (remembered 10 min), and server.log records every
+  attempt with its `Host`, `Sec-Fetch-Site` and `User-Agent` — read those
+  before blaming a reverse proxy or a prefetching browser.
 - The web plugin's assets are `include_bytes!` of `assets/`; the crate
   does not build without them. Run `scripts/vendor-xterm.sh` after a
   fresh clone only if the files are missing — they are committed.

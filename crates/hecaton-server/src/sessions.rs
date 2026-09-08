@@ -4,6 +4,7 @@
 //! nothing here is persisted, so sessions die with the daemon.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -16,15 +17,54 @@ use crate::vault::random_hex;
 pub const CODE_TTL: Duration = Duration::from_secs(60);
 /// How long a browser session lives.
 pub const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+/// How long a dead code (used or expired) is remembered, so a second
+/// visit to its URL is told what happened instead of "unknown".
+pub const TOMBSTONE_TTL: Duration = Duration::from_secs(10 * 60);
 pub const COOKIE: &str = "hecaton_session";
 /// Every proxied path starts here; a login may only redirect below it, and
 /// the cookie is scoped to it.
 pub const MOUNT_PREFIX: &str = "/v1/plugins/";
 
+/// Why a login code was refused. The page is for a human who pasted a
+/// stale URL; naming the reason tells them whether to hurry (expired)
+/// or to look for what else fetched the URL first (used).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeRejected {
+    /// Never issued, or dead for longer than `TOMBSTONE_TTL`.
+    Unknown,
+    /// Redeemed once already, `ago` earlier.
+    Used { ago: Duration },
+    /// Sat unused past `CODE_TTL`; it lapsed `ago` earlier.
+    Expired { ago: Duration },
+}
+
+impl fmt::Display for CodeRejected {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown => write!(f, "unknown login code"),
+            Self::Used { ago } => write!(f, "login code already used {}s ago", ago.as_secs()),
+            Self::Expired { ago } => write!(
+                f,
+                "login code expired {}s ago (a code is valid for {}s after it is printed)",
+                ago.as_secs(),
+                CODE_TTL.as_secs()
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Fate {
+    Used,
+    Expired,
+}
+
 #[derive(Default)]
 struct Inner {
     /// code → expiry
     codes: HashMap<String, Instant>,
+    /// dead code → (when it died, how)
+    dead: HashMap<String, (Instant, Fate)>,
     /// session id → expiry
     sessions: HashMap<String, Instant>,
 }
@@ -44,8 +84,27 @@ impl Sessions {
     }
 
     fn prune(inner: &mut Inner, now: Instant) {
-        inner.codes.retain(|_, expiry| *expiry > now);
-        inner.sessions.retain(|_, expiry| *expiry > now);
+        let Inner {
+            codes,
+            dead,
+            sessions,
+        } = inner;
+        codes.retain(|code, expiry| {
+            let live = *expiry > now;
+            if !live {
+                dead.insert(code.clone(), (*expiry, Fate::Expired));
+            }
+            live
+        });
+        dead.retain(|_, (at, _)| *at + TOMBSTONE_TTL > now);
+        sessions.retain(|_, expiry| *expiry > now);
+    }
+
+    /// The entry whose key equals `code`, compared in constant time each:
+    /// a lookup by key would leak through timing what a guesser is after.
+    fn find<'a, V>(map: &'a HashMap<String, V>, code: &str) -> Option<(&'a String, &'a V)> {
+        map.iter()
+            .find(|(k, _)| constant_time_eq(k.as_bytes(), code.as_bytes()))
     }
 
     /// A fresh single-use code, 32 random bytes as hex, good for `CODE_TTL`.
@@ -62,24 +121,30 @@ impl Sessions {
     }
 
     /// Exchanges a live code for a session id; the code is gone either way.
-    pub fn redeem(&self, code: &str) -> Option<String> {
+    pub fn redeem(&self, code: &str) -> Result<String, CodeRejected> {
         self.redeem_at(code, Instant::now())
     }
 
-    pub fn redeem_at(&self, code: &str, now: Instant) -> Option<String> {
+    pub fn redeem_at(&self, code: &str, now: Instant) -> Result<String, CodeRejected> {
         let mut inner = self.lock();
         Self::prune(&mut inner, now);
-        // Few codes, compared in constant time each: a lookup by key would
-        // leak through timing what a guesser is after.
-        let key = inner
-            .codes
-            .keys()
-            .find(|k| constant_time_eq(k.as_bytes(), code.as_bytes()))
-            .cloned()?;
+        let Some((key, _)) = Self::find(&inner.codes, code) else {
+            return Err(match Self::find(&inner.dead, code) {
+                Some((_, (at, Fate::Used))) => CodeRejected::Used {
+                    ago: now.saturating_duration_since(*at),
+                },
+                Some((_, (at, Fate::Expired))) => CodeRejected::Expired {
+                    ago: now.saturating_duration_since(*at),
+                },
+                None => CodeRejected::Unknown,
+            });
+        };
+        let key = key.clone();
         inner.codes.remove(&key);
+        inner.dead.insert(key, (now, Fate::Used));
         let id = random_hex(32);
         inner.sessions.insert(id.clone(), now + SESSION_TTL);
-        Some(id)
+        Ok(id)
     }
 
     pub fn is_valid(&self, id: &str) -> bool {
@@ -134,14 +199,25 @@ pub fn same_origin(headers: &HeaderMap, origin: &str) -> bool {
 /// a query, a fragment, a header or another host. A `.` or `..` segment is
 /// rejected too — a browser normalizes it out of the `Location` path per
 /// RFC 3986, and it could otherwise walk the redirect back out of the
-/// mount. `None` for anything else.
+/// mount. `None` for anything else. A bare mount root, `/v1/plugins/<name>`,
+/// gains its trailing slash: without it the path is the admin purge route,
+/// and a URL's final `/` is the first thing a copy-paste loses.
 pub fn login_target(to: Option<&str>) -> Option<String> {
     let to = to.unwrap_or(MOUNT_PREFIX);
     let charset_ok = to
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'~' | b'-'));
     let no_dot_segments = to.split('/').all(|s| !matches!(s, "." | ".."));
-    (to.starts_with(MOUNT_PREFIX) && charset_ok && no_dot_segments).then(|| to.to_string())
+    if !(to.starts_with(MOUNT_PREFIX) && charset_ok && no_dot_segments) {
+        return None;
+    }
+    let rest = &to[MOUNT_PREFIX.len()..];
+    let bare_root = !rest.is_empty() && !rest.contains('/');
+    Some(if bare_root {
+        format!("{to}/")
+    } else {
+        to.to_string()
+    })
 }
 
 #[cfg(test)]
@@ -156,15 +232,15 @@ mod tests {
         let t0 = Instant::now();
         let code = s.issue_code_at(t0);
         assert_eq!(code.len(), 64);
-        assert_eq!(s.redeem_at("nope", t0), None);
+        assert!(s.redeem_at("nope", t0).is_err());
         let id = s.redeem_at(&code, t0 + Duration::from_secs(30)).unwrap();
         assert_eq!(id.len(), 64);
         assert_ne!(id, code, "the session id is not the code");
-        assert_eq!(s.redeem_at(&code, t0), None, "single use");
+        assert!(s.redeem_at(&code, t0).is_err(), "single use");
         let late = s.issue_code_at(t0);
-        assert_eq!(
-            s.redeem_at(&late, t0 + CODE_TTL + Duration::from_secs(1)),
-            None,
+        assert!(
+            s.redeem_at(&late, t0 + CODE_TTL + Duration::from_secs(1))
+                .is_err(),
             "expired"
         );
         assert!(s.is_valid_at(&id, t0 + Duration::from_secs(3600)));
@@ -175,6 +251,49 @@ mod tests {
                 t0 + Duration::from_secs(30) + SESSION_TTL + Duration::from_secs(1)
             ),
             "sessions expire"
+        );
+    }
+
+    #[test]
+    fn a_dead_code_says_why_for_a_while() {
+        let s = Sessions::new();
+        let t0 = Instant::now();
+        let sec = Duration::from_secs;
+        assert_eq!(s.redeem_at("nope", t0), Err(CodeRejected::Unknown));
+
+        let used = s.issue_code_at(t0);
+        assert!(s.redeem_at(&used, t0 + sec(5)).is_ok());
+        assert_eq!(
+            s.redeem_at(&used, t0 + sec(8)),
+            Err(CodeRejected::Used { ago: sec(3) }),
+            "a second redemption is told when the first happened"
+        );
+
+        let stale = s.issue_code_at(t0);
+        assert_eq!(
+            s.redeem_at(&stale, t0 + CODE_TTL + sec(30)),
+            Err(CodeRejected::Expired { ago: sec(30) }),
+            "expiry is measured from the end of the code's life"
+        );
+
+        assert_eq!(
+            s.redeem_at(&used, t0 + sec(5) + TOMBSTONE_TTL + sec(1)),
+            Err(CodeRejected::Unknown),
+            "the reason is forgotten after a while"
+        );
+        assert_eq!(
+            s.redeem_at(&stale, t0 + CODE_TTL + TOMBSTONE_TTL + sec(1)),
+            Err(CodeRejected::Unknown)
+        );
+
+        assert_eq!(CodeRejected::Unknown.to_string(), "unknown login code");
+        assert_eq!(
+            CodeRejected::Used { ago: sec(3) }.to_string(),
+            "login code already used 3s ago"
+        );
+        assert_eq!(
+            CodeRejected::Expired { ago: sec(30) }.to_string(),
+            "login code expired 30s ago (a code is valid for 60s after it is printed)"
         );
     }
 
@@ -241,6 +360,26 @@ mod tests {
                 origin
             ),
             "sec-fetch-site wins when present"
+        );
+    }
+
+    #[test]
+    fn a_mount_root_target_gains_its_trailing_slash() {
+        // `/v1/plugins/<name>` without the slash is the admin purge route,
+        // not the mount; a `to` that lost its final `/` in a copy-paste
+        // must still land on the mount.
+        assert_eq!(
+            login_target(Some("/v1/plugins/web")).as_deref(),
+            Some("/v1/plugins/web/")
+        );
+        assert_eq!(
+            login_target(Some("/v1/plugins/web/agents/x")).as_deref(),
+            Some("/v1/plugins/web/agents/x"),
+            "deeper paths are the plugin's business"
+        );
+        assert_eq!(
+            login_target(Some("/v1/plugins/web/index.html")).as_deref(),
+            Some("/v1/plugins/web/index.html")
         );
     }
 

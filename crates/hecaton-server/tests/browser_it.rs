@@ -71,13 +71,28 @@ async fn a_login_code_becomes_a_cookie_once() {
     assert!(w.daemon.sessions().is_valid(id));
 
     let (s, _, text) = w.api.raw("GET", &path, &[], None);
-    assert_eq!(
-        (s, text.as_str()),
-        (404, "unknown or expired login code"),
-        "single use"
+    assert_eq!(s, 404, "single use");
+    assert!(
+        text.starts_with("login code already used ") && text.ends_with("s ago"),
+        "a second visit is told the code was spent: {text:?}"
     );
-    let (s, _, _) = w.api.raw("GET", "/v1/login/nope", &[], None);
-    assert_eq!(s, 404);
+    let (s, _, text) = w.api.raw("GET", "/v1/login/nope", &[], None);
+    assert_eq!((s, text.as_str()), (404, "unknown login code"));
+
+    // The mount root without its slash is where a hand-typed or
+    // truncated URL lands: a bare redirect to the mount, no auth needed,
+    // while DELETE there is still the admin purge route.
+    let (s, headers, _) = w.api.raw("GET", "/v1/plugins/web", &[], None);
+    assert_eq!(s, 308, "slash-less mount root redirects");
+    assert_eq!(header(&headers, "location"), Some("/v1/plugins/web/"));
+    let (s, _, _) = w.api.raw("GET", "/v1/plugins/not%20a%20name", &[], None);
+    assert_eq!(s, 404, "a name that cannot be a plugin is not redirected");
+    let (s, v) = w.api.call("DELETE", "/v1/plugins/web", None, None);
+    assert_eq!(
+        (s, v["error"].as_str().unwrap()),
+        (401, "missing or invalid admin token"),
+        "purge still needs the bearer"
+    );
     let (s, _, text) = w.api.raw("GET", "/v1/login/nope?to=/v1/fleets", &[], None);
     assert_eq!(
         (s, text.as_str()),

@@ -979,6 +979,10 @@ and `Cookie`; it adds `X-Hecaton-Forwarded-Prefix: /v1/plugins/<name>` and
 `hecaton_plugin_proxy_requests_total{plugin,status}` is registered now,
 labelled with the response status.
 
+`GET /v1/plugins/<name>` without the slash — a hand-typed or truncated
+URL — is a 308 to `/v1/plugins/<name>/`, unauthenticated, revealing
+nothing; DELETE there remains the admin purge route.
+
 **Sessions.** A browser cannot send the admin bearer on a navigation, so
 the daemon gains two routes. `POST /v1/sessions` (admin bearer) answers
 `{ login_url }` carrying a one-time code: 32 random bytes hex, valid for
@@ -986,9 +990,14 @@ the daemon gains two routes. `POST /v1/sessions` (admin bearer) answers
 a session — another 32 random bytes hex, in memory only, expiring after
 12 h — sets `hecaton_session=<id>; HttpOnly; SameSite=Strict;
 Path=/v1/plugins` and answers 303 to `to`, which must be a path under
-`/v1/plugins/` (400 otherwise). A bad, used or expired code is a plain-text
-404. Sessions die with the daemon; nothing is persisted; there is no
-logout route. The admin token never enters the browser.
+`/v1/plugins/` (400 otherwise; a bare `/v1/plugins/<name>` gains its
+trailing slash). A bad, used or expired code is a plain-text
+404 that names which (a spent or lapsed code is remembered for 10 min, so
+the human who pasted a stale URL learns whether something fetched it first
+or the 60 s ran out); every attempt is logged with its `Host`,
+`Sec-Fetch-Site` and `User-Agent`, never the code. Sessions die with the
+daemon; nothing is persisted; there is no logout route. The admin token
+never enters the browser.
 
 A cookie-authenticated proxy request must also be same-origin: when
 `Sec-Fetch-Site` is present it must be `same-origin` or `none`; otherwise
@@ -1184,7 +1193,8 @@ Where the phase 3 implementation plan refined this section:
 - **The root of a mount forwards to `/v1/routes`, no trailing slash**:
   axum's `nest` answers the nested `/` at `/v1/routes` and 404s
   `/v1/routes/`; `/v1/plugins/<name>` without a slash stays the purge
-  route (§18.2).
+  route for DELETE, and a GET there is a 308 to `/v1/plugins/<name>/`
+  (§18.2).
 - **`destroy-unattached` is set after the client is attached**, in one
   command sequence inside the PTY (`new-session -t =<crew> -s
   hecaton-attach-<hex> ; select-window -t =<agent> ; set-option

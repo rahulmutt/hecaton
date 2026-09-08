@@ -147,16 +147,25 @@ else
   UP=failed
 fi
 
-if [ "$WEB" = 1 ] && [ "$UP" = ok ]; then
+# The login URL is single use and lives 60 s from the moment it is minted,
+# so it is minted right when you are told to open it (fake mode: once, as
+# the smoke check). A second visit to a spent URL says why it was refused,
+# and server.log records every attempt with the Host and Sec-Fetch-Site it
+# arrived with.
+browser_login() {
   hr "browser terminal (plugins spec §14)"
   LOGIN="$("$HECATON" plugin open web 2>/dev/null || true)"
   if [ -n "$LOGIN" ]; then
-    say ">>> Open this once in a browser (valid 60 s; it becomes a session cookie):"
+    say ">>> Open this once in a browser, now (valid 60 s; it becomes a session cookie):"
     say ">>>     $LOGIN"
+    say ">>> Through a reverse proxy: replace only the origin ($URL), keep the path and"
+    say ">>> query. If the proxy signs you in first, or the code lapses, mint a fresh one:"
+    say ">>>     XDG_STATE_HOME=$XDG_STATE_HOME $HECATON plugin open web"
   else
     say "plugin open web failed; see $SERVER/server.log"
   fi
-fi
+}
+if [ "$WEB" = 1 ] && [ "$UP" = ok ] && [ "$FAKE" = 1 ]; then browser_login; fi
 
 metrics() { curl -sf "$URL/metrics" 2>/dev/null | grep '^hecaton_hook_events_total' || say "(no hook events counted yet)"; }
 
@@ -178,6 +187,8 @@ if [ "$FAKE" = 1 ]; then
   ONBOARD="n (fake)"
   sleep 2
 else
+  say
+  if [ "$WEB" = 1 ]; then browser_login; fi
   say
   say ">>> Now attach in another terminal:"
   say ">>>     tmux -L $SOCKET attach -t $FLEET/$CREW"
