@@ -247,14 +247,21 @@ credentials, hook input, or sandbox rules.
   (Spec C §8, pending).
 - Workspace git calls (`hecaton-runtime/src/inspect.rs`) set
   `GIT_OPTIONAL_LOCKS=0` and `-c core.fsmonitor=false -c core.hooksPath=<empty>`
-  and pass `--no-ext-diff --no-textconv` to every `diff`: the crew's
-  `.git/config` is agent-writable. Keep those when adding a git call there.
+  and pass `--no-ext-diff --no-textconv --no-color --submodule=short
+  --ignore-submodules=dirty` to every `diff`: the crew's `.git/config` is
+  agent-writable, and the last two keep git out of a nested repository the
+  agent committed as a gitlink, whose own config (its `diff.external`) the
+  `-c` overrides reach but the argv flags do not. Keep those when adding a
+  git call there.
 - A workspace `diff` refuses with `repository config sets <key>; workspace
   diff refused` when the crew's `.git/config` declares a
   `filter.<x>.<clean|smudge|process>`, or when it sets
   `extensions.worktreeconfig` (a `config.worktree` file could then hold a
   filter the check's `--local` read cannot see, so the extension alone is
-  refused) — the fix is to unset it (an agent can write that file).
+  refused; `git sparse-checkout init/set` and `scalar` set it too, so it is
+  not always tampering) — an agent can write that config; the fix is to unset
+  the filter, or `git sparse-checkout disable` where sparse checkout set the
+  extension, rather than unsetting that key by hand.
   `read_file`/`list_dir` run no git and are unaffected.
 - A workspace route's two 404s differ on purpose: `no workspace for agent`
   (no worktree yet) and `no such path`; the SDK maps only the second to

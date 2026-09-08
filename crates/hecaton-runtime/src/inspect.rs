@@ -29,8 +29,24 @@ const CONFIG: &[&str] = &[
     "-c",
     "diff.noprefix=false",
 ];
-/// On every `diff`: no external diff driver, no textconv, no colour.
-const DIFF_FLAGS: &[&str] = &["--no-ext-diff", "--no-textconv", "--no-color"];
+/// On every `diff`: no external diff driver, no textconv, no colour, and no
+/// descent into a nested repository. An explicit `--submodule=short` beats a
+/// `diff.submodule = diff` an agent wrote into the shared config, so a
+/// gitlink prints its two hashes and git runs nothing inside the nested
+/// repository — where the `-c` overrides above do apply (they travel in
+/// `GIT_CONFIG_PARAMETERS`) but these argv flags do not, leaving that
+/// repository's own `diff.external` free to run as the daemon; the
+/// `FILTER_KEYS` probe never reads a nested repository's config either.
+/// `--ignore-submodules=dirty` drops the `git status` child the default
+/// dirty check spawns there as well; the cost is that a submodule dirty only
+/// in its own worktree is not flagged `uncommitted`.
+const DIFF_FLAGS: &[&str] = &[
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-color",
+    "--submodule=short",
+    "--ignore-submodules=dirty",
+];
 
 /// Config keys whose value is a program git runs on `diff` (a clean
 /// filter through `.gitattributes`) or on checkout; `--no-ext-diff` and
@@ -38,8 +54,10 @@ const DIFF_FLAGS: &[&str] = &["--no-ext-diff", "--no-textconv", "--no-color"];
 /// matching `extensions.worktreeconfig` (git lowercases variable names in
 /// `--name-only` output, whatever case the file used) means the worktree
 /// may have a `config.worktree` file the `--local` read below cannot see
-/// — hecaton never enables `worktreeConfig`, so one set here means the
-/// repository config was tampered with, and a diff is refused outright.
+/// — hecaton never enables `worktreeConfig`, so one set here is not
+/// something hecaton sets, and a diff is refused outright. `git
+/// sparse-checkout init/set` (and `scalar`) enable it too, so the remedy is
+/// `git sparse-checkout disable` rather than unsetting the key by hand.
 const FILTER_KEYS: &str = r"^(filter\..*\.(clean|smudge|process)|extensions\.worktreeconfig)$";
 
 impl Runtime {

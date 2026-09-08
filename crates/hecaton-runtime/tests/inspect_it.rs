@@ -253,6 +253,40 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
             .contains("+more")
     );
 
+    // A nested repository the agent can create carries its own config, which
+    // the `FILTER_KEYS` probe never reads: with `diff.submodule = diff` in the
+    // crew config git descends into `sub` for the per-file diff, and there the
+    // `-c` overrides still apply (they travel in `GIT_CONFIG_PARAMETERS`) but
+    // the argv `--no-ext-diff` does not, so the nested `diff.external` would
+    // run as the daemon. `--submodule=short` prints the two hashes instead and
+    // `--ignore-submodules=dirty` drops the dirty check's own child process.
+    let sub = w.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    git(&sub, &["init", "-q", "-b", "main"]);
+    std::fs::write(sub.join("f"), "a\n").unwrap();
+    git(&sub, &["add", "."]);
+    git(&sub, &["commit", "-q", "-m", "nested"]);
+    git(
+        &sub,
+        &["config", "diff.external", &hook.display().to_string()],
+    );
+    git(w, &["add", "sub"]);
+    git(w, &["commit", "-q", "-m", "nest a repository"]);
+    // dirty in its own worktree: what the default dirty check would look at
+    std::fs::write(sub.join("f"), "a\nb\n").unwrap();
+    git(w, &["config", "diff.submodule", "diff"]);
+    // the plain `git add`/`commit` above ran the planted `core.fsmonitor`
+    // hook (they carry none of the `-c` overrides), so clear the marker: the
+    // assertion below is about the nested repository alone.
+    let _ = std::fs::remove_file(&marker);
+    let nested = rt.diff(&id, "origin/main").unwrap();
+    let gitlink = nested.files.iter().find(|f| f.path == "sub").unwrap();
+    assert_eq!(gitlink.status, FileStatus::Added);
+    assert!(
+        !marker.exists(),
+        "the nested repository's diff.external ran"
+    );
+
     // README must be wired to the "pwn" filter, or nothing would ever run
     // it and the marker checks below would pass even without the guard.
     std::fs::write(w.join(".gitattributes"), "README filter=pwn\n").unwrap();
@@ -262,6 +296,13 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
         w,
         &["config", "filter.pwn.clean", &hook.display().to_string()],
     );
+    // Positive control: plain git here does run the clean filter, so the
+    // `!marker.exists()` assertions below say something. `--no-ext-diff`, so
+    // only the filter can be what touched the marker (`diff.external` is
+    // still set in this config from the block above).
+    git(w, &["diff", "--no-ext-diff", "-U3", "HEAD", "--", "README"]);
+    assert!(marker.exists(), "the plain git diff runs the clean filter");
+    std::fs::remove_file(&marker).unwrap();
     let e = rt.diff(&id, "origin/main").unwrap_err();
     assert_eq!(
         e,
@@ -271,6 +312,28 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
     );
     assert!(!marker.exists(), "the filter ran");
     git(w, &["config", "--unset", "filter.pwn.clean"]);
+    assert!(rt.diff(&id, "origin/main").is_ok(), "unset: diffs again");
+
+    // a filter in a file the repository config includes: the probe reads it
+    // (`--includes`) and names the filter key, not the include.
+    let included = root.join("included.config");
+    std::fs::write(
+        &included,
+        format!("[filter \"inc\"]\n\tclean = {}\n", hook.display()),
+    )
+    .unwrap();
+    git(
+        w,
+        &["config", "include.path", &included.display().to_string()],
+    );
+    assert_eq!(
+        rt.diff(&id, "origin/main").unwrap_err(),
+        WorkspaceError::Filter {
+            key: "filter.inc.clean".into()
+        }
+    );
+    assert!(!marker.exists(), "the filter ran");
+    git(w, &["config", "--unset", "include.path"]);
     assert!(rt.diff(&id, "origin/main").is_ok(), "unset: diffs again");
 
     // extensions.worktreeConfig would let an agent write a filter into

@@ -330,7 +330,7 @@ event appended). Through the SDK's `Metrics`, so prefixed
   repository's smudge filters; `diff` can still run clean filters declared
   through `.gitattributes` plus `.git/config`. The controls in §3.2 close
   fsmonitor, hooks, external diff and textconv; the residue is the existing
-  "agents in a crew share `.git`" trust.
+  "agents in a crew share `.git`" trust (superseded by §12).
 - New mitigation rows: workspace path rules and the canonical-prefix check
   (`hecaton-core/src/workspace.rs`, `hecaton-runtime/src/inspect.rs`); the
   git invocation controls (`inspect.rs`); per-file and per-response caps;
