@@ -469,6 +469,61 @@ async fn the_review_page_and_its_data_routes_pass_the_workspace_through() {
 }
 
 #[tokio::test]
+async fn events_json_carries_the_workspace_version_when_there_is_one() {
+    let (fake, _, h, _watch) = world().await;
+    h.activate(ALICE, json!({})).await.unwrap();
+    h.activate("e2e/c/carol", json!({})).await.unwrap();
+    fake.set_workspace(
+        ALICE,
+        sample_diff(),
+        BTreeMap::from([("src/lib.rs".to_string(), b"fn a() {}\n".to_vec())]),
+    );
+    let (status, _, body) = h
+        .get_route("/agents/e2e/c/alice/events.json", "/v1/plugins/web")
+        .await;
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["workspace"]["head"], sample_diff().head);
+    let fp = v["workspace"]["fingerprint"].as_str().unwrap().to_string();
+    assert_eq!(fp.len(), 64);
+    fake.set_workspace(
+        ALICE,
+        sample_diff(),
+        BTreeMap::from([("src/lib.rs".to_string(), b"fn a() {}\nfn b() {}\n".to_vec())]),
+    );
+    let (_, _, body) = h
+        .get_route("/agents/e2e/c/alice/events.json", "/v1/plugins/web")
+        .await;
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_ne!(
+        v["workspace"]["fingerprint"], fp,
+        "different bytes, different fingerprint"
+    );
+    // carol has no workspace at the fake: null, and the column still flows
+    let (status, _, body) = h
+        .get_route("/agents/e2e/c/carol/events.json", "/v1/plugins/web")
+        .await;
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert!(v["workspace"].is_null(), "{v}");
+    assert_eq!(v["phase"], "pending");
+    // one diff.json fetch is one refresh
+    let (status, _, _) = h
+        .get_route("/agents/e2e/c/alice/diff.json", "/v1/plugins/web")
+        .await;
+    assert_eq!(status, 200);
+    let text = h.metrics().await;
+    assert_eq!(
+        metric(&text, "hecaton_plugin_web_diff_refreshes_total", &[]),
+        Some(1.0)
+    );
+    assert_eq!(
+        metric(&text, "hecaton_plugin_web_version_failures_total", &[]),
+        Some(1.0)
+    );
+}
+
+#[tokio::test]
 async fn a_review_is_one_send_text_and_a_divider_in_the_column() {
     let (fake, _, h, _watch) = world().await;
     h.activate(ALICE, json!({})).await.unwrap();

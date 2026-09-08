@@ -21,6 +21,8 @@ pub struct Shared {
     pub reviews_total: IntCounterVec,
     pub review_comments_total: IntCounter,
     pub events_buffered_total: IntCounter,
+    pub diff_refreshes_total: IntCounter,
+    pub version_failures_total: IntCounter,
 }
 
 pub struct WebPlugin {
@@ -53,6 +55,14 @@ impl WebPlugin {
             "events_buffered_total",
             "Hook events appended to an agent's activity buffer",
         )?;
+        let diff_refreshes_total = metrics.int_counter(
+            "diff_refreshes_total",
+            "diff.json fetches, one per refresh of a review page's diff",
+        )?;
+        let version_failures_total = metrics.int_counter(
+            "version_failures_total",
+            "workspace_version calls that failed during an events.json poll",
+        )?;
         Ok(Self {
             shared: Arc::new(Shared {
                 host,
@@ -62,6 +72,8 @@ impl WebPlugin {
                 reviews_total,
                 review_comments_total,
                 events_buffered_total,
+                diff_refreshes_total,
+                version_failures_total,
             }),
             metrics,
         })

@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Mutex, MutexGuard};
 
-use hecaton_api::{AgentPhase, FleetRecord, Timestamp};
+use hecaton_api::{AgentPhase, FleetRecord, Timestamp, WorkspaceVersion};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -36,11 +36,14 @@ pub struct Entry {
     pub payload_truncated: bool,
 }
 
-/// The `events.json` body.
+/// The `events.json` body (Spec D §3.1 adds `workspace`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Events {
     pub phase: AgentPhase,
     pub events: Vec<Entry>,
+    /// The worktree's version, `None` when the daemon refused or failed.
+    #[serde(default)]
+    pub workspace: Option<WorkspaceVersion>,
 }
 
 #[derive(Default)]
@@ -214,6 +217,7 @@ impl Cache {
         Events {
             phase: phase_in(&i.fleets, agent),
             events,
+            workspace: None,
         }
     }
 

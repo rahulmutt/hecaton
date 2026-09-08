@@ -544,7 +544,10 @@ async fn diff_json(
         Err(r) => return r,
     };
     match shared.host.workspace_diff(&id).await {
-        Ok(diff) => Json(diff).into_response(),
+        Ok(diff) => {
+            shared.diff_refreshes_total.inc();
+            Json(diff).into_response()
+        }
         Err(e) => sdk_error(e),
     }
 }
@@ -579,7 +582,9 @@ struct AfterQuery {
     after: u64,
 }
 
-/// The activity column's poll: entries after `after`, and the phase.
+/// The activity column's poll: entries after `after`, the phase, and the
+/// worktree's version (Spec D §3.1) — `null` when the daemon refuses or
+/// fails, so the column keeps flowing.
 async fn events_json(
     State(shared): State<Arc<Shared>>,
     Path(path): Path<(String, String, String)>,
@@ -593,7 +598,15 @@ async fn events_json(
         Ok(Query(q)) => q.after,
         Err(e) => return (StatusCode::BAD_REQUEST, e.body_text()).into_response(),
     };
-    Json(shared.cache.events_after(&id, after)).into_response()
+    let mut events = shared.cache.events_after(&id, after);
+    match shared.host.workspace_version(&id).await {
+        Ok(v) => events.workspace = Some(v),
+        Err(e) => {
+            tracing::debug!(agent = %id, "workspace version: {e}");
+            shared.version_failures_total.inc();
+        }
+    }
+    Json(events).into_response()
 }
 
 async fn bridge_route(
