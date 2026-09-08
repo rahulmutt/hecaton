@@ -263,6 +263,7 @@ impl PluginHost {
         &self,
         name: &AgentName,
         req: HelloRequest,
+        token: &str,
     ) -> Result<HelloResponse, DaemonError> {
         let plugin = self
             .materializer
@@ -289,7 +290,8 @@ impl PluginHost {
                 "hello.listen: must be a loopback address".into(),
             ));
         }
-        self.registry.set_listen(name, req.listen.clone());
+        self.registry
+            .set_listen(name, req.listen.clone(), token.to_string());
         self.handle
             .tx
             .send(Msg::Event {

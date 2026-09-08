@@ -202,6 +202,7 @@ pub struct StubScript {
     pub actions: Vec<hecaton_api::PluginAction>,
     pub health_ok: bool,
     pub metrics_body: String,
+    pub expect_token: Option<String>,
 }
 
 #[derive(Clone)]
@@ -239,6 +240,31 @@ pub async fn stub_plugin(script: StubScript) -> StubPlugin {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((route.to_string(), v));
+    };
+    async fn check_token(
+        State(s): State<S>,
+        req: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let ok = match &s.script.expect_token {
+            None => true,
+            Some(want) => crate::auth::bearer(req.headers())
+                .is_some_and(|got| crate::auth::constant_time_eq(got.as_bytes(), want.as_bytes())),
+        };
+        if ok {
+            next.run(req).await
+        } else {
+            (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "bad daemon token" })),
+            )
+                .into_response()
+        }
+    }
+    let state = S {
+        script,
+        calls: calls.clone(),
     };
     let app = Router::new()
         .route(
@@ -297,10 +323,11 @@ pub async fn stub_plugin(script: StubScript) -> StubPlugin {
             "/v1/metrics",
             get(move |State(s): State<S>| async move { s.script.metrics_body.clone() }),
         )
-        .with_state(S {
-            script,
-            calls: calls.clone(),
-        });
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            check_token,
+        ))
+        .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .unwrap_or_else(|e| panic!("bind: {e}"));

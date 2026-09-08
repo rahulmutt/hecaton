@@ -1,6 +1,10 @@
 //! Every daemon → plugin call (plugins spec §4.2) on one `reqwest` client:
 //! loopback, plain HTTP/1.1, no proxy, 5 s unless the caller says otherwise.
 //! Failures are classified into the four `reason` labels of §4.3.
+//!
+//! Every call carries the plugin's own token as the bearer (§18.3): the
+//! plugin's listener is a loopback port any local process can reach, and
+//! this is how it tells the daemon from the rest.
 
 use std::fmt;
 use std::time::Duration;
@@ -12,6 +16,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::PluginError;
+use super::registry::PluginAddr;
 
 /// Default per-call timeout (§4.2 "5 s unless stated").
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -87,8 +92,8 @@ impl PluginClient {
         Ok(Self { http })
     }
 
-    fn url(listen: &str, path: &str) -> String {
-        format!("http://{listen}{path}")
+    fn url(addr: &PluginAddr, path: &str) -> String {
+        format!("http://{}{path}", addr.listen)
     }
 
     /// Reads at most `MAX_BODY` bytes off the wire, chunk by chunk, so an
@@ -120,14 +125,15 @@ impl PluginClient {
 
     async fn post<T: Serialize + ?Sized>(
         &self,
-        listen: &str,
+        addr: &PluginAddr,
         path: &str,
         body: &T,
         timeout: Duration,
     ) -> Result<Vec<u8>, CallFailure> {
         let resp = self
             .http
-            .post(Self::url(listen, path))
+            .post(Self::url(addr, path))
+            .bearer_auth(&addr.token)
             .timeout(timeout)
             .json(body)
             .send()
@@ -135,24 +141,28 @@ impl PluginClient {
         Self::body(resp).await
     }
 
-    pub async fn activate(&self, listen: &str, req: &ActivateRequest) -> Result<(), CallFailure> {
-        self.post(listen, "/v1/activate", req, CALL_TIMEOUT)
+    pub async fn activate(
+        &self,
+        addr: &PluginAddr,
+        req: &ActivateRequest,
+    ) -> Result<(), CallFailure> {
+        self.post(addr, "/v1/activate", req, CALL_TIMEOUT)
             .await
             .map(|_| ())
     }
 
     pub async fn deactivate(
         &self,
-        listen: &str,
+        addr: &PluginAddr,
         req: &DeactivateRequest,
     ) -> Result<(), CallFailure> {
-        self.post(listen, "/v1/deactivate", req, CALL_TIMEOUT)
+        self.post(addr, "/v1/deactivate", req, CALL_TIMEOUT)
             .await
             .map(|_| ())
     }
 
-    pub async fn events(&self, listen: &str, batch: &EventBatch) -> Result<(), CallFailure> {
-        self.post(listen, "/v1/events", batch, CALL_TIMEOUT)
+    pub async fn events(&self, addr: &PluginAddr, batch: &EventBatch) -> Result<(), CallFailure> {
+        self.post(addr, "/v1/events", batch, CALL_TIMEOUT)
             .await
             .map(|_| ())
     }
@@ -161,11 +171,11 @@ impl PluginClient {
     /// is not a JSON object is a `Body` failure (§4.3).
     pub async fn intercept(
         &self,
-        listen: &str,
+        addr: &PluginAddr,
         req: &InterceptRequest,
         timeout: Duration,
     ) -> Result<InterceptResponse, CallFailure> {
-        let bytes = self.post(listen, "/v1/intercept", req, timeout).await?;
+        let bytes = self.post(addr, "/v1/intercept", req, timeout).await?;
         let verdict: InterceptResponse =
             serde_json::from_slice(&bytes).map_err(|e| CallFailure::Body(e.to_string()))?;
         if !matches!(verdict.response, Value::Object(_)) {
@@ -174,19 +184,25 @@ impl PluginClient {
         Ok(verdict)
     }
 
-    pub async fn health(&self, listen: &str) -> Result<(), CallFailure> {
+    pub async fn health(&self, addr: &PluginAddr) -> Result<(), CallFailure> {
         let resp = self
             .http
-            .get(Self::url(listen, "/v1/health"))
+            .get(Self::url(addr, "/v1/health"))
+            .bearer_auth(&addr.token)
             .send()
             .await?;
         Self::body(resp).await.map(|_| ())
     }
 
-    pub async fn metrics(&self, listen: &str, timeout: Duration) -> Result<String, CallFailure> {
+    pub async fn metrics(
+        &self,
+        addr: &PluginAddr,
+        timeout: Duration,
+    ) -> Result<String, CallFailure> {
         let resp = self
             .http
-            .get(Self::url(listen, "/v1/metrics"))
+            .get(Self::url(addr, "/v1/metrics"))
+            .bearer_auth(&addr.token)
             .timeout(timeout)
             .send()
             .await?;
@@ -274,10 +290,13 @@ mod tests {
 
     #[tokio::test]
     async fn calls_reach_the_plugin_and_classify_failures() {
-        let listen = stub().await;
+        let addr = PluginAddr {
+            listen: stub().await,
+            token: "t".into(),
+        };
         let c = PluginClient::new().unwrap();
         c.activate(
-            &listen,
+            &addr,
             &ActivateRequest {
                 agent: "f/c/a".into(),
                 config: json!({}),
@@ -287,7 +306,7 @@ mod tests {
         .unwrap();
         let e = c
             .activate(
-                &listen,
+                &addr,
                 &ActivateRequest {
                     agent: "f/c/bad".into(),
                     config: json!({}),
@@ -314,7 +333,7 @@ mod tests {
             "an empty body renders without the trailing colon"
         );
         c.deactivate(
-            &listen,
+            &addr,
             &DeactivateRequest {
                 agent: "f/c/a".into(),
             },
@@ -322,7 +341,7 @@ mod tests {
         .await
         .unwrap();
         c.events(
-            &listen,
+            &addr,
             &EventBatch {
                 events: vec![event("Notification")],
             },
@@ -332,7 +351,7 @@ mod tests {
 
         let v = c
             .intercept(
-                &listen,
+                &addr,
                 &InterceptRequest {
                     event: event("PreToolUse"),
                     response_so_far: json!({ "a": 1 }),
@@ -347,7 +366,7 @@ mod tests {
         assert_eq!(v.actions, vec![hecaton_api::PluginAction::Stop]);
         let e = c
             .intercept(
-                &listen,
+                &addr,
                 &InterceptRequest {
                     event: event("PreCompact"),
                     response_so_far: json!({}),
@@ -361,7 +380,7 @@ mod tests {
         assert!(matches!(e, CallFailure::Body(_)), "{e}");
         let e = c
             .intercept(
-                &listen,
+                &addr,
                 &InterceptRequest {
                     event: event("Stop"),
                     response_so_far: json!({}),
@@ -372,25 +391,28 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(e, CallFailure::Timeout);
-        let e = c.health("127.0.0.1:1").await.unwrap_err();
+        let e = c
+            .health(&PluginAddr {
+                listen: "127.0.0.1:1".into(),
+                token: "t".into(),
+            })
+            .await
+            .unwrap_err();
         assert_eq!(e, CallFailure::Connect);
         assert_eq!(e.reason(), "connect");
-        c.health(&listen).await.unwrap();
-        let text = c
-            .metrics(&listen, Duration::from_millis(500))
-            .await
-            .unwrap();
+        c.health(&addr).await.unwrap();
+        let text = c.metrics(&addr, Duration::from_millis(500)).await.unwrap();
         assert!(text.starts_with("# TYPE hecaton_plugin_x_up"));
     }
 
     #[tokio::test]
     async fn a_body_over_the_cap_fails_without_being_fully_buffered() {
-        let listen = oversized_stub().await;
+        let addr = PluginAddr {
+            listen: oversized_stub().await,
+            token: "t".into(),
+        };
         let c = PluginClient::new().unwrap();
-        let e = c
-            .metrics(&listen, Duration::from_secs(5))
-            .await
-            .unwrap_err();
+        let e = c.metrics(&addr, Duration::from_secs(5)).await.unwrap_err();
         assert_eq!(e.reason(), "body");
         assert!(matches!(e, CallFailure::Body(_)), "{e}");
     }

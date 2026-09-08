@@ -32,6 +32,7 @@ struct Inner {
     plugin_events_dropped: IntCounterVec,
     plugin_actions: IntCounterVec,
     plugin_metrics_scrape_failures: IntCounterVec,
+    proxy_requests: IntCounterVec,
 }
 
 impl Metrics {
@@ -120,6 +121,13 @@ impl Metrics {
             ),
             &["plugin"],
         )?;
+        let proxy_requests = IntCounterVec::new(
+            Opts::new(
+                "hecaton_plugin_proxy_requests_total",
+                "Requests proxied to plugin routes, by response status",
+            ),
+            &["plugin", "status"],
+        )?;
         for c in [
             Box::new(fleets.clone()) as Box<dyn prometheus::core::Collector>,
             Box::new(agents.clone()),
@@ -135,6 +143,7 @@ impl Metrics {
             Box::new(plugin_events_dropped.clone()),
             Box::new(plugin_actions.clone()),
             Box::new(plugin_metrics_scrape_failures.clone()),
+            Box::new(proxy_requests.clone()),
         ] {
             registry.register(c)?;
         }
@@ -155,6 +164,7 @@ impl Metrics {
                 plugin_events_dropped,
                 plugin_actions,
                 plugin_metrics_scrape_failures,
+                proxy_requests,
             }),
         })
     }
@@ -277,6 +287,14 @@ impl Metrics {
             .with_label_values(&[plugin])
             .inc();
     }
+
+    /// One request through the plugin mount (§18.2), by answered status.
+    pub fn proxy_request(&self, plugin: &str, status: u16) {
+        self.inner
+            .proxy_requests
+            .with_label_values(&[plugin, &status.to_string()])
+            .inc();
+    }
 }
 
 #[cfg(test)]
@@ -349,6 +367,7 @@ mod tests {
         m.plugin_action("flow", "send_text");
         m.hook_action(&id, "send_text");
         m.scrape_failure("web");
+        m.proxy_request("web", 200);
         let text = m.encode();
         assert!(text.contains(
             "hecaton_plugin_events_total{event=\"PreToolUse\",mode=\"intercept\",plugin=\"flow\"} 1"
@@ -367,6 +386,9 @@ mod tests {
             "hecaton_hook_actions_total{action=\"send_text\",agent=\"a\",crew=\"c\",fleet=\"f\"} 1"
         ));
         assert!(text.contains("hecaton_plugin_metrics_scrape_failures_total{plugin=\"web\"} 1"));
+        assert!(
+            text.contains("hecaton_plugin_proxy_requests_total{plugin=\"web\",status=\"200\"} 1")
+        );
         for name in [
             "hecaton_fleets",
             "hecaton_agents",
@@ -382,6 +404,7 @@ mod tests {
             "hecaton_plugin_events_dropped_total",
             "hecaton_plugin_actions_total",
             "hecaton_plugin_metrics_scrape_failures_total",
+            "hecaton_plugin_proxy_requests_total",
         ] {
             assert!(text.contains(&format!("# TYPE {name} ")), "{name} missing");
         }

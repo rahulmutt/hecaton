@@ -1,10 +1,11 @@
 //! In-memory ports for tests (Phase 2 spec §3.5). Always compiled: they are
 //! small, dependency-free, and Phase 3's tests need them too.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use hecaton_api::{CredentialBundle, GitSettings, Timestamp};
 
@@ -13,7 +14,7 @@ use crate::name::{AgentId, AgentName, FleetName};
 use crate::plugin::ResolvedPlugin;
 use crate::ports::{
     AgentRunner, Clock, HookTarget, Keep, LaunchPlan, MaterializeError, Materializer,
-    ObservedState, ProcessState, RunnerError,
+    ObservedState, ProcessState, PtyStream, RunnerError,
 };
 use crate::repo::RepoRef;
 
@@ -136,6 +137,92 @@ impl Materializer for FakeMaterializer {
 }
 
 #[derive(Default)]
+struct PtyBuf {
+    data: VecDeque<u8>,
+    closed: bool,
+}
+
+/// One fake terminal's shared end: what the writer wrote, until the
+/// reader takes it; `closed` ends the reader with EOF and the writer with
+/// `BrokenPipe`.
+#[derive(Default)]
+struct PtyShared {
+    buf: Mutex<PtyBuf>,
+    cv: Condvar,
+}
+
+impl PtyShared {
+    fn close(&self) {
+        lock(&self.buf).closed = true;
+        self.cv.notify_all();
+    }
+}
+
+struct FakePtyReader(Arc<PtyShared>);
+
+impl Read for FakePtyReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let mut b = lock(&self.0.buf);
+        while b.data.is_empty() && !b.closed {
+            b = self.0.cv.wait(b).unwrap_or_else(|e| e.into_inner());
+        }
+        if b.data.is_empty() {
+            return Ok(0);
+        }
+        let n = out.len().min(b.data.len());
+        for (slot, byte) in out.iter_mut().zip(b.data.drain(..n)) {
+            *slot = byte;
+        }
+        Ok(n)
+    }
+}
+
+struct FakePtyWriter(Arc<PtyShared>);
+
+impl Write for FakePtyWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let mut b = lock(&self.0.buf);
+        if b.closed {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "pty closed"));
+        }
+        b.data.extend(bytes);
+        self.0.cv.notify_all();
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The fake's terminal: an echo. Bytes written come back on the reader,
+/// resizes are recorded on the runner, `FakeRunner::close_attach` (or a
+/// drop) ends it.
+pub struct FakePty {
+    shared: Arc<PtyShared>,
+    agent: String,
+    resizes: Arc<Mutex<Vec<(String, u16, u16)>>>,
+}
+
+impl PtyStream for FakePty {
+    fn reader(&self) -> io::Result<Box<dyn Read + Send>> {
+        Ok(Box::new(FakePtyReader(self.shared.clone())))
+    }
+    fn writer(&self) -> io::Result<Box<dyn Write + Send>> {
+        Ok(Box::new(FakePtyWriter(self.shared.clone())))
+    }
+    fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
+        lock(&self.resizes).push((self.agent.clone(), cols, rows));
+        Ok(())
+    }
+}
+
+impl Drop for FakePty {
+    fn drop(&mut self) {
+        self.shared.close();
+    }
+}
+
+#[derive(Default)]
 pub struct FakeRunner {
     rec: Mutex<Recorder>,
     state: Mutex<ObservedState>,
@@ -144,6 +231,8 @@ pub struct FakeRunner {
     /// `observe()` is logged, counted, leaves status unchanged, and the
     /// next tick retries at the resync cadence).
     fail_observe: AtomicBool,
+    attached: Mutex<BTreeMap<String, Arc<PtyShared>>>,
+    resizes: Arc<Mutex<Vec<(String, u16, u16)>>>,
 }
 
 impl FakeRunner {
@@ -165,6 +254,19 @@ impl FakeRunner {
     /// failing) until changed again.
     pub fn set_fail_observe(&self, fail: bool) {
         self.fail_observe.store(fail, Ordering::SeqCst);
+    }
+    /// Ends the reader of the latest attach for `agent`; `false` if none.
+    pub fn close_attach(&self, agent: &AgentId) -> bool {
+        match lock(&self.attached).remove(&agent.to_string()) {
+            Some(shared) => {
+                shared.close();
+                true
+            }
+            None => false,
+        }
+    }
+    pub fn resizes(&self) -> Vec<(String, u16, u16)> {
+        lock(&self.resizes).clone()
     }
     fn check(&self, method: &str, id: &str) -> Result<(), RunnerError> {
         match lock(&self.rec).record(method, id) {
@@ -222,6 +324,17 @@ impl AgentRunner for FakeRunner {
     }
     fn send_text(&self, agent: &AgentId, text: &str, submit: bool) -> Result<(), RunnerError> {
         self.check("send_text", &format!("{agent} {text:?} submit={submit}"))
+    }
+    fn attach(&self, agent: &AgentId) -> Result<Box<dyn PtyStream>, RunnerError> {
+        let id = agent.to_string();
+        self.check("attach", &id)?;
+        let shared = Arc::new(PtyShared::default());
+        lock(&self.attached).insert(id.clone(), shared.clone());
+        Ok(Box::new(FakePty {
+            shared,
+            agent: id,
+            resizes: self.resizes.clone(),
+        }))
     }
 }
 
@@ -336,5 +449,35 @@ mod tests {
         assert_eq!(c.now(), Timestamp(105));
         c.set(Timestamp(1));
         assert_eq!(c.now(), Timestamp(1));
+    }
+
+    #[test]
+    fn the_fake_pty_echoes_records_resizes_and_closes() {
+        use std::io::{Read, Write};
+        let r = FakeRunner::default();
+        let pty = r.attach(&id("f/c/a")).unwrap();
+        let mut reader = pty.reader().unwrap();
+        let mut writer = pty.writer().unwrap();
+        writer.write_all(b"hi").unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(reader.read(&mut buf).unwrap(), 2);
+        assert_eq!(&buf[..2], b"hi");
+        pty.resize(120, 40).unwrap();
+        assert_eq!(r.resizes(), vec![("f/c/a".to_string(), 120, 40)]);
+        assert!(r.close_attach(&id("f/c/a")), "an open attach was closed");
+        assert!(!r.close_attach(&id("f/c/a")), "and only once");
+        assert_eq!(reader.read(&mut buf).unwrap(), 0, "EOF after close");
+        assert_eq!(
+            writer.write_all(b"x").unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert!(r.calls().contains(&"attach f/c/a".to_string()));
+        // dropping the stream closes it too
+        let pty = r.attach(&id("f/c/b")).unwrap();
+        let mut reader = pty.reader().unwrap();
+        drop(pty);
+        assert_eq!(reader.read(&mut buf).unwrap(), 0);
+        r.fail_next("attach", "f/c/c", "no window");
+        assert!(r.attach(&id("f/c/c")).is_err());
     }
 }

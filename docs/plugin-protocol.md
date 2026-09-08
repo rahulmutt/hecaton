@@ -34,7 +34,7 @@ profile environment (plugins spec §5.1):
 |---|---|
 | `HECATON_API_URL` | The daemon's base URL, `http://127.0.0.1:<port>`, no trailing slash. Every plugin → daemon route in §3 is relative to it. |
 | `HECATON_PLUGIN_NAME` | This plugin's name, as declared in `hecaton-plugin.yaml` and `plugins.yaml`. |
-| `HECATON_PLUGIN_TOKEN` | The bearer for every plugin → daemon call: `Authorization: Bearer <token>`. A wrong or missing token is 401 `{ "error": "unknown plugin or bad token" }` on every route under `/v1/plugin-host/`, `hello` included (`hello-bad-token.json`). |
+| `HECATON_PLUGIN_TOKEN` | The bearer for every plugin → daemon call: `Authorization: Bearer <token>`. A wrong or missing token is 401 `{ "error": "unknown plugin or bad token" }` on every route under `/v1/plugin-host/`, `hello` included (`hello-bad-token.json`). It is also the bearer the daemon presents on every daemon → plugin call (§4); a plugin must check it and answer 401 `{ "error": "bad daemon token" }` to anything else (`activate-bad-token.json`), since its listener is a loopback port any local process can reach. |
 | `HECATON_PLUGIN_SCRATCH` | A read-write scratch directory; no API call needed. |
 
 ## 3. Plugin → daemon
@@ -56,6 +56,9 @@ daemon by `crates/hecaton-server/tests/events_it.rs` (§6).
 | `GET fleets` | `fleets` | — | `[FleetRecord]` | 200 | `fleets.json` |
 | `GET fleets/{name}` | `fleets` | — | `FleetRecord` | 200 | (shape as in `fleets.json`'s `response[0]`) |
 | `GET fleets/{name}`, unknown name | `fleets` | — | `{ error }` | 404 | `fleet-missing.json` |
+| `GET fleets/watch` (WebSocket) | `fleets` | — | one text frame per change, each the complete `GET fleets` body | 101 | `fleets-watch.json` (Task 6) |
+| `GET agents/{fleet}/{crew}/{agent}/attach` (WebSocket) | `attach` | — | binary frames are terminal bytes both ways; the one text frame is `{ "resize": { "cols", "rows" } }` | 101 | `attach-resize.json` (Task 6) |
+| `GET agents/…/attach`, agent not active for this plugin | `attach` | — | `{ "error": "plugin is not active for agent <id>" }` | 404 | (as for actions) |
 | `POST agents/{fleet}/{crew}/{agent}/actions` | `actions` | one of the three action shapes below | `{}` | 200 | `action.json` |
 | `POST agents/…/actions`, agent not active for this plugin | `actions` | — | `{ "error": "plugin is not active for agent <id>" }` | 404 | (same status as `fleet-missing.json`; asserted by `events_it.rs`, §6) |
 | `GET kv?prefix=` | `kv` | — | `{ keys }` | 200 | `kv-list.json` |
@@ -83,15 +86,31 @@ bare `.` or `..` segment. `PUT` and
 `?prefix=` on the list route filters returned `keys` by prefix
 (`kv-list.json`).
 
+**Streams** (plugins spec §18.4). `fleets/watch` sends the current list
+as its first frame and the whole list again after every change (fleet
+records and activation rows alike), pinging every 30 s; a consumer
+replaces its state on each frame and reconnects when the socket drops.
+`attach` opens a terminal on the agent's window: binary frames carry
+bytes both ways, a text frame must be a resize (`{ "resize": { "cols":
+120, "rows": 40 } }`, both at least 1) or the daemon closes with 1003;
+the daemon closes with 1000 when the window ends and 1011 on a runner
+failure. Both take the plugin's bearer on the handshake and answer the
+usual 401/403 before upgrading.
+
 ## 4. Daemon → plugin
 
 At the `listen` address the plugin's `hello` gave (§3), plain HTTP, 5 s
 timeout unless stated otherwise.
 
+Every request carries `Authorization: Bearer <HECATON_PLUGIN_TOKEN>` — the
+plugin's own token (§2). The fixtures' `headers` object is what the daemon
+sends; `activate-bad-token.json` records the refusal a plugin must answer.
+
 | Route | Request | Response | Status | Fixture |
 |---|---|---|---|---|
 | `POST /v1/activate` | `{ agent, config }` | `{}` | 200 | `activate.json` |
 | `POST /v1/activate`, rejected | `{ agent, config }` | `{ error }` | 400 | `activate-rejected.json` |
+| `POST /v1/activate`, wrong or missing bearer | same | `{ error }` | 401 | `activate-bad-token.json` |
 | `POST /v1/deactivate` | `{ agent }` | `{}` | 200 | (same success shape as `activate.json`) |
 | `POST /v1/events` | `{ events: [HookEvent] }` | `{}` | 200 | `events.json` |
 | `POST /v1/intercept` | `{ event, response_so_far, deadline_ms }` | `{ response, actions }` | 200 | `intercept.json` |
@@ -142,6 +161,28 @@ that breaks this rule instead of re-exposing it. The Rust SDK's
 cannot break the rule; a plugin in another language formats the text
 itself and must apply the prefix.
 
+### 4.1 Routes
+
+A manifest with `routes: true` mounts the plugin's own HTTP surface at
+`/v1/plugins/<name>/…` on the daemon's listener, authenticated by the
+admin bearer or a browser session cookie (plugins spec §18.2). The daemon
+forwards `/v1/plugins/<name>/` to `GET|POST|… http://<listen>/v1/routes`
+and `/v1/plugins/<name>/<rest>?<query>` to `/v1/routes/<rest>?<query>`
+— `<rest>` crosses percent-encoded exactly as the client wrote it, and a
+`.` or `..` segment (its `%2e` spellings included) is refused with 400
+rather than forwarded — with the method, the body (1 MiB cap, 413 beyond), and the request
+headers minus `Authorization`, `Cookie`, `Host` and the hop-by-hop set
+(`Connection` and `Upgrade` are kept on an upgrade request). Two headers
+are added: `Authorization: Bearer <HECATON_PLUGIN_TOKEN>` (§2) and
+`X-Hecaton-Forwarded-Prefix: /v1/plugins/<name>`, the mount to build links
+from. The response streams back with its hop-by-hop headers removed; a
+101 is upgraded on both sides and the two byte streams copied until either
+closes, so a WebSocket route works unchanged behind the mount. 404
+`plugin "x" has no routes` without `routes: true`, 503 `plugin "x" is not
+ready` before `hello`. The Rust SDK nests `Plugin::routes` under
+`/v1/routes` behind the same bearer check as every other route
+(`routes.json`, Task 6).
+
 ## 5. Activation lifecycle
 
 An agent's `(agent, plugin)` pair is one of three states, visible in
@@ -165,12 +206,19 @@ never activates simply never runs for that agent.
 
 ## 6. Conformance
 
-`docs/plugin-protocol/*.json` holds fourteen fixtures, one JSON object
+`docs/plugin-protocol/*.json` holds eighteen fixtures, one JSON object
 each: `{ route, direction, request, status, response }` for
 `daemon-to-plugin` and most `plugin-to-daemon` routes; `raw` (base64)
 replaces `request`/`response` for the kv byte bodies, `health.json` and
 `metrics.json`; `hello-bad-token.json` additionally carries a top-level
-`"token"` to send instead of the real one.
+`"token"` to send instead of the real one. daemon-to-plugin fixtures also
+carry `headers`, the request headers the daemon sends.
+
+Fixtures with `"transport": "websocket"` (`attach-resize.json`,
+`fleets-watch.json`) describe one frame, not a request/response pair, and
+are asserted by the SDK's stream test against `FakeHost`; `routes.json`
+is replayed through the SDK router alone — the daemon's proxy forwards
+requests unparsed.
 
 Two tests replay every fixture:
 

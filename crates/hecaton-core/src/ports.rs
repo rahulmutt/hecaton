@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
 use hecaton_api::{CredentialBundle, GitSettings, Timestamp};
@@ -172,6 +173,21 @@ pub trait AgentRunner: Send + Sync {
     fn stop_crew(&self, crew: &CrewRef) -> Result<(), RunnerError>;
     fn observe(&self, fleet: &FleetName) -> Result<ObservedState, RunnerError>;
     fn send_text(&self, agent: &AgentId, text: &str, submit: bool) -> Result<(), RunnerError>;
+    /// A terminal on the agent's window (plugins spec §18.4). The runner
+    /// decides how; nothing about tmux crosses this port.
+    fn attach(&self, agent: &AgentId) -> Result<Box<dyn PtyStream>, RunnerError>;
+}
+
+/// A live terminal on one agent's window (plugins spec §18.4). Sync like
+/// every port; the server bridges it to a WebSocket with one blocking
+/// reader task. Dropping the stream ends the session.
+pub trait PtyStream: Send {
+    /// A reader of the terminal's output. Owned by the caller so a
+    /// blocking reader thread can outlive the borrow.
+    fn reader(&self) -> io::Result<Box<dyn Read + Send>>;
+    /// The writer of keystrokes. Taken once: a second call fails.
+    fn writer(&self) -> io::Result<Box<dyn Write + Send>>;
+    fn resize(&self, cols: u16, rows: u16) -> io::Result<()>;
 }
 
 pub trait Clock: Send + Sync {

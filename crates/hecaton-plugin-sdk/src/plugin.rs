@@ -5,8 +5,9 @@
 use std::future::{Future, IntoFuture};
 use std::sync::Arc;
 
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{StatusCode, header::CONTENT_TYPE};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -16,6 +17,7 @@ use hecaton_api::{
 };
 use serde_json::{Value, json};
 
+use crate::auth::{bearer, constant_time_eq};
 use crate::{Host, Metrics, SdkError};
 
 pub trait Plugin: Send + Sync + 'static {
@@ -66,22 +68,52 @@ pub trait Plugin: Send + Sync + 'static {
     fn metrics(&self) -> Option<&Metrics> {
         None
     }
+    /// The plugin's own HTTP surface, mounted by the daemon under
+    /// `/v1/plugins/<name>/` when the manifest says `routes: true`
+    /// (plugin-protocol §4.1). Served under `/v1/routes` behind the same
+    /// bearer check as every other route; the request carries
+    /// `X-Hecaton-Forwarded-Prefix` for building links.
+    fn routes(&self) -> Option<Router> {
+        None
+    }
 }
 
-pub fn router<P: Plugin>(plugin: Arc<P>) -> Router {
-    Router::new()
+/// The §4.2 router for `plugin`. Every route, the plugin's own under
+/// `/v1/routes` included, needs `Authorization: Bearer <token>` — the
+/// daemon presents the plugin's own token (plugins spec §18.3), because
+/// the listener is a loopback port any local process can reach.
+pub fn router<P: Plugin>(plugin: Arc<P>, token: &str) -> Router {
+    let token: Arc<str> = Arc::from(token);
+    // The state is applied before nesting so both routers are `Router<()>`.
+    let base = Router::new()
         .route("/v1/activate", post(activate::<P>))
         .route("/v1/deactivate", post(deactivate::<P>))
         .route("/v1/events", post(events::<P>))
         .route("/v1/intercept", post(intercept::<P>))
         .route("/v1/health", get(health::<P>))
         .route("/v1/metrics", get(metrics::<P>))
-        .with_state(plugin)
+        .with_state(plugin.clone());
+    let base = match plugin.routes() {
+        Some(routes) => base.nest("/v1/routes", routes),
+        None => base,
+    };
+    base.layer(middleware::from_fn_with_state(token, require_daemon_bearer))
         // daemon → plugin request bodies are capped at 1 MiB (plugin-protocol
         // §1), matching the daemon's own `plugin_api::router` layer
         // (`hecaton-server/src/api.rs`); axum's default (2 MiB) is otherwise
         // silently more permissive than the spec promises.
         .layer(DefaultBodyLimit::max(1 << 20))
+}
+
+async fn require_daemon_bearer(
+    State(token): State<Arc<str>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    match bearer(req.headers()) {
+        Some(t) if constant_time_eq(t.as_bytes(), token.as_bytes()) => next.run(req).await,
+        _ => error(StatusCode::UNAUTHORIZED, "bad daemon token"),
+    }
 }
 
 fn error(status: StatusCode, message: impl Into<String>) -> Response {
@@ -178,8 +210,9 @@ pub async fn bind() -> Result<(tokio::net::TcpListener, String), SdkError> {
 pub async fn run<P: Plugin>(
     listener: tokio::net::TcpListener,
     plugin: Arc<P>,
+    token: &str,
 ) -> Result<(), SdkError> {
-    axum::serve(listener, router(plugin))
+    axum::serve(listener, router(plugin, token))
         .into_future()
         .await
         .map_err(|e| SdkError::Bind(e.to_string()))
@@ -205,7 +238,8 @@ async fn serve_on<P: Plugin>(
     listen: String,
 ) -> Result<(), SdkError> {
     let plugin = Arc::new(plugin);
-    let server = tokio::spawn(run(listener, plugin));
+    let token = host.env().token.clone();
+    let server = tokio::spawn(async move { run(listener, plugin, &token).await });
     if let Err(e) = host.hello(version, &listen).await {
         server.abort();
         let _ = server.await;
@@ -224,9 +258,15 @@ mod tests {
     struct Silent;
     impl Plugin for Silent {}
 
-    async fn post(url: &str, body: Value) -> (u16, Value) {
+    async fn post(url: &str, token: &str, body: Value) -> (u16, Value) {
         let c = reqwest::Client::builder().no_proxy().build().unwrap();
-        let r = c.post(url).json(&body).send().await.unwrap();
+        let r = c
+            .post(url)
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
         let status = r.status().as_u16();
         let text = r.text().await.unwrap();
         (
@@ -238,10 +278,11 @@ mod tests {
     #[tokio::test]
     async fn defaults_accept_everything_and_pass_the_response_through() {
         let (listener, listen) = bind().await.unwrap();
-        tokio::spawn(run(listener, Arc::new(Silent)));
+        tokio::spawn(run(listener, Arc::new(Silent), "tok"));
         let base = format!("http://{listen}");
         let (s, _) = post(
             &format!("{base}/v1/activate"),
+            "tok",
             json!({ "agent": "f/c/a", "config": {} }),
         )
         .await;
@@ -255,6 +296,7 @@ mod tests {
         };
         let (s, v) = post(
             &format!("{base}/v1/intercept"),
+            "tok",
             json!({ "event": event, "response_so_far": { "x": 2 }, "deadline_ms": 5 }),
         )
         .await;
@@ -262,6 +304,7 @@ mod tests {
         let c = reqwest::Client::builder().no_proxy().build().unwrap();
         assert_eq!(
             c.get(format!("{base}/v1/health"))
+                .bearer_auth("tok")
                 .send()
                 .await
                 .unwrap()
@@ -271,6 +314,7 @@ mod tests {
         );
         assert_eq!(
             c.get(format!("{base}/v1/metrics"))
+                .bearer_auth("tok")
                 .send()
                 .await
                 .unwrap()
@@ -279,6 +323,93 @@ mod tests {
                 .unwrap(),
             ""
         );
+    }
+
+    #[tokio::test]
+    async fn every_route_refuses_a_call_without_the_daemon_bearer() {
+        let (listener, listen) = bind().await.unwrap();
+        tokio::spawn(run(listener, Arc::new(Silent), "tok"));
+        let base = format!("http://{listen}");
+        for token in ["", "nope"] {
+            let (s, v) = post(
+                &format!("{base}/v1/activate"),
+                token,
+                json!({ "agent": "f/c/a", "config": {} }),
+            )
+            .await;
+            assert_eq!(
+                (s, v),
+                (401, json!({ "error": "bad daemon token" })),
+                "{token:?}"
+            );
+        }
+        let c = reqwest::Client::builder().no_proxy().build().unwrap();
+        assert_eq!(
+            c.get(format!("{base}/v1/health"))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            401
+        );
+        assert_eq!(
+            c.get(format!("{base}/v1/metrics"))
+                .bearer_auth("tok")
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            200
+        );
+    }
+
+    #[tokio::test]
+    async fn routes_are_nested_behind_the_bearer() {
+        struct Routed;
+        impl Plugin for Routed {
+            fn routes(&self) -> Option<Router> {
+                Some(
+                    Router::new()
+                        .route("/", get(|| async { "root" }))
+                        .route("/x", get(|| async { "x" })),
+                )
+            }
+        }
+        let (listener, listen) = bind().await.unwrap();
+        tokio::spawn(run(listener, Arc::new(Routed), "tok"));
+        let c = reqwest::Client::builder().no_proxy().build().unwrap();
+        for (path, want) in [("/v1/routes", "root"), ("/v1/routes/x", "x")] {
+            let r = c
+                .get(format!("http://{listen}{path}"))
+                .bearer_auth("tok")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                (r.status().as_u16(), r.text().await.unwrap().as_str()),
+                (200, want),
+                "{path}"
+            );
+        }
+        let r = c
+            .get(format!("http://{listen}/v1/routes/x"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            401,
+            "the plugin's routes need the bearer too"
+        );
+        let r = c
+            .get(format!("http://{listen}/v1/routes/nope"))
+            .bearer_auth("tok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 404);
     }
 
     #[tokio::test]
@@ -298,6 +429,7 @@ mod tests {
         let c = reqwest::Client::builder().no_proxy().build().unwrap();
         assert_eq!(
             c.get(format!("http://{listen}/v1/health"))
+                .bearer_auth("tok")
                 .send()
                 .await
                 .unwrap()

@@ -54,6 +54,7 @@ crews:
                     goto: review
                     send:
                       text: Run the tests and fix any failures.
+          web: {}
       bob:
         claude:
           settings:
@@ -76,4 +77,5 @@ crews:
           RUST_LOG: info
         runner:
           type: tmux
-        plugins: {}
+        plugins:
+          web: {}

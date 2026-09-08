@@ -62,6 +62,9 @@ fn run() -> anyhow::Result<String> {
         Command::Plugin {
             command: PluginCommand::Package(args),
         } => commands::plugin::package_command(&args),
+        Command::Plugin {
+            command: PluginCommand::Open(args),
+        } => commands::plugin::open_command(&args),
         Command::HookRelay => commands::relay::hook_relay_command(),
     }
 }

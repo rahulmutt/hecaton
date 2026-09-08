@@ -7,22 +7,26 @@ use std::time::Duration;
 
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
+use axum::http::header::{CONTENT_TYPE, LOCATION, SET_COOKIE};
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{any, delete, get, post};
 use axum::{Json, Router};
 use hecaton_api::{
     DownQuery, ErrorBody, FleetRequest, FleetSummary, HelloRequest, HelloResponse, PluginStatus,
-    SyncReport,
+    SessionRequest, SessionResponse, SyncReport,
 };
 use hecaton_core::{AgentName, FleetName, FleetRecord, Keep, NameError};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::auth::{RateLimiter, bearer, constant_time_eq};
 use crate::daemon::{Daemon, DaemonError};
 use crate::hooks;
-use crate::plugins::PluginError;
+use crate::plugins::{PluginAddr, PluginError};
+use crate::proxy;
+use crate::sessions::{COOKIE, MOUNT_PREFIX, cookie_value, login_target, same_origin, set_cookie};
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -118,6 +122,7 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
         .route("/v1/plugins", get(list_plugins))
         .route("/v1/plugins/sync", post(sync_plugins))
         .route("/v1/plugins/{name}", delete(purge_plugin))
+        .route("/v1/sessions", post(create_session))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin))
         .layer(DefaultBodyLimit::max(4 << 20));
     let agents = Router::new()
@@ -130,13 +135,21 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
         .route("/v1/plugin-host/hello", post(plugin_hello))
         .layer(DefaultBodyLimit::max(64 << 10));
     let plugin_host = crate::plugin_api::router().layer(DefaultBodyLimit::max(1 << 20));
+    // The plugin mount authenticates itself (bearer or session cookie),
+    // so it sits outside the admin middleware. `/v1/plugins/{name}` with
+    // no slash stays the purge route.
+    let mount = Router::new()
+        .route("/v1/plugins/{name}/", any(proxy_root))
+        .route("/v1/plugins/{name}/{*rest}", any(proxy_rest));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/metrics", get(metrics))
+        .route("/v1/login/{code}", get(login))
         .merge(admin)
         .merge(agents)
         .merge(plugins)
         .merge(plugin_host)
+        .merge(mount)
         .with_state(state)
 }
 
@@ -176,11 +189,11 @@ async fn metrics(State(state): State<AppState>) -> Response {
     // the scrapes running in parallel despite the sequential awaits below.
     let mut scrapes = Vec::new();
     for name in registry.names() {
-        let Some(listen) = registry.ready_listen(&name) else {
+        let Some(addr) = registry.ready_addr(&name) else {
             continue;
         };
         let client = state.daemon.client().clone();
-        let handle = tokio::spawn(async move { client.metrics(&listen, SCRAPE_TIMEOUT).await });
+        let handle = tokio::spawn(async move { client.metrics(&addr, SCRAPE_TIMEOUT).await });
         scrapes.push((name, handle));
     }
     for (name, handle) in scrapes {
@@ -343,6 +356,173 @@ async fn purge_plugin(
         .map_err(|e: NameError| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
     state.daemon.plugins().purge(&name).await?;
     Ok(Json(json!({})))
+}
+
+/// `POST /v1/sessions`: a single-use login URL for the admin's browser
+/// (plugins spec §18.2). The admin token itself never enters the browser.
+async fn create_session(
+    State(state): State<AppState>,
+    b: Result<Json<SessionRequest>, JsonRejection>,
+) -> Result<Json<SessionResponse>, ApiError> {
+    let req = b
+        .map(|Json(r)| r)
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))?;
+    let to = login_target(req.to.as_deref()).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("to: must be a path under {MOUNT_PREFIX}"),
+        )
+    })?;
+    let code = state.daemon.sessions().issue_code();
+    Ok(Json(SessionResponse {
+        login_url: format!("{}/v1/login/{code}?to={to}", state.daemon.origin()),
+    }))
+}
+
+async fn proxy_root(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    req: Request,
+) -> Response {
+    proxied(&state, &name, req).await
+}
+
+/// `rest` is captured only so the route matches; the proxy reads it back
+/// off the raw path, because `Path` percent-decodes what it captures.
+async fn proxy_rest(
+    State(state): State<AppState>,
+    Path((name, _rest)): Path<(String, String)>,
+    req: Request,
+) -> Response {
+    proxied(&state, &name, req).await
+}
+
+/// What `/v1/plugins/{name}/…` resolved to. Only the two named variants
+/// may appear in the proxy counter's `plugin` label: the label is minted
+/// from the registry, never from the path, so an anonymous caller cannot
+/// fill the series with one entry per guessed name.
+enum Mount {
+    /// Authenticated, installed with `routes: true`, and listening.
+    Ready(AgentName, PluginAddr),
+    /// Authenticated and installed with `routes: true`, but no `hello` yet.
+    NotReady(AgentName),
+    /// Anything else: unauthenticated, unparseable, unknown, or routeless.
+    Refused(ApiError),
+}
+
+/// The mount (plugins spec §6, §18.2): authenticate, resolve the plugin,
+/// forward, count.
+async fn proxied(state: &AppState, name: &str, req: Request) -> Response {
+    let (label, resp) = match resolve_mount(state, name, req.headers()) {
+        Mount::Ready(plugin, addr) => {
+            let resp =
+                proxy::forward(state.daemon.proxy_client(), &addr, plugin.as_str(), req).await;
+            (plugin.to_string(), resp)
+        }
+        Mount::NotReady(plugin) => {
+            let e = ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("plugin {:?} is not ready", plugin.as_str()),
+            );
+            (plugin.to_string(), e.into_response())
+        }
+        Mount::Refused(e) => ("unknown".to_string(), e.into_response()),
+    };
+    state
+        .daemon
+        .metrics()
+        .proxy_request(&label, resp.status().as_u16());
+    resp
+}
+
+fn resolve_mount(state: &AppState, name: &str, headers: &HeaderMap) -> Mount {
+    if let Err(e) = authenticate_browser_or_admin(state, headers) {
+        return Mount::Refused(e);
+    }
+    let no_routes = || {
+        Mount::Refused(ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("plugin {name:?} has no routes"),
+        ))
+    };
+    let Ok(plugin) = name.parse::<AgentName>() else {
+        return no_routes();
+    };
+    let registry = state.daemon.registry();
+    if !registry.plugin(&plugin).is_some_and(|p| p.manifest.routes) {
+        return no_routes();
+    }
+    match registry.ready_addr(&plugin) {
+        Some(addr) => Mount::Ready(plugin, addr),
+        None => Mount::NotReady(plugin),
+    }
+}
+
+/// The admin bearer, or a live session cookie on a same-origin request
+/// (§18.2). A bearer that is present but wrong is refused outright; the
+/// cookie is never consulted then.
+fn authenticate_browser_or_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let unauthorized = || ApiError::new(StatusCode::UNAUTHORIZED, "missing or invalid admin token");
+    if let Some(t) = bearer(headers) {
+        return if constant_time_eq(t.as_bytes(), state.daemon.token().as_bytes()) {
+            Ok(())
+        } else {
+            Err(unauthorized())
+        };
+    }
+    match cookie_value(headers, COOKIE) {
+        Some(id) if state.daemon.sessions().is_valid(&id) => {
+            if same_origin(headers, state.daemon.origin()) {
+                Ok(())
+            } else {
+                Err(ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "cross-origin request refused",
+                ))
+            }
+        }
+        _ => Err(unauthorized()),
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct LoginQuery {
+    to: Option<String>,
+}
+
+/// `GET /v1/login/{code}`: the browser's end. A live code becomes a session
+/// cookie and a 303 to `to`; anything else is a plain-text 404 — the page
+/// is for a human who pasted a stale URL, not for a client parsing JSON.
+async fn login(
+    State(state): State<AppState>,
+    code: Result<Path<String>, PathRejection>,
+    q: Result<Query<LoginQuery>, QueryRejection>,
+) -> Response {
+    let to = match q {
+        Ok(Query(q)) => match login_target(q.to.as_deref()) {
+            Some(to) => to,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("to: must be a path under {MOUNT_PREFIX}"),
+                )
+                    .into_response();
+            }
+        },
+        Err(e) => return (StatusCode::BAD_REQUEST, e.body_text()).into_response(),
+    };
+    let Ok(Path(code)) = code else {
+        return (StatusCode::NOT_FOUND, "unknown or expired login code").into_response();
+    };
+    match state.daemon.sessions().redeem(&code) {
+        Some(id) => (
+            StatusCode::SEE_OTHER,
+            [(LOCATION, to), (SET_COOKIE, set_cookie(&id))],
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "unknown or expired login code").into_response(),
+    }
 }
 
 #[cfg(test)]

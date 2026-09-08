@@ -103,6 +103,49 @@ impl Api {
         let bytes = resp.body_mut().read_to_vec().unwrap();
         (status, bytes)
     }
+
+    /// A request with explicit headers, redirects not followed, answered
+    /// as status, response headers and body text — for the login and
+    /// proxy paths, where the headers are the point.
+    pub fn raw(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> (u16, Vec<(String, String)>, String) {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(5)))
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .build()
+            .into();
+        let url = format!("{}{path}", self.base);
+        let mut req = match method {
+            "GET" => agent.get(&url).force_send_body(),
+            "POST" => agent.post(&url),
+            _ => unreachable!(),
+        };
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let mut resp = match body {
+            Some(b) => req.send(b).unwrap(),
+            None => req.send_empty().unwrap(),
+        };
+        let status = resp.status().as_u16();
+        let headers = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        let text = resp.body_mut().read_to_string().unwrap();
+        (status, headers, text)
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
+    }
 }
 
 pub struct World {
@@ -123,7 +166,8 @@ impl Drop for World {
 
 /// A daemon with the chain handler, served on a port, with one package
 /// `flow` declared (intercepts PreToolUse+Stop, observes Stop, needs
-/// actions+kv) and one package `web` (observes SessionStart, needs fleets).
+/// actions+kv) and one package `web` (observes SessionStart, needs
+/// fleets+attach, serves routes).
 pub async fn world() -> World {
     let h = Harness::new(Duration::from_secs(3600));
     let dir = tempfile::tempdir().unwrap();
@@ -135,7 +179,7 @@ pub async fn world() -> World {
     write_plugin_package(
         &dir.path().join("web-pkg"),
         "web",
-        "hooks: { observe: [SessionStart] }\nneeds: [fleets]\n",
+        "hooks: { observe: [SessionStart] }\nneeds: [fleets, attach]\nroutes: true\n",
     );
     std::fs::write(
         dir.path().join("plugins.yaml"),

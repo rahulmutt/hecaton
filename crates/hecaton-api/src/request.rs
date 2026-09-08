@@ -38,6 +38,22 @@ pub struct ErrorBody {
     pub error: String,
 }
 
+/// Body of `POST /v1/sessions` (plugins spec §18.2).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionRequest {
+    /// Where the login redirects: a path under `/v1/plugins/`; the mount
+    /// root when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionResponse {
+    /// `http://127.0.0.1:<port>/v1/login/<code>?to=<path>`, single use.
+    pub login_url: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,5 +89,17 @@ mod tests {
         assert!(serde_json::from_value::<DownQuery>(serde_json::json!({ "x": 1 })).is_err());
         let e: ErrorBody = serde_json::from_str(r#"{"error":"fleet exists"}"#).unwrap();
         assert_eq!(e.error, "fleet exists");
+    }
+
+    #[test]
+    fn session_request_round_trips() {
+        assert_eq!(
+            serde_json::to_string(&SessionRequest { to: None }).unwrap(),
+            "{}"
+        );
+        let r: SessionRequest =
+            serde_json::from_value(serde_json::json!({ "to": "/v1/plugins/web/" })).unwrap();
+        assert_eq!(r.to.as_deref(), Some("/v1/plugins/web/"));
+        assert!(serde_json::from_value::<SessionRequest>(serde_json::json!({ "x": 1 })).is_err());
     }
 }

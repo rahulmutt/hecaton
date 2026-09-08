@@ -21,7 +21,7 @@ pub use host::{PluginHost, PluginHostConfig};
 pub use kv::{PluginKv, validate_key};
 pub use manifest::read_manifest;
 pub use materializer::{NullStore, PluginMaterializer};
-pub use registry::{ActivationRow, PluginInfo, PluginRegistry};
+pub use registry::{ActivationRow, PluginAddr, PluginInfo, PluginRegistry};
 
 /// Every plugin failure, with the config path or file first.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

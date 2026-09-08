@@ -30,7 +30,7 @@ pub use sandbox::{
     Grants, check_conflicts, hecaton_grants, merge_profile, render_profile, validate_profile,
     validate_profile_at, write_profile, write_profile_at,
 };
-pub use tmux::{ANCHOR_WINDOW, TmuxRunner};
+pub use tmux::{ANCHOR_WINDOW, ATTACH_SESSION_PREFIX, TmuxAttach, TmuxRunner};
 pub use toolchain::{Toolchain, embedded_system_tools, mise_env, render_mise_toml, system_tools};
 pub use tools::{MissingTool, ToolPaths};
 pub use workspace::Workspace;

@@ -109,13 +109,17 @@ async fn token(w: &World, plugin: &str) -> String {
 async fn start_flow(w: &World) -> (Arc<FlowLike>, Host) {
     let plugin = Arc::new(FlowLike::default());
     let (listener, listen) = bind().await.unwrap();
-    tokio::spawn(run(listener, plugin.clone()));
     let env = Env {
         api_url: w.api.base.clone(),
         name: "flow".into(),
         token: token(w, "flow").await,
         scratch: w.dir.path().join("scratch"),
     };
+    tokio::spawn({
+        let plugin = plugin.clone();
+        let token = env.token.clone();
+        async move { run(listener, plugin, &token).await }
+    });
     let host = Host::new(env).unwrap();
     host.hello("0.1.0", &listen).await.unwrap();
     (plugin, host)
@@ -450,7 +454,8 @@ async fn plugin_metrics_are_re_exported_under_the_prefix_rule() {
         .with_label_values(&["a"])
         .set(1);
     let (l1, listen1) = bind().await.unwrap();
-    tokio::spawn(run(l1, Arc::new(Good(good))));
+    let flow_token = token(&w, "flow").await;
+    tokio::spawn(async move { run(l1, Arc::new(Good(good)), &flow_token).await });
     // A plugin outside the SDK answering an unprefixed family: the daemon
     // must drop the body whole.
     let bad = axum::Router::new().route(

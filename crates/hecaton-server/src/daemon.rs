@@ -11,10 +11,10 @@ use hecaton_api::{
     SyncReport,
 };
 use hecaton_core::{
-    AgentId, AgentName, EventHandler, Fleet, FleetName, FleetRecord, FleetSecrets, Keep, Outcome,
-    is_reserved_fleet, plugin_id,
+    AgentId, AgentName, AgentRunner, EventHandler, Fleet, FleetName, FleetRecord, FleetSecrets,
+    Keep, Outcome, is_reserved_fleet, plugin_id,
 };
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
 use crate::actor::{self, FleetHandle, Msg, Ports, Shared};
 use crate::auth::constant_time_eq;
@@ -25,6 +25,7 @@ use crate::plugins::{
     ActivationRow, CallFailure, PluginClient, PluginError, PluginHost, PluginHostConfig, PluginKv,
     PluginRegistry,
 };
+use crate::sessions::Sessions;
 
 /// The chain handler's hello hook; `PassThrough` has nothing to clear.
 pub trait HelloObserver: Send + Sync {
@@ -57,7 +58,13 @@ pub struct Daemon {
     plugins: Arc<PluginHost>,
     registry: Arc<PluginRegistry>,
     client: PluginClient,
+    /// The reverse proxy's own connection pool for the plugin mount.
+    proxy_client: crate::proxy::HttpClient,
     kv: Arc<PluginKv>,
+    sessions: Sessions,
+    /// Ticks once per published actor snapshot and once per registry
+    /// write; `fleets/watch` waits on it (§18.4).
+    changes: Arc<watch::Sender<u64>>,
     /// One `apply` or `down` at a time *per fleet*: activation and the
     /// actor message must not interleave with another apply of the same
     /// fleet. Every other fleet runs on its own lock — an apply waits for
@@ -101,6 +108,7 @@ impl Daemon {
         let (shared, purged) = actor::shared(metrics);
         let plugins = PluginHost::start(plugin_config, &ports, shared.clone(), registry.clone());
         let ports = Arc::new(ports);
+        let changes = Arc::new(watch::channel(0u64).0);
         let mut fleets = BTreeMap::new();
         for (record, secrets) in existing {
             match FleetName::try_from(record.spec.name.clone()) {
@@ -135,6 +143,7 @@ impl Daemon {
                         shared.clone(),
                         true,
                     );
+                    tokio::spawn(Self::forward_changes(h.status.clone(), changes.clone()));
                     fleets.insert(name, h);
                 }
                 Err(e) => tracing::error!("skipping a stored fleet with an invalid name: {e}"),
@@ -149,7 +158,10 @@ impl Daemon {
             plugins,
             registry,
             client,
+            proxy_client: crate::proxy::client(),
             kv,
+            sessions: Sessions::new(),
+            changes,
             applying: std::sync::Mutex::new(BTreeMap::new()),
         });
         tokio::spawn(Self::forget_purged(Arc::downgrade(&daemon), purged));
@@ -171,10 +183,10 @@ impl Daemon {
     /// degraded message, a success clears it. Never restarts anything.
     pub async fn poll_health(&self) {
         for name in self.registry.names() {
-            let Some(listen) = self.registry.ready_listen(&name) else {
+            let Some(addr) = self.registry.ready_addr(&name) else {
                 continue;
             };
-            match self.client.health(&listen).await {
+            match self.client.health(&addr).await {
                 Ok(()) => self.registry.set_degraded(&name, None),
                 Err(e) => {
                     tracing::warn!(plugin = %name, "health check failed: {e}");
@@ -190,6 +202,7 @@ impl Daemon {
                 return;
             };
             d.fleets.write().await.remove(&name);
+            d.bump();
         }
     }
 
@@ -213,8 +226,22 @@ impl Daemon {
         &self.client
     }
 
+    pub fn proxy_client(&self) -> &crate::proxy::HttpClient {
+        &self.proxy_client
+    }
+
     pub fn kv(&self) -> &Arc<PluginKv> {
         &self.kv
+    }
+
+    pub fn sessions(&self) -> &Sessions {
+        &self.sessions
+    }
+
+    /// The daemon's own origin, `http://127.0.0.1:<port>`: the login URL's
+    /// host and the only `Origin` a cookie request may carry (§18.2).
+    pub fn origin(&self) -> &str {
+        &self.ports.hook_url
     }
 
     /// Activation state is a read-time overlay (§16.3): the actor never
@@ -224,10 +251,43 @@ impl Daemon {
         record
     }
 
+    /// Every published snapshot of one actor becomes one tick of the
+    /// change counter `fleets/watch` waits on; a final tick when the actor
+    /// ends (a purge), so the list without it goes out too.
+    async fn forward_changes(
+        mut status: watch::Receiver<FleetRecord>,
+        changes: Arc<watch::Sender<u64>>,
+    ) {
+        while status.changed().await.is_ok() {
+            changes.send_modify(|n| *n += 1);
+        }
+        changes.send_modify(|n| *n += 1);
+    }
+
+    /// Ticks when any fleet record or activation row changed (§18.4).
+    pub fn changes(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    /// Registry writes have no actor behind them; the writer ticks.
+    fn bump(&self) {
+        self.changes.send_modify(|n| *n += 1);
+    }
+
+    pub fn runner(&self) -> Arc<dyn AgentRunner> {
+        self.ports.runner.clone()
+    }
+
     /// Reconciles the plugin set to `plugins.yaml`; `serve` calls it once
     /// at start and fails fast on an error, `plugin sync` on demand.
     pub async fn sync_plugins(&self) -> Result<SyncReport, PluginError> {
-        self.plugins.sync().await
+        let report = self.plugins.sync().await;
+        // `replace_plugins` drops the activation rows of every plugin the
+        // sync removed, and the plugin fleet's own actor snapshot is not
+        // forwarded to `changes` — so this registry write ticks like the
+        // others, or `fleets/watch` keeps serving the removed rows.
+        self.bump();
+        report
     }
 
     /// `hello` authenticates with the plugin's token — the hook secret the
@@ -242,18 +302,18 @@ impl Daemon {
         if !self.verify_secret(&plugin_id(name), token).await {
             return Err(DaemonError::Unauthorized);
         }
-        let response = self.plugins.hello(name, req).await?;
+        let response = self.plugins.hello(name, req, token).await?;
         self.handler.on_hello(name);
         // Restart recovery (§16.2): the plugin knows nothing about the
         // pairs it had; every row is offered again, and a refusal now is
         // the pair's state, not an error for the plugin.
-        if let Some(listen) = self.registry.ready_listen(name) {
+        if let Some(addr) = self.registry.ready_addr(name) {
             for (agent, row) in self.registry.rows_for_plugin(name) {
                 let req = ActivateRequest {
                     agent: agent.to_string(),
                     config: row.config.clone(),
                 };
-                let activation = match self.client.activate(&listen, &req).await {
+                let activation = match self.client.activate(&addr, &req).await {
                     Ok(()) => PluginActivation::active(),
                     Err(e) => {
                         tracing::warn!(plugin = %name, agent = %agent, "activation rejected at hello: {e}");
@@ -263,6 +323,7 @@ impl Daemon {
                 self.registry.set_state(&agent, name, activation);
             }
         }
+        self.bump();
         Ok(response)
     }
 
@@ -283,13 +344,13 @@ impl Daemon {
 
     /// Best effort: a plugin that cannot be told is logged, not an error.
     async fn deactivate_pair(&self, agent: &AgentId, plugin: &AgentName) {
-        let Some(listen) = self.registry.ready_listen(plugin) else {
+        let Some(addr) = self.registry.ready_addr(plugin) else {
             return;
         };
         let req = DeactivateRequest {
             agent: agent.to_string(),
         };
-        if let Err(e) = self.client.deactivate(&listen, &req).await {
+        if let Err(e) = self.client.deactivate(&addr, &req).await {
             tracing::warn!(plugin = %plugin, agent = %agent, "deactivate failed: {e}");
         }
     }
@@ -300,14 +361,14 @@ impl Daemon {
     /// state — the pair really is not active any more.
     async fn restore_pairs(&self, pairs: &[Pair]) {
         for p in pairs {
-            let Some(listen) = self.registry.ready_listen(&p.plugin) else {
+            let Some(addr) = self.registry.ready_addr(&p.plugin) else {
                 continue;
             };
             let req = ActivateRequest {
                 agent: p.agent.to_string(),
                 config: p.config.clone(),
             };
-            if let Err(e) = self.client.activate(&listen, &req).await {
+            if let Err(e) = self.client.activate(&addr, &req).await {
                 tracing::warn!(plugin = %p.plugin, agent = %p.agent, "restoring the previous activation failed: {e}");
                 self.registry.set_state(
                     &p.agent,
@@ -424,13 +485,13 @@ impl Daemon {
         let mut accepted: Vec<Pair> = Vec::new();
         let mut rows: Vec<(Pair, PluginActivation)> = Vec::new();
         for p in &d.activate {
-            match self.registry.ready_listen(&p.plugin) {
-                Some(listen) => {
+            match self.registry.ready_addr(&p.plugin) {
+                Some(addr) => {
                     let req = ActivateRequest {
                         agent: p.agent.to_string(),
                         config: p.config.clone(),
                     };
-                    match self.client.activate(&listen, &req).await {
+                    match self.client.activate(&addr, &req).await {
                         Ok(()) => {
                             accepted.push(p.clone());
                             rows.push((p.clone(), PluginActivation::active()));
@@ -449,6 +510,10 @@ impl Daemon {
                                 }
                             }
                             self.restore_pairs(&restore).await;
+                            // The rollback may have written rows of its own
+                            // and this apply returns before the tick at the
+                            // end: no actor snapshot is behind it either.
+                            self.bump();
                             return Err(DaemonError::Invalid(format!(
                                 "{}: {}",
                                 activation::config_path(&p.agent, &p.plugin),
@@ -481,6 +546,10 @@ impl Daemon {
                         self.shared.clone(),
                         false,
                     );
+                    tokio::spawn(Self::forward_changes(
+                        h.status.clone(),
+                        self.changes.clone(),
+                    ));
                     fleets.insert(name.clone(), h.clone());
                     h
                 }
@@ -515,6 +584,7 @@ impl Daemon {
                 },
             );
         }
+        self.bump();
         Ok(self.overlay(record))
     }
 
@@ -546,6 +616,7 @@ impl Daemon {
         for (agent, plugin) in self.registry.remove_fleet(name) {
             self.deactivate_pair(&agent, &plugin).await;
         }
+        self.bump();
         Ok(self.overlay(record))
     }
 
@@ -1371,7 +1442,9 @@ mod tests {
             ..StubScript::default()
         })
         .await;
-        w.daemon.registry().set_listen(&flow, good.listen.clone());
+        w.daemon
+            .registry()
+            .set_listen(&flow, good.listen.clone(), "t".into());
         w.daemon
             .apply(&name, s, Default::default(), true)
             .await

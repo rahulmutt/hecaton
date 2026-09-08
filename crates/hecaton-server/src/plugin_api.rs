@@ -3,6 +3,7 @@
 
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, JsonRejection, PathRejection, QueryRejection};
+use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
 use axum::response::{IntoResponse, Response};
@@ -21,10 +22,15 @@ use crate::plugins::PluginError;
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route("/v1/plugin-host/fleets", get(list_fleets))
+        .route("/v1/plugin-host/fleets/watch", get(watch_fleets))
         .route("/v1/plugin-host/fleets/{name}", get(get_fleet))
         .route(
             "/v1/plugin-host/agents/{fleet}/{crew}/{agent}/actions",
             axum::routing::post(post_action),
+        )
+        .route(
+            "/v1/plugin-host/agents/{fleet}/{crew}/{agent}/attach",
+            get(attach),
         )
         .route("/v1/plugin-host/kv", get(list_keys))
         .route(
@@ -79,6 +85,48 @@ async fn get_fleet(
         .await
         .map(Json)
         .ok_or_else(|| DaemonError::NotFound.into())
+}
+
+/// `GET fleets/watch` (WS): every change, as the whole list (§18.4).
+async fn watch_fleets(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    caller(&state, &headers, Capability::Fleets).await?;
+    let daemon = state.daemon.clone();
+    Ok(ws.on_upgrade(move |socket| crate::watch::serve_watch(socket, daemon)))
+}
+
+/// `GET agents/{id}/attach` (WS): a terminal on the agent's window, for a
+/// plugin active on it (§18.4). The runner attaches on a blocking thread
+/// before the upgrade, so a failure is an ordinary 500.
+async fn attach(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    path: Result<Path<(String, String, String)>, PathRejection>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    let plugin = caller(&state, &headers, Capability::Attach).await?;
+    let Path((f, c, a)) = path.map_err(|e| ApiError::new(e.status(), e.body_text()))?;
+    let agent: AgentId = format!("{f}/{c}/{a}")
+        .parse()
+        .map_err(|_: hecaton_core::NameError| ApiError::from(DaemonError::NotFound))?;
+    if !state.daemon.registry().is_active(&agent, &plugin) {
+        return Err(PluginError::NotActive(agent.to_string()).into());
+    }
+    let runner = state.daemon.runner();
+    let id = agent.clone();
+    let stream = tokio::task::spawn_blocking(move || runner.attach(&id))
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tracing::info!(plugin = %plugin, agent = %agent, "attach opened");
+    // The guard, not the stream: an upgrade that never completes leaves
+    // axum dropping this closure on a runtime task, and ending a tmux
+    // attach blocks (`StreamGuard`).
+    let guard = crate::attach::StreamGuard::new(stream);
+    Ok(ws.on_upgrade(move |socket| crate::attach::bridge(socket, guard)))
 }
 
 async fn post_action(

@@ -124,6 +124,8 @@ pub enum PluginCommand {
     Remove(PluginRemoveArgs),
     /// Build a plugin tarball from a package directory and print its sha256.
     Package(PluginPackageArgs),
+    /// Print a single-use login URL for the plugin's browser routes (valid 60 s).
+    Open(PluginOpenArgs),
 }
 
 #[derive(Debug, Args)]
@@ -134,6 +136,13 @@ pub struct PluginInstallArgs {
     /// Expected sha256 of the tarball.
     #[arg(long)]
     pub sha256: Option<String>,
+    #[arg(long)]
+    pub api_url: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct PluginOpenArgs {
+    pub name: String,
     #[arg(long)]
     pub api_url: Option<String>,
 }

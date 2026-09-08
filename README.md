@@ -27,12 +27,16 @@ a repository.
    for; an agent opts into a plugin with `plugins: { <name>: { …config… } }`
    in its settings block and `up` waits until the plugin has accepted it.
 8. `mise run package-plugins` — assembles the in-tree `flow` plugin under
-   `target/plugins/flow/`; point a `plugins.yaml` entry's `source` at that
-   directory and give an agent a `plugins: { flow: … }` block to drive it
-   by rule: block a tool call, send text on `Stop`, move between states.
-   `examples/payments.yaml` shows one.
+   `target/plugins/flow/` (and `web` under `target/plugins/web/`); point a
+   `plugins.yaml` entry's `source` at that directory and give an agent a
+   `plugins: { flow: … }` block to drive it by rule: block a tool call,
+   send text on `Stop`, move between states. `examples/payments.yaml`
+   shows one.
 9. `mise x -- cargo run -q -p hecaton -- dev materialize examples/payments.yaml backend/bob --no-host-defaults`
    — renders bob's generated files into a temp dir without launching anything.
+10. `mise x -- cargo run -q -p hecaton -- plugin open web` — prints a
+    single-use login URL (60 s); open it in a browser to reach the web
+    plugin's index and click an agent for a live terminal.
 
 ## Where to look
 - `ARCHITECTURE.md` — the map: pieces, flow, non-obvious decisions.
@@ -42,10 +46,9 @@ a repository.
 - `docs/plugin-protocol.md` — the wire contract for plugins in any language.
 
 ## Status
-Spec A is complete. Spec B (plugins) is in progress: phase 1 (plugin
-workloads), phase 2a (the event protocol) and phase 2b (the `flow` plugin,
-`mise run package-plugins`, the SDK's metrics registry and test harness)
-are done; phase 3, the proxy, attach, `fleets/watch` and `web`, is next.
+Spec A and Spec B (plugins) are complete: plugin workloads, the event
+protocol, the `flow` and `web` plugins, the proxied plugin mount with
+browser sessions, attach and `fleets/watch`.
 
 ### Upgrading to Spec B phase 1
 - Fleet files rename the reserved `flow: {}` settings block to `plugins: {}`
@@ -67,3 +70,14 @@ are done; phase 3, the proxy, attach, `fleets/watch` and `web`, is next.
 - `Plugin::metrics` in the SDK returns `Option<&Metrics>` instead of text;
   register families through `Metrics` and the prefix is applied for you.
 - `mise run test` and `mise run e2e` now run `package-plugins` first.
+
+### Upgrading to Spec B phase 3
+- Every daemon → plugin call now carries `Authorization: Bearer
+  <HECATON_PLUGIN_TOKEN>`; a plugin in another language must check it and
+  answer 401 otherwise (plugin-protocol §2, §4). SDK plugins need only a
+  rebuild.
+- `hecaton-plugin-sdk`: `router`/`run` take the token; `Host` is `Clone`;
+  `Plugin::routes`, `Host::attach`, `Host::watch_fleets` are new.
+- `stop_crew` now kills every tmux session grouped with the crew's.
+- `mise run package-plugins` assembles `web` next to `flow`; `test` and
+  `e2e` depend on it.

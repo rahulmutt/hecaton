@@ -1,6 +1,7 @@
 {
   "route": "POST /v1/events",
   "direction": "daemon-to-plugin",
+  "headers": { "authorization": "Bearer tok" },
   "request": {
     "events": [
       {

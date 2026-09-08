@@ -11,7 +11,8 @@ defaults:
   tools: { node: "22.11.0" }
   env: { RUST_LOG: info }
   runner: { type: tmux }
-  plugins: {}
+  plugins:
+    web: {}          # every agent gets a browser terminal (hecaton plugin open web)
 crews:
   backend:
     repo: acme/payments-api

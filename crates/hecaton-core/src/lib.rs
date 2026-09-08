@@ -22,7 +22,7 @@ pub use plugin::{
 };
 pub use ports::{
     AgentRunner, Clock, HookTarget, Keep, LaunchPlan, MaterializeError, Materializer,
-    ObservedState, ProcessState, RunnerError, first_line,
+    ObservedState, ProcessState, PtyStream, RunnerError, first_line,
 };
 pub use reconcile::{Plan, ReconcilePolicy, Step};
 pub use repo::{RepoError, RepoRef};
