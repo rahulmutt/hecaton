@@ -1301,7 +1301,8 @@ everything else in them is internal.
   name could never be fetched by a plugin. `hecaton_core::
   reserved_fleet_reason` carries both with their reasons; `is_reserved_fleet`
   keeps meaning the plugin fleet alone (the daemon serves its record and
-  filters its agents by it).
+  filters its agents by it). A stored fleet already named `watch` is
+  logged and ignored at the next daemon start, as one named `hecaton` is.
 - **The 1011 close on a PTY write failure says so** ("the terminal's
   writer failed"); it used to reuse the 1000 reason.
 - **The web plugin's assets live under a digest segment**,

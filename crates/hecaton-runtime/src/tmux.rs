@@ -515,11 +515,12 @@ impl AgentRunner for TmuxRunner {
             session: session.clone(),
         };
         // Everything after the `windows()` check was fire-and-forget: a
-        // duplicate name, a crew session killed meanwhile or a failed
-        // `select-window` would hand out a live stream whose reader shows
-        // tmux's error line and then EOF. The session appearing is what
-        // says the client attached; on failure `attach` drops here and
-        // cleans up after itself.
+        // duplicate name or a crew session killed meanwhile would hand
+        // out a live stream whose reader shows tmux's error line and then
+        // EOF. The session appearing is what says the client attached (a
+        // `select-window` failing after that leaves it on the anchor, not
+        // dead); on failure `attach` drops here and cleans up after
+        // itself.
         self.confirm_attached(&mut attach).map_err(fail)?;
         Ok(Box::new(attach))
     }

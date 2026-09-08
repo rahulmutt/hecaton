@@ -288,7 +288,9 @@ impl Daemon {
         // sync removed, and the plugin fleet's own actor snapshot is not
         // forwarded to `changes` — so this registry write ticks like the
         // others, or `fleets/watch` keeps serving the removed rows. A
-        // sync that fails does so before it replaces anything.
+        // sync that fails resolving does so before it replaces anything;
+        // the failures after `replace_plugins` are the actor being gone,
+        // which is shutdown, when no watcher is left to tell.
         if report.is_ok() {
             self.bump();
         }

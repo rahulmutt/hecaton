@@ -88,7 +88,16 @@ fn filtered(src: &HeaderMap, dropped: &[&str], keep_upgrade: bool) -> HeaderMap 
         if dropped.contains(&name) {
             continue;
         }
-        if name == "connection" || name == "upgrade" {
+        if name == "connection" {
+            // On an upgrade the value is rewritten to exactly `Upgrade`:
+            // the other names it carried were stripped just above and a
+            // `Connection` naming absent headers would be a lie.
+            if keep_upgrade && !out.contains_key(header::CONNECTION) {
+                out.insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
+            }
+            continue;
+        }
+        if name == "upgrade" {
             if keep_upgrade {
                 out.append(k.clone(), v.clone());
             }
@@ -459,6 +468,17 @@ mod tests {
             ])),
             "a token among others, in any case"
         );
+        let out = forwarded_headers(&headers(&[
+            ("connection", "keep-alive, X-Hop, Upgrade"),
+            ("x-hop", "1"),
+            ("upgrade", "websocket"),
+        ]));
+        assert_eq!(
+            out.get("connection").map(|v| v.to_str().unwrap()),
+            Some("Upgrade"),
+            "rewritten: the names it carried are gone"
+        );
+        assert!(!out.contains_key("x-hop"));
         let out = forwarded_headers(&headers(&[("upgrade", "h2c"), ("accept", "*/*")]));
         let names: Vec<&str> = out.keys().map(|k| k.as_str()).collect();
         assert_eq!(names, vec!["accept"], "a stray Upgrade is not forwarded");

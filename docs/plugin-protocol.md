@@ -173,8 +173,9 @@ and `/v1/plugins/<name>/<rest>?<query>` to `/v1/routes/<rest>?<query>`
 — `<rest>` crosses percent-encoded exactly as the client wrote it, and a
 `.` or `..` segment (its `%2e` spellings included) is refused with 400
 rather than forwarded — with the method, the body (1 MiB cap, 413 beyond), and the request
-headers minus `Authorization`, `Cookie`, `Host` and the hop-by-hop set
-(`Connection` and `Upgrade` are kept on an upgrade request). Two headers
+headers minus `Authorization`, `Cookie`, `Host`, the hop-by-hop set and
+whatever `Connection:` names (on an upgrade request `Upgrade` is kept and
+`Connection` is sent as exactly `Upgrade`). Two headers
 are added: `Authorization: Bearer <HECATON_PLUGIN_TOKEN>` (§2) and
 `X-Hecaton-Forwarded-Prefix: /v1/plugins/<name>`, the mount to build links
 from. The response streams back with its hop-by-hop headers removed; a

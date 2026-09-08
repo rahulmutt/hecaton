@@ -242,6 +242,8 @@ mod tests {
     use crate::ResolvedAgent;
     use hecaton_api::{Capability, HookSubscriptions};
 
+    use serde_json::json;
+
     #[test]
     fn two_fleet_names_are_reserved_and_only_one_is_the_plugin_fleet() {
         assert_eq!(
@@ -256,7 +258,6 @@ mod tests {
         assert!(is_reserved_fleet("hecaton"));
         assert!(!is_reserved_fleet("watch"), "not the plugin fleet");
     }
-    use serde_json::json;
     use std::collections::BTreeSet;
 
     const MISE: &str = "[tools]\nttyd = \"1.7.7\"\n\n[tasks.serve]\nrun = \"python3 plugin.py\"\n";

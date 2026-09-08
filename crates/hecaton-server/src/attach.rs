@@ -152,11 +152,21 @@ fn pump_reader(mut reader: Box<dyn Read + Send>, tx: &mpsc::Sender<Vec<u8>>) {
     }
 }
 
+/// A close frame's reason fits in the control frame: 123 bytes at most,
+/// cut at a character boundary (a runner error can be long).
+fn close_reason(reason: &str) -> String {
+    let mut end = reason.len().min(123);
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    reason[..end].to_string()
+}
+
 async fn close(socket: &mut WebSocket, code: u16, reason: &str) {
     let _ = socket
         .send(Message::Close(Some(CloseFrame {
             code,
-            reason: reason.to_string().into(),
+            reason: close_reason(reason).into(),
         })))
         .await;
 }
@@ -216,6 +226,15 @@ mod tests {
         drop(stream);
         rx.recv_timeout(Duration::from_secs(5))
             .expect("the caller's own drop");
+    }
+
+    #[test]
+    fn a_close_reason_fits_the_control_frame() {
+        assert_eq!(close_reason("the window closed"), "the window closed");
+        let long = format!("attach: {}", "x".repeat(300));
+        assert_eq!(close_reason(&long).len(), 123);
+        let multibyte = "ü".repeat(70); // 140 bytes
+        assert_eq!(close_reason(&multibyte).len(), 122, "a character boundary");
     }
 
     #[test]

@@ -57,7 +57,9 @@ fn prefix(headers: &HeaderMap) -> String {
     headers
         .get(PREFIX_HEADER)
         .and_then(|v| v.to_str().ok())
-        .filter(|s| s.starts_with('/'))
+        // one leading slash, not two (or a backslash): `//host` is a
+        // scheme-relative URL to a browser, and it would land in a `src`
+        .filter(|s| s.starts_with('/') && !s[1..].starts_with(['/', '\\']))
         .map(|s| s.trim_end_matches('/').to_string())
         .unwrap_or_default()
 }
@@ -235,11 +237,22 @@ async fn asset(Path((digest, file)): Path<(String, String)>) -> Response {
         .into_response()
 }
 
+/// A close frame's reason fits in the control frame: 123 bytes at most,
+/// cut at a character boundary (a longer one makes the browser fail the
+/// connection with 1002 and show nothing).
+fn close_reason(reason: &str) -> String {
+    let mut end = reason.len().min(123);
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    reason[..end].to_string()
+}
+
 async fn close(socket: &mut WebSocket, code: u16, reason: &str) {
     let _ = socket
         .send(Message::Close(Some(CloseFrame {
             code,
-            reason: reason.to_string().into(),
+            reason: close_reason(reason).into(),
         })))
         .await;
 }
@@ -267,7 +280,7 @@ impl Drop for OpenTerminal {
 /// for a socket that ended without one and become 1011.
 fn forwardable(code: u16) -> u16 {
     match code {
-        1005 | 1006 | 1015 => 1011,
+        1004..=1006 | 1015 => 1011,
         1000..=1013 | 3000..=4999 => code,
         _ => 1011,
     }
@@ -375,6 +388,8 @@ mod tests {
         assert_eq!(with("/v1/plugins/web"), "/v1/plugins/web");
         assert_eq!(with("/v1/plugins/web/"), "/v1/plugins/web");
         assert_eq!(with("http://evil.example"), "", "not a path");
+        assert_eq!(with("//evil.example"), "", "scheme-relative, not a path");
+        assert_eq!(with("/\\evil.example"), "");
         assert_eq!(with("javascript:alert(1)"), "");
         assert_eq!(with(""), "");
         assert_eq!(prefix(&HeaderMap::new()), "");
@@ -393,12 +408,22 @@ mod tests {
     }
 
     #[test]
+    fn a_close_reason_fits_the_control_frame() {
+        assert_eq!(close_reason("short"), "short");
+        let long = "é".repeat(100); // 200 bytes
+        let cut = close_reason(&long);
+        assert!(cut.len() <= 123 && cut.chars().all(|c| c == 'é'), "{cut:?}");
+        assert_eq!(cut.len(), 122, "cut at a character boundary");
+    }
+
+    #[test]
     fn only_sendable_close_codes_are_forwarded() {
         assert_eq!(forwardable(1000), 1000);
         assert_eq!(forwardable(1003), 1003);
         assert_eq!(forwardable(1011), 1011);
         assert_eq!(forwardable(4000), 4000);
         // reserved: never on the wire
+        assert_eq!(forwardable(1004), 1011);
         assert_eq!(forwardable(1005), 1011);
         assert_eq!(forwardable(1006), 1011);
         assert_eq!(forwardable(1015), 1011);
