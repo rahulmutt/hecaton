@@ -9,8 +9,9 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use hecaton_api::{
     CredentialBundle, EntryKind, GitSettings, Timestamp, TreeEntry, WORKSPACE_FILE_LIMIT,
-    WorkspaceDiff, WorkspaceTree, check_path,
+    WorkspaceDiff, WorkspaceTree, WorkspaceVersion, check_path,
 };
+use sha2::{Digest, Sha256};
 
 use crate::agent::{CrewRef, ResolvedAgent};
 use crate::name::{AgentId, AgentName, FleetName};
@@ -476,6 +477,23 @@ fn tree_of(files: &BTreeMap<String, Vec<u8>>, path: &str) -> Option<WorkspaceTre
     })
 }
 
+/// The fakes' fingerprint: `sha256(head \0 (path \0 bytes \0)*)` over the
+/// file map, so a `set` with different bytes changes it. The SDK's
+/// `FakeHost` derives the same value (it may not depend on this crate),
+/// and the `workspace-version.json` fixture holds it for its files.
+pub fn fake_fingerprint(head: &str, files: &BTreeMap<String, Vec<u8>>) -> String {
+    let mut h = Sha256::new();
+    h.update(head.as_bytes());
+    h.update([0]);
+    for (path, bytes) in files {
+        h.update(path.as_bytes());
+        h.update([0]);
+        h.update(bytes);
+        h.update([0]);
+    }
+    hex::encode(h.finalize())
+}
+
 impl WorkspaceReader for FakeWorkspace {
     fn diff(&self, agent: &AgentId, base_ref: &str) -> Result<WorkspaceDiff, WorkspaceError> {
         let _ = lock(&self.rec).record("diff", &format!("{agent} {base_ref}"));
@@ -508,6 +526,15 @@ impl WorkspaceReader for FakeWorkspace {
                 return Err(WorkspaceError::NotADirectory);
             }
             tree_of(&t.files, path).ok_or(WorkspaceError::NoSuchPath)
+        })
+    }
+    fn version(&self, agent: &AgentId, base_ref: &str) -> Result<WorkspaceVersion, WorkspaceError> {
+        let _ = lock(&self.rec).record("version", &format!("{agent} {base_ref}"));
+        self.with(agent, |t| {
+            Ok(WorkspaceVersion {
+                head: t.diff.head.clone(),
+                fingerprint: fake_fingerprint(&t.diff.head, &t.files),
+            })
         })
     }
 }
@@ -841,5 +868,29 @@ mod tests {
             .to_string(),
             "repository config sets filter.lfs.clean; workspace diff refused"
         );
+        let v = w.version(&id("f/c/a"), "origin/main").unwrap();
+        assert_eq!(v.head, "h");
+        assert_eq!(v.fingerprint.len(), 64);
+        assert!(v.fingerprint.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(
+            w.version(&id("f/c/a"), "origin/main").unwrap().fingerprint,
+            v.fingerprint,
+            "stable"
+        );
+        w.set(
+            &id("f/c/a"),
+            diff.clone(),
+            BTreeMap::from([("src/lib.rs".to_string(), b"fn a() {}\nfn b() {}\n".to_vec())]),
+        );
+        assert_ne!(
+            w.version(&id("f/c/a"), "origin/main").unwrap().fingerprint,
+            v.fingerprint,
+            "different bytes, different fingerprint"
+        );
+        assert_eq!(
+            w.version(&id("f/c/z"), "origin/main"),
+            Err(WorkspaceError::Missing("f/c/z".into()))
+        );
+        assert!(w.calls().contains(&"version f/c/a origin/main".to_string()));
     }
 }

@@ -9,9 +9,11 @@ use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
+use sha2::{Digest, Sha256};
+
 use hecaton_api::{
     EntryKind, FileDiff, FileStatus, TreeEntry, WORKSPACE_FILE_COUNT_LIMIT, WORKSPACE_FILE_LIMIT,
-    WORKSPACE_PATCH_LIMIT, WorkspaceDiff, WorkspaceTree, check_path,
+    WORKSPACE_PATCH_LIMIT, WorkspaceDiff, WorkspaceTree, WorkspaceVersion, check_path,
 };
 use hecaton_core::{AgentId, WorkspaceError, WorkspaceReader};
 
@@ -197,6 +199,40 @@ pub fn shape_patch(raw: String) -> (String, bool, bool) {
         .rposition(|b| *b == b'\n')
         .map_or(0, |i| i + 1);
     (raw[..end].to_string(), false, true)
+}
+
+/// One changed or untracked path as the fingerprint sees it: `(size,
+/// mtime, mtime_nsec)` from `symlink_metadata`, or `None` when the path
+/// vanished between the listing and the `stat`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathStat {
+    pub path: String,
+    pub stat: Option<(u64, i64, i64)>,
+}
+
+/// `hex(sha256(head \0 merge_base \0 (path \0 size \0 mtime.nsec \0 |
+/// path \0 missing \0)*))` (Spec D §2.3). Entries are hashed in the order
+/// given; callers pass them sorted.
+pub fn fingerprint_of(head: &str, merge_base: &str, entries: &[PathStat]) -> String {
+    let mut h = Sha256::new();
+    h.update(head.as_bytes());
+    h.update([0]);
+    h.update(merge_base.as_bytes());
+    h.update([0]);
+    for e in entries {
+        h.update(e.path.as_bytes());
+        h.update([0]);
+        match e.stat {
+            Some((size, mtime, nsec)) => {
+                h.update(size.to_string().as_bytes());
+                h.update([0]);
+                h.update(format!("{mtime}.{nsec:09}").as_bytes());
+            }
+            None => h.update(b"missing"),
+        }
+        h.update([0]);
+    }
+    hex::encode(h.finalize())
 }
 
 fn io_error(path: &Path, e: std::io::Error) -> WorkspaceError {
@@ -405,6 +441,14 @@ impl WorkspaceReader for Runtime {
             entries,
         })
     }
+    fn version(&self, agent: &AgentId, base_ref: &str) -> Result<WorkspaceVersion, WorkspaceError> {
+        // Task 2 computes this; until then the diff's identity stands in.
+        let d = self.diff(agent, base_ref)?;
+        Ok(WorkspaceVersion {
+            fingerprint: fingerprint_of(&d.head, &d.merge_base, &[]),
+            head: d.head,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -473,5 +517,68 @@ mod tests {
         assert!(!binary && truncated);
         assert!(cut.len() <= WORKSPACE_PATCH_LIMIT);
         assert!(cut.ends_with('\n'), "cut at a line boundary");
+    }
+
+    #[test]
+    fn the_fingerprint_changes_with_every_input_and_is_stable() {
+        let a = PathStat {
+            path: "a".into(),
+            stat: Some((1, 10, 500)),
+        };
+        let b = PathStat {
+            path: "b".into(),
+            stat: None,
+        };
+        let base = fingerprint_of("h", "m", &[a.clone(), b.clone()]);
+        assert_eq!(base.len(), 64);
+        assert_eq!(
+            base,
+            fingerprint_of("h", "m", &[a.clone(), b.clone()]),
+            "stable"
+        );
+        assert_ne!(
+            base,
+            fingerprint_of("H", "m", &[a.clone(), b.clone()]),
+            "head"
+        );
+        assert_ne!(
+            base,
+            fingerprint_of("h", "M", &[a.clone(), b.clone()]),
+            "merge-base"
+        );
+        assert_ne!(
+            base,
+            fingerprint_of("h", "m", std::slice::from_ref(&a)),
+            "a path"
+        );
+        let bigger = PathStat {
+            path: "a".into(),
+            stat: Some((2, 10, 500)),
+        };
+        assert_ne!(base, fingerprint_of("h", "m", &[bigger, b.clone()]), "size");
+        let later = PathStat {
+            path: "a".into(),
+            stat: Some((1, 11, 500)),
+        };
+        assert_ne!(base, fingerprint_of("h", "m", &[later, b.clone()]), "mtime");
+        let nsec = PathStat {
+            path: "a".into(),
+            stat: Some((1, 10, 501)),
+        };
+        assert_ne!(
+            base,
+            fingerprint_of("h", "m", &[nsec, b.clone()]),
+            "mtime nsec"
+        );
+        let present = PathStat {
+            path: "b".into(),
+            stat: Some((0, 0, 0)),
+        };
+        assert_ne!(
+            base,
+            fingerprint_of("h", "m", &[a, present]),
+            "missing vs present"
+        );
+        assert_eq!(fingerprint_of("", "", &[]).len(), 64);
     }
 }

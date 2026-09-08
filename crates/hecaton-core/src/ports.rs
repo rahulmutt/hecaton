@@ -6,7 +6,9 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
-use hecaton_api::{CredentialBundle, GitSettings, Timestamp, WorkspaceDiff, WorkspaceTree};
+use hecaton_api::{
+    CredentialBundle, GitSettings, Timestamp, WorkspaceDiff, WorkspaceTree, WorkspaceVersion,
+};
 
 use crate::agent::{CrewRef, ResolvedAgent};
 use crate::name::{AgentId, AgentName, CrewName, FleetName};
@@ -177,6 +179,10 @@ pub trait WorkspaceReader: Send + Sync {
     fn read_file(&self, agent: &AgentId, path: &str) -> Result<Vec<u8>, WorkspaceError>;
     /// One directory, never recursive; the empty path is the root.
     fn list_dir(&self, agent: &AgentId, path: &str) -> Result<WorkspaceTree, WorkspaceError>;
+    /// A cheap fingerprint of the worktree (Spec D §2): `HEAD`, the
+    /// merge-base with `base_ref`, and every changed or untracked path's
+    /// size and mtime. Equal fingerprints mean `diff` would answer the same.
+    fn version(&self, agent: &AgentId, base_ref: &str) -> Result<WorkspaceVersion, WorkspaceError>;
 }
 
 /// Makes files exist (or not) for crews and agents.

@@ -116,6 +116,16 @@ pub struct WorkspaceTree {
     pub entries: Vec<TreeEntry>,
 }
 
+/// `GET …/workspace/version` (Spec D §2.1): `head` is the full sha;
+/// `fingerprint` is 64 hex chars over `HEAD`, the merge-base and the size
+/// and mtime of every changed or untracked path. Compared for equality,
+/// never interpreted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceVersion {
+    pub head: String,
+    pub fingerprint: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,5 +218,15 @@ mod tests {
         assert_eq!(WORKSPACE_FILE_LIMIT, 1 << 20);
         assert_eq!(WORKSPACE_PATCH_LIMIT, 256 << 10);
         assert_eq!(WORKSPACE_FILE_COUNT_LIMIT, 500);
+        let v = WorkspaceVersion {
+            head: "h".repeat(40),
+            fingerprint: "f".repeat(64),
+        };
+        let j = serde_json::to_value(&v).unwrap();
+        assert_eq!(
+            j,
+            json!({ "head": "h".repeat(40), "fingerprint": "f".repeat(64) })
+        );
+        assert_eq!(serde_json::from_value::<WorkspaceVersion>(j).unwrap(), v);
     }
 }

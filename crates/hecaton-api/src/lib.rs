@@ -38,7 +38,7 @@ pub use status::{
 };
 pub use workspace::{
     EntryKind, FileDiff, FileStatus, TreeEntry, WORKSPACE_FILE_COUNT_LIMIT, WORKSPACE_FILE_LIMIT,
-    WORKSPACE_PATCH_LIMIT, WorkspaceDiff, WorkspaceTree, check_path,
+    WORKSPACE_PATCH_LIMIT, WorkspaceDiff, WorkspaceTree, WorkspaceVersion, check_path,
 };
 
 #[cfg(test)]
