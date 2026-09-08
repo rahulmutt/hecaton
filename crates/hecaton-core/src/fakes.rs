@@ -177,21 +177,43 @@ impl Read for FakePtyReader {
     }
 }
 
-struct FakePtyWriter(Arc<PtyShared>);
+struct FakePtyWriter {
+    shared: Arc<PtyShared>,
+    /// Every write fails: the runner's side broke under the session.
+    broken: bool,
+}
 
 impl Write for FakePtyWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let mut b = lock(&self.0.buf);
+        if self.broken {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "pty write failed",
+            ));
+        }
+        let mut b = lock(&self.shared.buf);
         if b.closed {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "pty closed"));
         }
         b.data.extend(bytes);
-        self.0.cv.notify_all();
+        self.shared.cv.notify_all();
         Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+/// Where the runner's side of an attached stream fails, for the 1011
+/// paths (plugins spec §18.4): `FakeRunner::fault_next_attach`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PtyFault {
+    /// `reader()` fails.
+    Reader,
+    /// `writer()` fails.
+    Writer,
+    /// The writer is handed out but every write fails.
+    Write,
 }
 
 /// The fake's terminal: an echo. Bytes written come back on the reader,
@@ -201,14 +223,24 @@ pub struct FakePty {
     shared: Arc<PtyShared>,
     agent: String,
     resizes: Arc<Mutex<Vec<(String, u16, u16)>>>,
+    fault: Option<PtyFault>,
 }
 
 impl PtyStream for FakePty {
     fn reader(&self) -> io::Result<Box<dyn Read + Send>> {
+        if self.fault == Some(PtyFault::Reader) {
+            return Err(io::Error::other("no reader: the pty is gone"));
+        }
         Ok(Box::new(FakePtyReader(self.shared.clone())))
     }
     fn writer(&self) -> io::Result<Box<dyn Write + Send>> {
-        Ok(Box::new(FakePtyWriter(self.shared.clone())))
+        if self.fault == Some(PtyFault::Writer) {
+            return Err(io::Error::other("no writer: the pty is gone"));
+        }
+        Ok(Box::new(FakePtyWriter {
+            shared: self.shared.clone(),
+            broken: self.fault == Some(PtyFault::Write),
+        }))
     }
     fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
         lock(&self.resizes).push((self.agent.clone(), cols, rows));
@@ -233,6 +265,8 @@ pub struct FakeRunner {
     fail_observe: AtomicBool,
     attached: Mutex<BTreeMap<String, Arc<PtyShared>>>,
     resizes: Arc<Mutex<Vec<(String, u16, u16)>>>,
+    /// Consumed, oldest first, by the next `attach` calls.
+    faults: Mutex<VecDeque<PtyFault>>,
 }
 
 impl FakeRunner {
@@ -254,6 +288,10 @@ impl FakeRunner {
     /// failing) until changed again.
     pub fn set_fail_observe(&self, fail: bool) {
         self.fail_observe.store(fail, Ordering::SeqCst);
+    }
+    /// The next `attach` succeeds but its stream fails as `fault` says.
+    pub fn fault_next_attach(&self, fault: PtyFault) {
+        lock(&self.faults).push_back(fault);
     }
     /// Ends the reader of the latest attach for `agent`; `false` if none.
     pub fn close_attach(&self, agent: &AgentId) -> bool {
@@ -330,10 +368,12 @@ impl AgentRunner for FakeRunner {
         self.check("attach", &id)?;
         let shared = Arc::new(PtyShared::default());
         lock(&self.attached).insert(id.clone(), shared.clone());
+        let fault = lock(&self.faults).pop_front();
         Ok(Box::new(FakePty {
             shared,
             agent: id,
             resizes: self.resizes.clone(),
+            fault,
         }))
     }
 }

@@ -1,5 +1,6 @@
-//! The daemon's end of `GET /v1/plugin-host/agents/{id}/attach` (plugins
-//! spec §18.4): one WebSocket bridged to the runner's `PtyStream`. Binary
+//! The daemon's end of `GET
+//! /v1/plugin-host/agents/{fleet}/{crew}/{agent}/attach` (plugins spec
+//! §18.4): one WebSocket bridged to the runner's `PtyStream`. Binary
 //! frames are terminal bytes both ways; the one text frame is a resize.
 //! Dropping the stream at the end is what ends the terminal session.
 
@@ -7,7 +8,7 @@ use std::io::{Read, Write};
 
 use axum::body::Bytes;
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
-use hecaton_api::ResizeFrame;
+use hecaton_api::{ResizeFrame, TextFrame};
 use hecaton_core::PtyStream;
 use tokio::sync::mpsc;
 
@@ -45,8 +46,11 @@ impl Drop for StreamGuard {
             Ok(_) => {
                 tokio::task::spawn_blocking(move || drop(stream));
             }
-            // No runtime to protect (a plain thread, or one shutting down):
-            // dropping here is the only option left.
+            // No runtime at all (a plain thread): dropping here is the
+            // only option left. A runtime that is shutting down still
+            // answers `Ok` and accepts the blocking task; the stream is
+            // then dropped as the blocking queue drains, the same
+            // exposure as the `spawn_blocking(drop)` calls in `bridge`.
             Err(_) => drop(stream),
         }
     }
@@ -97,18 +101,20 @@ pub async fn bridge(mut socket: WebSocket, mut guard: StreamGuard) {
                     {
                         Ok((w, Ok(()))) => writer = w,
                         Ok((_, Err(_))) | Err(_) => {
-                            close(&mut socket, CLOSE_ERROR, "the window closed").await;
+                            close(&mut socket, CLOSE_ERROR, "the terminal's writer failed").await;
                             break;
                         }
                     }
                 }
                 Some(Ok(Message::Text(text))) => match ResizeFrame::parse(text.as_str()) {
-                    Some(frame) => {
+                    TextFrame::Resize(frame) => {
                         if let Err(e) = stream.resize(frame.resize.cols, frame.resize.rows) {
                             tracing::debug!("attach resize failed: {e}");
                         }
                     }
-                    None => {
+                    // a hidden container's fit, not a fault
+                    TextFrame::ZeroSized => {}
+                    TextFrame::Malformed => {
                         close(&mut socket, CLOSE_UNSUPPORTED, "expected a resize frame").await;
                         break;
                     }

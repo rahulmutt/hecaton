@@ -12,7 +12,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use hecaton_api::ResizeFrame;
+use hecaton_api::{ResizeFrame, TextFrame};
 
 use crate::plugin::Shared;
 use crate::state::AgentRow;
@@ -126,8 +126,8 @@ setInterval(refresh, {poll});
 /// The terminal page: xterm.js on a full-window div, the bridge socket,
 /// resizes on fit and on window resize, a line when the socket closes.
 /// A resize is only sent with both dimensions non-zero: the fit addon
-/// reports zeroes for a hidden container and the daemon closes the attach
-/// with 1003 on a zero-sized frame (plugins spec §18.4).
+/// reports zeroes for a hidden container, and the daemon ignores such a
+/// frame anyway (plugins spec §18.8), so it is not worth sending.
 pub fn terminal_html(prefix: &str, id: &str) -> String {
     format!(
         r#"<!doctype html>
@@ -258,7 +258,7 @@ pub async fn bridge(mut browser: WebSocket, shared: Arc<Shared>, agent: String) 
                     }
                 }
                 Some(Ok(Message::Text(text))) => {
-                    if let Some(f) = ResizeFrame::parse(text.as_str())
+                    if let TextFrame::Resize(f) = ResizeFrame::parse(text.as_str())
                         && wr.resize(f.resize.cols, f.resize.rows).await.is_err()
                     {
                         break;

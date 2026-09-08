@@ -17,7 +17,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use hecaton_api::{
     CHAIN_BUDGET_MS, ErrorBody, FleetRecord, HelloRequest, HelloResponse, HookEvent,
-    InterceptRequest, InterceptResponse, KvKeys, PluginAction, ResizeFrame, Timestamp,
+    InterceptRequest, InterceptResponse, KvKeys, PluginAction, ResizeFrame, TextFrame, Timestamp,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -300,8 +300,9 @@ async fn watch_fleets(
     })
 }
 
-/// An echo terminal: bytes come back, resizes are recorded, a text
-/// frame that is not a resize closes 1003 like the real daemon.
+/// An echo terminal: bytes come back, resizes are recorded, a
+/// zero-sized resize is ignored and a text frame that is not a resize
+/// closes 1003, like the real daemon.
 async fn attach(
     State(inner): State<Arc<Inner>>,
     headers: HeaderMap,
@@ -326,7 +327,7 @@ async fn attach(
                     }
                 }
                 Message::Text(text) => match ResizeFrame::parse(text.as_str()) {
-                    Some(frame) => inner
+                    TextFrame::Resize(frame) => inner
                         .resizes
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -334,7 +335,8 @@ async fn attach(
                             agent.clone(),
                             serde_json::to_value(frame).unwrap_or(Value::Null),
                         )),
-                    None => {
+                    TextFrame::ZeroSized => {}
+                    TextFrame::Malformed => {
                         let _ = socket
                             .send(Message::Close(Some(CloseFrame {
                                 code: 1003,

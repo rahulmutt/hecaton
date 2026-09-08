@@ -92,10 +92,12 @@ records and activation rows alike), pinging every 30 s; a consumer
 replaces its state on each frame and reconnects when the socket drops.
 `attach` opens a terminal on the agent's window: binary frames carry
 bytes both ways, a text frame must be a resize (`{ "resize": { "cols":
-120, "rows": 40 } }`, both at least 1) or the daemon closes with 1003;
-the daemon closes with 1000 when the window ends and 1011 on a runner
-failure. Both take the plugin's bearer on the handshake and answer the
-usual 401/403 before upgrading.
+120, "rows": 40 } }`) or the daemon closes with 1003; a resize with a
+zero dimension (what a hidden terminal's fit reports) is ignored, not
+refused. The daemon closes with 1000 when the window ends and 1011 on a
+runner failure. Both take the plugin's bearer on the handshake and answer
+the usual 401/403 before upgrading. Because `fleets/watch` sits beside
+`fleets/{name}`, `watch` is not a fleet name: `up` refuses it.
 
 ## 4. Daemon → plugin
 

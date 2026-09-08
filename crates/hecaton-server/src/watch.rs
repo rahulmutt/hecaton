@@ -3,6 +3,11 @@
 //! their activation overlay — so a consumer replaces its state and never
 //! diffs or handles removals. The daemon's change tick wakes the handler;
 //! it recomputes and sends only what differs from the last frame.
+//!
+//! Each connected client recomputes the overlay for itself on every tick
+//! (`plugin_fleets`), O(clients × fleets) per change. Fine for the
+//! handful of plugins that watch; a shared, tick-keyed snapshot is the
+//! next step if watchers multiply.
 
 use std::sync::Arc;
 use std::time::Duration;

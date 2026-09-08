@@ -1282,3 +1282,25 @@ Where the phase 3 implementation plan refined this section:
   activation rows of every removed plugin with no actor snapshot behind
   it, so `plugin remove`/`plugin sync` would otherwise leave
   `fleets/watch` consumers serving rows that are gone.
+
+### 18.8 Refinements after the phase 3 reviews (2026-09-08)
+
+Contract changes the phase 3 review follow-ups (issues #25–#31) made;
+everything else in them is internal.
+
+- **A zero-sized resize is ignored, not refused** (§18.4 said any text
+  frame that is not a well-formed resize closes 1003, and "well-formed"
+  meant both dimensions at least 1). xterm.js's fit addon reports zeroes
+  for a hidden container; the in-tree page guards against sending them,
+  but a third-party client that does not would lose its terminal over a
+  cosmetic frame. `ResizeFrame::parse` returns `TextFrame::{Resize,
+  ZeroSized, Malformed}`; the daemon, the SDK's `FakeHost` and the web
+  plugin treat `ZeroSized` as a no-op and `Malformed` as before.
+- **`watch` is a reserved fleet name**, beside `hecaton`: `GET
+  /v1/plugin-host/fleets/watch` is the watch route, so a fleet of that
+  name could never be fetched by a plugin. `hecaton_core::
+  reserved_fleet_reason` carries both with their reasons; `is_reserved_fleet`
+  keeps meaning the plugin fleet alone (the daemon serves its record and
+  filters its agents by it).
+- **The 1011 close on a PTY write failure says so** ("the terminal's
+  writer failed"); it used to reuse the 1000 reason.

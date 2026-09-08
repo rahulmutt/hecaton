@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use hecaton_api::{ActivationState, AgentSettings, CrewSpec, FleetRequest, FleetSpec, GitSettings};
+use hecaton_core::fakes::PtyFault;
 use hecaton_core::plugin_id;
 use hecaton_plugin_sdk::{Env, Host, Plugin, bind, run};
 use serde_json::{Value, json};
@@ -312,11 +313,12 @@ async fn removing_a_plugin_is_a_watch_frame() {
     s.close(None).await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn attach_bridges_the_runner_pty_and_gates_on_activation() {
+/// A world with `web` active for `f/c/a` (and `f/c/b` without it): the
+/// web token and the running plugin, which must outlive the test.
+async fn world_with_web_active() -> (World, String, Host) {
     let w = world().await;
     let web = token(&w, "web").await;
-    let _web_plugin = start_silent(&w, "web").await;
+    let web_plugin = start_silent(&w, "web").await;
     let req = json!(FleetRequest {
         spec: spec(&[("a", &[("web", json!({}))]), ("b", &[])]),
         credentials: Default::default()
@@ -339,6 +341,55 @@ async fn attach_bridges_the_runner_pty_and_gates_on_activation() {
     })
     .await
     .unwrap();
+    (w, web, web_plugin)
+}
+
+/// The close frame a socket ends with.
+async fn close_frame(s: &mut Socket) -> (u16, String) {
+    loop {
+        match s.next().await.expect("a frame").unwrap() {
+            Message::Close(Some(f)) => return (u16::from(f.code), f.reason.to_string()),
+            Message::Close(None) => return (1005, String::new()),
+            _ => {}
+        }
+    }
+}
+
+/// §18.4: 1011 is the runner's side failing — a stream whose reader or
+/// writer cannot be taken after the upgrade, or a PTY write that fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runner_side_failure_closes_1011_with_its_reason() {
+    let (w, web, _web_plugin) = world_with_web_active().await;
+    let url = ws_url(&w, "/v1/plugin-host/agents/f/c/a/attach");
+
+    w.h.runner.fault_next_attach(PtyFault::Reader);
+    let mut s = ws(&url, &web).await.unwrap();
+    let (code, reason) = close_frame(&mut s).await;
+    assert_eq!(code, 1011);
+    assert_eq!(reason, "attach: no reader: the pty is gone");
+
+    w.h.runner.fault_next_attach(PtyFault::Writer);
+    let mut s = ws(&url, &web).await.unwrap();
+    let (code, reason) = close_frame(&mut s).await;
+    assert_eq!(
+        (code, reason.as_str()),
+        (1011, "attach: no writer: the pty is gone")
+    );
+
+    w.h.runner.fault_next_attach(PtyFault::Write);
+    let mut s = ws(&url, &web).await.unwrap();
+    s.send(Message::Binary(b"x".to_vec().into())).await.unwrap();
+    let (code, reason) = close_frame(&mut s).await;
+    assert_eq!(
+        (code, reason.as_str()),
+        (1011, "the terminal's writer failed"),
+        "not the 1000 reason"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attach_bridges_the_runner_pty_and_gates_on_activation() {
+    let (w, web, _web_plugin) = world_with_web_active().await;
 
     // gates: capability, activation, token
     let e = ws(
@@ -394,6 +445,28 @@ async fn attach_bridges_the_runner_pty_and_gates_on_activation() {
     })
     .await
     .expect("the resize reached the runner");
+    // a zero-sized resize is cosmetic (a hidden container), not a fault:
+    // ignored, the session goes on
+    s.send(Message::Text(r#"{"resize":{"cols":0,"rows":40}}"#.into()))
+        .await
+        .unwrap();
+    s.send(Message::Binary(b"still".to_vec().into()))
+        .await
+        .unwrap();
+    let echo = s.next().await.unwrap().unwrap();
+    assert_eq!(
+        echo.into_data().as_ref(),
+        b"still",
+        "the socket survived a zero-sized resize"
+    );
+    assert!(
+        !w.h.runner
+            .resizes()
+            .iter()
+            .any(|(_, c, r)| *c == 0 || *r == 0),
+        "a zero dimension never reaches the runner: {:?}",
+        w.h.runner.resizes()
+    );
     s.send(Message::Text("junk".into())).await.unwrap();
     let close = s.next().await.unwrap().unwrap();
     match close {
