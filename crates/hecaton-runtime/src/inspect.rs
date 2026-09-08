@@ -142,8 +142,12 @@ pub fn shape_patch(raw: String) -> (String, bool, bool) {
     if raw.len() <= WORKSPACE_PATCH_LIMIT {
         return (raw, false, false);
     }
-    let end = raw[..WORKSPACE_PATCH_LIMIT]
-        .rfind('\n')
+    // Search bytes, not chars: `raw[..WORKSPACE_PATCH_LIMIT]` would panic if
+    // the limit lands inside a multi-byte character. `\n` is ASCII and never
+    // appears inside one, so a byte search for it is a valid boundary.
+    let end = raw.as_bytes()[..WORKSPACE_PATCH_LIMIT]
+        .iter()
+        .rposition(|b| *b == b'\n')
         .map_or(0, |i| i + 1);
     (raw[..end].to_string(), false, true)
 }
@@ -356,5 +360,19 @@ mod tests {
         assert!(cut.len() <= WORKSPACE_PATCH_LIMIT);
         assert!(cut.ends_with('\n'), "cut at a line boundary");
         assert_eq!(cut.len() % 100, 0);
+    }
+
+    /// `WORKSPACE_PATCH_LIMIT` (262144) falls inside the second byte of a
+    /// 2-byte UTF-8 character with this fixture's line length (102 bytes:
+    /// `+`, 50 × `é` at 2 bytes each, `\n`) — a byte-index slice would panic
+    /// here; the cut must land on the `\n` byte boundary instead.
+    #[test]
+    fn a_patch_is_cut_on_a_byte_boundary_even_through_a_multi_byte_character() {
+        let line = format!("+{}\n", "é".repeat(50));
+        let big = line.repeat(WORKSPACE_PATCH_LIMIT / line.len() + 10);
+        let (cut, binary, truncated) = shape_patch(big);
+        assert!(!binary && truncated);
+        assert!(cut.len() <= WORKSPACE_PATCH_LIMIT);
+        assert!(cut.ends_with('\n'), "cut at a line boundary");
     }
 }
