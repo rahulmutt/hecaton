@@ -267,32 +267,42 @@ fn confine(workspace: &Path, full: &Path) -> Result<(), WorkspaceError> {
     }
 }
 
+/// The `FILTER_KEYS` probe, first on every git-running read: `Filter` when
+/// the repository config names a program git would run.
+#[allow(clippy::type_complexity)]
+fn refuse_filters(
+    git: &dyn Fn(&[&str], &[i32]) -> Result<String, WorkspaceError>,
+) -> Result<(), WorkspaceError> {
+    let filters = git(
+        &[
+            "config",
+            "--local",
+            "--includes",
+            "--name-only",
+            "--get-regexp",
+            FILTER_KEYS,
+        ],
+        &[0, 1],
+    )?;
+    match filters
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+    {
+        Some(key) => Err(WorkspaceError::Filter {
+            key: key.to_string(),
+        }),
+        None => Ok(()),
+    }
+}
+
 impl WorkspaceReader for Runtime {
     fn diff(&self, agent: &AgentId, base_ref: &str) -> Result<WorkspaceDiff, WorkspaceError> {
         let id = agent.to_string();
         let (paths, crew) = self.workspace_of(agent)?;
         let git = |args: &[&str], ok: &[i32]| self.inspect_git(&id, &crew, &paths, args, ok);
-        let filters = git(
-            &[
-                "config",
-                "--local",
-                "--includes",
-                "--name-only",
-                "--get-regexp",
-                FILTER_KEYS,
-            ],
-            &[0, 1],
-        )?;
-        if let Some(key) = filters
-            .lines()
-            .next()
-            .map(str::trim)
-            .filter(|k| !k.is_empty())
-        {
-            return Err(WorkspaceError::Filter {
-                key: key.to_string(),
-            });
-        }
+        refuse_filters(&git)?;
         let head = git(&["rev-parse", "HEAD"], &[0])?.trim().to_string();
         let merge_base = git(&["merge-base", base_ref, "HEAD"], &[0])?
             .trim()
@@ -442,11 +452,39 @@ impl WorkspaceReader for Runtime {
         })
     }
     fn version(&self, agent: &AgentId, base_ref: &str) -> Result<WorkspaceVersion, WorkspaceError> {
-        // Task 2 computes this; until then the diff's identity stands in.
-        let d = self.diff(agent, base_ref)?;
+        let id = agent.to_string();
+        let (paths, crew) = self.workspace_of(agent)?;
+        let git = |args: &[&str], ok: &[i32]| self.inspect_git(&id, &crew, &paths, args, ok);
+        refuse_filters(&git)?;
+        let head = git(&["rev-parse", "HEAD"], &[0])?.trim().to_string();
+        let merge_base = git(&["merge-base", base_ref, "HEAD"], &[0])?
+            .trim()
+            .to_string();
+        let mut against_base: Vec<&str> = vec!["diff"];
+        against_base.extend(DIFF_FLAGS);
+        against_base.extend(["--name-only", "-z", merge_base.as_str()]);
+        let mut against_head: Vec<&str> = vec!["diff"];
+        against_head.extend(DIFF_FLAGS);
+        against_head.extend(["--name-only", "-z", "HEAD"]);
+        let mut paths_seen = split_z(&git(&against_base, &[0])?);
+        paths_seen.extend(split_z(&git(&against_head, &[0])?));
+        paths_seen.extend(split_z(&git(
+            &["ls-files", "--others", "--exclude-standard", "-z"],
+            &[0],
+        )?));
+        // `BTreeSet`: sorted and deduplicated, so the hash order is fixed.
+        let entries: Vec<PathStat> = paths_seen
+            .into_iter()
+            .map(|path| {
+                let stat = std::fs::symlink_metadata(paths.workspace.join(&path))
+                    .ok()
+                    .map(|m| (m.len(), m.mtime(), m.mtime_nsec()));
+                PathStat { path, stat }
+            })
+            .collect();
         Ok(WorkspaceVersion {
-            fingerprint: fingerprint_of(&d.head, &d.merge_base, &[]),
-            head: d.head,
+            fingerprint: fingerprint_of(&head, &merge_base, &entries),
+            head,
         })
     }
 }

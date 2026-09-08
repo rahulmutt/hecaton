@@ -80,6 +80,10 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
         rt.diff(&id, "origin/main"),
         Err(WorkspaceError::Missing("f/c/a".into()))
     );
+    assert_eq!(
+        rt.version(&id, "origin/main"),
+        Err(WorkspaceError::Missing("f/c/a".into()))
+    );
 
     ws.ensure_repo("f/c/a", &crew, &repo, "main").unwrap();
     ws.ensure_worktree("f/c/a", &crew, &paths.workspace, "hecaton/f/c/a", "main")
@@ -103,7 +107,7 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
     let d = rt.diff(&id, "origin/main").unwrap();
     assert_eq!(
         (d.base_ref.as_str(), d.merge_base.clone(), d.head.clone()),
-        ("origin/main", base, head)
+        ("origin/main", base, head.clone())
     );
     assert!(!d.truncated);
     let names: Vec<&str> = d.files.iter().map(|f| f.path.as_str()).collect();
@@ -157,6 +161,40 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
             w,
             &["diff", "--no-color", "-U3", &d.merge_base, "--", "README"]
         )
+    );
+
+    // the version: stable while nothing changes, sensitive to every kind of change
+    let v0 = rt.version(&id, "origin/main").unwrap();
+    assert_eq!(v0.head, head);
+    assert_eq!(v0.fingerprint.len(), 64);
+    assert_eq!(rt.version(&id, "origin/main").unwrap(), v0, "stable");
+    std::fs::write(w.join("src/lib.rs"), "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+    let v1 = rt.version(&id, "origin/main").unwrap();
+    assert_ne!(v1.fingerprint, v0.fingerprint, "an edit");
+    std::fs::write(w.join("fresh.txt"), "new\n").unwrap();
+    let v2 = rt.version(&id, "origin/main").unwrap();
+    assert_ne!(v2.fingerprint, v1.fingerprint, "an untracked file");
+    git(w, &["add", "notes.txt"]);
+    let v3 = rt.version(&id, "origin/main").unwrap();
+    assert_eq!(
+        v3.fingerprint, v2.fingerprint,
+        "a byte-identical git add is invisible"
+    );
+    git(w, &["commit", "-q", "-m", "notes"]);
+    let v4 = rt.version(&id, "origin/main").unwrap();
+    assert_ne!(v4.fingerprint, v3.fingerprint, "a commit");
+    assert_ne!(v4.head, v0.head);
+    std::fs::remove_file(w.join("fresh.txt")).unwrap();
+    let v5 = rt.version(&id, "origin/main").unwrap();
+    assert_ne!(v5.fingerprint, v4.fingerprint, "a deletion");
+    // put the tree back as the later assertions expect it
+    git(w, &["reset", "-q", "--soft", "HEAD~1"]);
+    git(w, &["reset", "-q", "notes.txt"]);
+    std::fs::write(w.join("src/lib.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+    assert_eq!(
+        rt.diff(&id, "origin/main").unwrap().files.len(),
+        d.files.len(),
+        "restored"
     );
 
     // file and tree
@@ -311,6 +349,13 @@ fn the_diff_reports_every_change_kind_and_reads_stay_inside_the_worktree() {
         }
     );
     assert!(!marker.exists(), "the filter ran");
+    assert!(
+        matches!(
+            rt.version(&id, "origin/main"),
+            Err(WorkspaceError::Filter { .. })
+        ),
+        "version is refused by the same check"
+    );
     git(w, &["config", "--unset", "filter.pwn.clean"]);
     assert!(rt.diff(&id, "origin/main").is_ok(), "unset: diffs again");
 
