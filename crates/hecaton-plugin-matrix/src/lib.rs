@@ -4,6 +4,9 @@
 pub mod actor;
 pub mod config;
 pub mod matrix;
+pub mod plugin;
 pub mod render;
 pub mod routing;
 pub mod session;
+
+pub use plugin::{Launcher, MatrixPlugin};
