@@ -6,8 +6,12 @@ use std::path::Path;
 use std::process::Command;
 
 use hecaton_api::{AgentSettings, CredentialBundle, CrewSpec, FleetSpec, GitAuth, GitSettings};
-use hecaton_core::{Fleet, HookTarget, Keep, Materializer, ResolvedAgent};
+use hecaton_core::{CrewTools, Fleet, HookTarget, Keep, Materializer, ResolvedAgent};
 use hecaton_runtime::{Runtime, embedded_system_tools};
+
+fn no_tools() -> BTreeMap<String, String> {
+    BTreeMap::new()
+}
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -127,8 +131,19 @@ fn materialize_then_remove_round_trip() {
         secret: "s".into(),
     };
 
-    rt.ensure_crew(&crew, &agent.repo, &agent.git_ref, &agent.git, &creds)
-        .unwrap();
+    let (f_tools, c_tools) = (no_tools(), no_tools());
+    rt.ensure_crew(
+        &crew,
+        &agent.repo,
+        &agent.git_ref,
+        &agent.git,
+        &creds,
+        CrewTools {
+            fleet: &f_tools,
+            crew: &c_tools,
+        },
+    )
+    .unwrap();
     let plan = rt.materialize(&agent, &creds, &hooks).unwrap();
     let paths = layout.agent(&agent.id);
     assert!(paths.workspace.join("README").exists());
@@ -140,8 +155,18 @@ fn materialize_then_remove_round_trip() {
     );
     assert_eq!(plan.cwd, paths.workspace);
     // idempotent
-    rt.ensure_crew(&crew, &agent.repo, &agent.git_ref, &agent.git, &creds)
-        .unwrap();
+    rt.ensure_crew(
+        &crew,
+        &agent.repo,
+        &agent.git_ref,
+        &agent.git,
+        &creds,
+        CrewTools {
+            fleet: &f_tools,
+            crew: &c_tools,
+        },
+    )
+    .unwrap();
     rt.materialize(&agent, &creds, &hooks).unwrap();
     assert!(paths.installed_marker().exists());
     let mise_log = std::fs::read_to_string(paths.logs.join("mise.toolchain.log")).unwrap();
@@ -191,6 +216,7 @@ fn gh_auth_without_a_token_is_a_clear_error() {
     let rt = Runtime::new(support::layout(&root), tools);
     let f = fleet("file:///nowhere.git");
     let agent = ResolvedAgent::from_fleet(&f).remove(0);
+    let (f_tools, c_tools) = (no_tools(), no_tools());
     let err = rt
         .ensure_crew(
             &agent.id.crew_ref(),
@@ -198,6 +224,10 @@ fn gh_auth_without_a_token_is_a_clear_error() {
             "main",
             &GitSettings::default(),
             &CredentialBundle::default(),
+            CrewTools {
+                fleet: &f_tools,
+                crew: &c_tools,
+            },
         )
         .unwrap_err();
     assert_eq!(

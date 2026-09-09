@@ -52,7 +52,7 @@ pub fn embedded_system_tools() -> BTreeMap<String, String> {
 /// the embedded default.
 pub fn system_tools(
     layout: &StateLayout,
-    id: &AgentId,
+    id: &str,
 ) -> Result<BTreeMap<String, String>, MaterializeError> {
     let path = layout.system_mise_toml();
     match std::fs::read_to_string(&path) {
@@ -412,12 +412,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let layout = StateLayout::from_env(dir.path(), |_| None);
         assert_eq!(
-            system_tools(&layout, &id()).unwrap(),
+            system_tools(&layout, &id().to_string()).unwrap(),
             embedded_system_tools()
         );
         std::fs::create_dir_all(&layout.config_root).unwrap();
         std::fs::write(layout.system_mise_toml(), "[tools]\nclaude = \"9.9.9\"\n").unwrap();
-        assert_eq!(system_tools(&layout, &id()).unwrap()["claude"], "9.9.9");
+        assert_eq!(
+            system_tools(&layout, &id().to_string()).unwrap()["claude"],
+            "9.9.9"
+        );
     }
 
     #[test]

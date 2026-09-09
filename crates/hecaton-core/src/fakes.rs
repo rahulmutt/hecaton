@@ -17,7 +17,7 @@ use crate::agent::{CrewRef, ResolvedAgent};
 use crate::name::{AgentId, AgentName, FleetName};
 use crate::plugin::ResolvedPlugin;
 use crate::ports::{
-    AgentRunner, Clock, HookTarget, Keep, LaunchPlan, MaterializeError, Materializer,
+    AgentRunner, Clock, CrewTools, HookTarget, Keep, LaunchPlan, MaterializeError, Materializer,
     ObservedState, ProcessState, PtyStream, RunnerError, WorkspaceError, WorkspaceReader,
 };
 use crate::repo::RepoRef;
@@ -47,6 +47,8 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[derive(Default)]
 pub struct FakeMaterializer {
     rec: Mutex<Recorder>,
+    #[allow(clippy::type_complexity)]
+    crew_tools: Mutex<Vec<(String, Vec<String>, Vec<String>)>>,
 }
 
 impl FakeMaterializer {
@@ -57,6 +59,11 @@ impl FakeMaterializer {
         lock(&self.rec)
             .fail_next
             .push((method.into(), id.into(), stderr.into()));
+    }
+    /// Each `ensure_crew` call as (crew, fleet tools, crew tools), with
+    /// each table flattened to sorted `name=version` strings.
+    pub fn crew_tools(&self) -> Vec<(String, Vec<String>, Vec<String>)> {
+        lock(&self.crew_tools).clone()
     }
     fn check(&self, method: &str, id: &str, tool: &str) -> Result<(), MaterializeError> {
         match lock(&self.rec).record(method, id) {
@@ -80,7 +87,14 @@ impl Materializer for FakeMaterializer {
         _: &str,
         _: &GitSettings,
         _: &CredentialBundle,
+        tools: CrewTools<'_>,
     ) -> Result<(), MaterializeError> {
+        let flat = |t: &BTreeMap<String, String>| {
+            t.iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+        };
+        lock(&self.crew_tools).push((crew.to_string(), flat(tools.fleet), flat(tools.crew)));
         self.check("ensure_crew", &crew.to_string(), "git")
     }
     fn materialize(

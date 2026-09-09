@@ -103,6 +103,13 @@ impl StateLayout {
     pub fn system_mise_toml(&self) -> PathBuf {
         self.config_root.join("mise.toml")
     }
+    /// The generated copy of the system table that the daemon pool is
+    /// installed from. `system_mise_toml()` is the admin's hand-written
+    /// input; this is hecaton's rendering of it, so the marker has a stable
+    /// file to hash.
+    pub fn system_mise_toml_generated(&self) -> PathBuf {
+        self.data_root.join("mise.toml")
+    }
     /// `server/`: token, vault key, endpoint, pid, log (Phase 3 spec §3.3, §5).
     pub fn server_dir(&self) -> PathBuf {
         self.state_root.join("server")

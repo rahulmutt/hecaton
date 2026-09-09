@@ -21,7 +21,7 @@ pub use plugin::{
     plugin_id, reserved_fleet_reason, validate_manifest,
 };
 pub use ports::{
-    AgentRunner, Clock, HookTarget, Keep, LaunchPlan, MaterializeError, Materializer,
+    AgentRunner, Clock, CrewTools, HookTarget, Keep, LaunchPlan, MaterializeError, Materializer,
     ObservedState, ProcessState, PtyStream, RunnerError, WorkspaceError, WorkspaceReader,
     first_line,
 };

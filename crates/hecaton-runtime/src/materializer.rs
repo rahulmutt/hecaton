@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use hecaton_api::{CredentialBundle, GitAuth, GitSettings};
 use hecaton_core::{
-    AgentId, AgentName, CrewRef, HookTarget, Keep, LaunchPlan, MaterializeError, Materializer,
-    RepoRef, ResolvedAgent, ResolvedPlugin,
+    AgentId, AgentName, CrewRef, CrewTools, HookTarget, Keep, LaunchPlan, MaterializeError,
+    Materializer, RepoRef, ResolvedAgent, ResolvedPlugin,
 };
 
 use crate::env::agent_env;
@@ -71,7 +71,7 @@ impl Runtime {
             },
         )?;
 
-        let system = system_tools(&self.layout, id)?;
+        let system = system_tools(&self.layout, &id.to_string())?;
         let tools_changed = Toolchain {
             tools: &self.tools,
             layout: &self.layout,
@@ -152,6 +152,56 @@ impl Runtime {
             message: e.to_string(),
         })
     }
+
+    /// The three daemon-owned pools, outermost first: the system table into
+    /// the daemon pool, the fleet's tools into the fleet pool, this crew's
+    /// into the crew pool. Each is skipped when its marker already matches
+    /// its rendered table, and each resolves through the pools above it, so
+    /// a version an outer pool already holds is never downloaded twice
+    /// (Spec E §5).
+    pub fn install_pools(
+        &self,
+        crew: &CrewRef,
+        tools: CrewTools<'_>,
+    ) -> Result<(), MaterializeError> {
+        let tc = Toolchain {
+            tools: &self.tools,
+            layout: &self.layout,
+        };
+        let fleet = self.layout.fleet(&crew.fleet);
+        let crew_paths = self.layout.crew(crew);
+        let daemon_pool = self.layout.mise_data_dir();
+        let log = crew_paths.root.join("logs").join("mise.pools.log");
+
+        let system = system_tools(&self.layout, &crew.fleet.to_string())?;
+        tc.install_level(
+            "system",
+            &self.layout.system_mise_toml_generated(),
+            &daemon_pool,
+            &[],
+            &self.layout.system_installed_marker(),
+            &system,
+            &log,
+        )?;
+        tc.install_level(
+            &format!("fleet {}", crew.fleet),
+            &fleet.mise_toml,
+            &fleet.mise_pool(),
+            std::slice::from_ref(&daemon_pool),
+            &fleet.installed_marker(),
+            tools.fleet,
+            &log,
+        )?;
+        tc.install_level(
+            &format!("crew {crew}"),
+            &crew_paths.mise_toml(),
+            &crew_paths.mise_pool(),
+            &[fleet.mise_pool(), daemon_pool],
+            &crew_paths.installed_marker(),
+            tools.crew,
+            &log,
+        )
+    }
 }
 
 impl Runtime {
@@ -216,8 +266,10 @@ impl Materializer for Runtime {
         git_ref: &str,
         git: &GitSettings,
         creds: &CredentialBundle,
+        tools: CrewTools<'_>,
     ) -> Result<(), MaterializeError> {
         let id = crew.to_string();
+        self.install_pools(crew, tools)?;
         if git.auth == GitAuth::Gh {
             let token = creds.gh_token.as_deref().ok_or_else(|| MaterializeError::Invalid {
                 id: id.clone(),

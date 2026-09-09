@@ -8,9 +8,9 @@ use std::sync::{Arc, RwLock};
 
 use hecaton_api::{CredentialBundle, GitSettings};
 use hecaton_core::{
-    AgentId, AgentName, CrewRef, FleetName, FleetRecord, FleetSecrets, FleetStore, HookTarget,
-    Keep, LaunchPlan, MaterializeError, Materializer, RepoRef, ResolvedAgent, ResolvedPlugin,
-    StoreError,
+    AgentId, AgentName, CrewRef, CrewTools, FleetName, FleetRecord, FleetSecrets, FleetStore,
+    HookTarget, Keep, LaunchPlan, MaterializeError, Materializer, RepoRef, ResolvedAgent,
+    ResolvedPlugin, StoreError,
 };
 
 pub struct PluginMaterializer {
@@ -54,6 +54,7 @@ impl Materializer for PluginMaterializer {
         _: &str,
         _: &GitSettings,
         _: &CredentialBundle,
+        _: CrewTools<'_>,
     ) -> Result<(), MaterializeError> {
         Ok(())
     }
@@ -153,12 +154,17 @@ mod tests {
             vec!["materialize_plugin hecaton/plugins/web"]
         );
         // crews and removals are no-ops: nothing to clone, state kept until purge
+        let empty = BTreeMap::new();
         m.ensure_crew(
             &agents[0].id.crew_ref(),
             &agents[0].repo,
             "none",
             &agents[0].git,
             &CredentialBundle::default(),
+            CrewTools {
+                fleet: &empty,
+                crew: &empty,
+            },
         )
         .unwrap();
         m.remove_agent(&agents[0].id).unwrap();

@@ -8,7 +8,9 @@ use hecaton_api::{CredentialBundle, FleetStatus};
 use crate::agent::{CrewRef, ResolvedAgent};
 use crate::fleet::Fleet;
 use crate::name::{AgentId, FleetName};
-use crate::ports::{AgentRunner, Clock, HookTarget, Keep, LaunchPlan, Materializer, RunnerError};
+use crate::ports::{
+    AgentRunner, Clock, CrewTools, HookTarget, Keep, LaunchPlan, Materializer, RunnerError,
+};
 use crate::reconcile::{Plan, ReconcilePolicy, Step, apply, finish_pass, plan};
 
 pub struct ReconcileContext<'a> {
@@ -116,9 +118,12 @@ pub fn execute(plan: &Plan, status: &mut FleetStatus, ctx: &ReconcileContext) ->
 }
 
 fn ensure_crew(ctx: &ReconcileContext, crew: &CrewRef) -> Result<(), String> {
-    let desired = ctx
+    let fleet = ctx
         .desired
-        .and_then(|f| f.crews.get(&crew.crew))
+        .ok_or_else(|| format!("{crew}: not in the desired fleet"))?;
+    let desired = fleet
+        .crews
+        .get(&crew.crew)
         .ok_or_else(|| format!("{crew}: not in the desired fleet"))?;
     ctx.materializer
         .ensure_crew(
@@ -127,6 +132,10 @@ fn ensure_crew(ctx: &ReconcileContext, crew: &CrewRef) -> Result<(), String> {
             &desired.git_ref,
             &desired.git,
             ctx.creds,
+            CrewTools {
+                fleet: &fleet.tools,
+                crew: &desired.tools,
+            },
         )
         .map_err(|e| e.to_string())?;
     ctx.runner.ensure_crew(crew).map_err(|e| e.to_string())
@@ -224,6 +233,44 @@ mod tests {
                 clock: &self.clock,
             }
         }
+    }
+
+    fn harness_with_tools(
+        fleet_tools: BTreeMap<String, String>,
+        crew_tools: BTreeMap<String, String>,
+    ) -> (Harness, Fleet) {
+        let h = Harness::new();
+        let mut f = fleet(&["a"]);
+        f.tools = fleet_tools;
+        if let Some(c) = f.crews.get_mut(&"c".parse().unwrap()) {
+            c.tools = crew_tools;
+        }
+        (h, f)
+    }
+
+    #[test]
+    fn ensure_crew_passes_the_fleet_and_crew_tool_tables_through() {
+        let (h, f) = harness_with_tools(
+            BTreeMap::from([("node".to_string(), "22.11.0".to_string())]),
+            BTreeMap::from([("python".to_string(), "3.12.8".to_string())]),
+        );
+        let seen = h.m.crew_tools();
+        assert!(seen.is_empty(), "nothing recorded before the pass");
+        let mut st = FleetStatus::default();
+        let _ = execute(
+            &vec![Step::EnsureCrew("f/c".parse().unwrap())],
+            &mut st,
+            &h.ctx(Some(&f)),
+        );
+        assert_eq!(
+            h.m.crew_tools(),
+            vec![(
+                "f/c".to_string(),
+                vec!["node=22.11.0".to_string()],
+                vec!["python=3.12.8".to_string()]
+            )],
+            "the materializer sees each level's own table, unmerged"
+        );
     }
 
     #[test]
