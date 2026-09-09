@@ -121,14 +121,14 @@ pub fn validate(body: &ReviewBody) -> Result<(), String> {
 /// comments in file then line order each quoting its line, and the
 /// summary as `Overall:` when there is one. No trailing newline: the
 /// runner's `submit` adds the Enter.
-pub fn render_message(agent: &str, body: &ReviewBody) -> String {
+pub fn render_message(body: &ReviewBody) -> String {
     let mut comments: Vec<&Comment> = body.comments.iter().collect();
     comments.sort_by(|a, b| {
         (a.path.as_str(), a.line, a.side as u8).cmp(&(b.path.as_str(), b.line, b.side as u8))
     });
     let n = comments.len();
     let short: String = body.head.chars().take(7).collect();
-    let mut out = format!("Review of {agent}");
+    let mut out = String::from("Review");
     if !body.base_ref.is_empty() {
         out.push_str(&format!(" against {}", body.base_ref));
     }
@@ -180,8 +180,8 @@ mod tests {
     fn the_message_is_the_spec_example() {
         assert_eq!(validate(&body()), Ok(()));
         assert_eq!(
-            render_message("e2e/c/alice", &body()),
-            "Review of e2e/c/alice against origin/main at 3f9c2a1 (2 comments)\n\
+            render_message(&body()),
+            "Review against origin/main at 3f9c2a1 (2 comments)\n\
              \n\
              src/lib.rs line 42 (new):\n\
              > +    let x = foo();\n\
@@ -198,11 +198,8 @@ mod tests {
         one.comments.truncate(1);
         one.summary.clear();
         one.base_ref.clear();
-        let m = render_message("f/c/a", &one);
-        assert!(
-            m.starts_with("Review of f/c/a at 3f9c2a1 (1 comment)\n\n"),
-            "{m}"
-        );
+        let m = render_message(&one);
+        assert!(m.starts_with("Review at 3f9c2a1 (1 comment)\n\n"), "{m}");
         assert!(!m.contains("Overall:"));
         assert!(!m.ends_with('\n'));
     }
@@ -328,10 +325,10 @@ mod tests {
             .collect(),
         };
         assert_eq!(validate(&big), Ok(()), "every field is within its cap");
-        let message = render_message("f/c/a", &big);
+        let message = render_message(&big);
         assert!(message.len() > MAX_MESSAGE_BYTES, "{} bytes", message.len());
         assert_eq!(MAX_MESSAGE_BYTES, 262144);
         // A review of the size the caps are written for stays well under.
-        assert!(render_message("f/c/a", &body()).len() < MAX_MESSAGE_BYTES);
+        assert!(render_message(&body()).len() < MAX_MESSAGE_BYTES);
     }
 }

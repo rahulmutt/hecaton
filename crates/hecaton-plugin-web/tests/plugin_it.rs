@@ -544,7 +544,7 @@ async fn a_review_is_one_send_text_and_a_divider_in_the_column() {
         (status, String::from_utf8_lossy(&body).as_ref()),
         (200, "{}")
     );
-    let expected = "Review of e2e/c/alice against origin/main at 3f9c2a1 (1 comment)\n\nsrc/lib.rs line 2 (new):\n> +fn b() { c() }\nName this.\n\nOverall:\nLooks fine.";
+    let expected = "Review against origin/main at 3f9c2a1 (1 comment)\n\nsrc/lib.rs line 2 (new):\n> +fn b() { c() }\nName this.\n\nOverall:\nLooks fine.";
     assert_eq!(
         fake.actions_for(ALICE),
         vec![PluginAction::SendText {

@@ -290,7 +290,7 @@ send`.
 The message, one string:
 
 ```
-Review of e2e/c/alice against origin/main at 3f9c2a1 (2 comments)
+Review against origin/main at 3f9c2a1 (2 comments)
 
 src/lib.rs line 42 (new):
 > +    let x = foo();
@@ -306,6 +306,8 @@ Looks close. Please address the comments above and run the tests.
 
 The `Overall:` block is omitted when the summary is empty; `at <sha>` is the
 first seven characters of `head`; comments are in file then line order. The
+header names no agent: the agent is the recipient, and the fleet and crew
+are Hecaton's addressing, not something it can see (changed 2026-09-09). The
 plugin sends it as `send_text { submit: true }`, appends the `review_sent`
 entry, and answers `{}`. A failed action is 502 with the daemon's message
 and the page keeps the draft.

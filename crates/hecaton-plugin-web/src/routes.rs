@@ -603,7 +603,7 @@ async fn post_review(
     if let Err(reason) = validate(&review) {
         return (StatusCode::BAD_REQUEST, reason).into_response();
     }
-    let message = render_message(&id, &review);
+    let message = render_message(&review);
     // `validate` bounds every field, but `path` and `text` multiply by the
     // comment count, so the rendered message needs its own cap.
     if message.len() > MAX_MESSAGE_BYTES {

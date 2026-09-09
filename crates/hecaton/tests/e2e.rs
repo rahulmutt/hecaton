@@ -1588,10 +1588,7 @@ fn web_journey() {
     let stdin = wait_file_until(&w.agent_dir("alice").join("home/fake-claude.stdin"), |s| {
         s.contains("Looks fine.")
     });
-    assert!(
-        stdin.contains("Review of e2e/c/alice against origin/main at "),
-        "{stdin}"
-    );
+    assert!(stdin.contains("Review against origin/main at "), "{stdin}");
     assert!(
         stdin.contains("NOTES.md line 1 (new):\n> +agent notes\nPlease expand these notes."),
         "{stdin}"
