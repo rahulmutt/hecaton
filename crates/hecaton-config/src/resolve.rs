@@ -79,11 +79,16 @@ pub fn resolve(file: &FleetFile, opts: &ResolveOptions) -> Result<FleetSpec, Con
                 git_ref: crew.git_ref.clone(),
                 git: crew.git.clone(),
                 agents,
+                ..Default::default()
             },
         );
     }
 
-    let spec = FleetSpec { name, crews };
+    let spec = FleetSpec {
+        name,
+        crews,
+        ..Default::default()
+    };
     Fleet::try_from(spec.clone())?; // names and repos
     Ok(spec)
 }

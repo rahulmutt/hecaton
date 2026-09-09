@@ -569,6 +569,7 @@ mod tests {
         FleetRecord::new(FleetSpec {
             name: name.into(),
             crews: BTreeMap::new(),
+            ..Default::default()
         })
     }
 

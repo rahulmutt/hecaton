@@ -113,8 +113,10 @@ fn spec(agents: &[(&str, &[(&str, Value)])]) -> FleetSpec {
                         (n.to_string(), s)
                     })
                     .collect(),
+                ..Default::default()
             },
         )]),
+        ..Default::default()
     }
 }
 

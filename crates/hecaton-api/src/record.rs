@@ -75,6 +75,7 @@ mod tests {
         FleetSpec {
             name: "payments".into(),
             crews: BTreeMap::new(),
+            ..Default::default()
         }
     }
 

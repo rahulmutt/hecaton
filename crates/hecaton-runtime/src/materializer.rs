@@ -352,8 +352,10 @@ mod tests {
                     git_ref: "main".into(),
                     git: GitSettings::default(),
                     agents: BTreeMap::from([("a".to_string(), s)]),
+                    ..Default::default()
                 },
             )]),
+            ..Default::default()
         })
         .unwrap();
         ResolvedAgent::from_fleet(&fleet).remove(0)

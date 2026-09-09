@@ -309,6 +309,7 @@ mod tests {
         let mut r = FleetRecord::new(FleetSpec {
             name: "payments".into(),
             crews: BTreeMap::new(),
+            ..Default::default()
         });
         r.generation = 3;
         r.status.generation = 3;
@@ -348,6 +349,7 @@ mod tests {
         let mut r = FleetRecord::new(FleetSpec {
             name: "p".into(),
             crews: BTreeMap::new(),
+            ..Default::default()
         });
         r.generation = 1;
         r.status.generation = 1;

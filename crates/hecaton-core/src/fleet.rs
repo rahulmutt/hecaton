@@ -12,6 +12,8 @@ use crate::repo::{RepoError, RepoRef};
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fleet {
     pub name: FleetName,
+    /// Tools for the fleet pool, verbatim from `FleetSpec`.
+    pub tools: BTreeMap<String, String>,
     pub crews: BTreeMap<CrewName, Crew>,
 }
 
@@ -21,6 +23,8 @@ pub struct Crew {
     pub repo: RepoRef,
     pub git_ref: String,
     pub git: GitSettings,
+    /// Tools for this crew's pool, verbatim from `CrewSpec`.
+    pub tools: BTreeMap<String, String>,
     pub agents: BTreeMap<AgentName, AgentSettings>,
 }
 
@@ -52,6 +56,7 @@ impl TryFrom<FleetSpec> for Fleet {
             path: "name".to_string(),
             source,
         })?;
+        let tools = spec.tools;
         let mut crews = BTreeMap::new();
         for (crew_name, crew) in spec.crews {
             let path = format!("crews.{crew_name}");
@@ -62,7 +67,7 @@ impl TryFrom<FleetSpec> for Fleet {
                 })?;
             crews.insert(crew_name, convert_crew(&path, crew)?);
         }
-        Ok(Self { name, crews })
+        Ok(Self { name, tools, crews })
     }
 }
 
@@ -102,6 +107,7 @@ fn convert_crew(path: &str, crew: CrewSpec) -> Result<Crew, FleetError> {
         repo,
         git_ref: crew.git_ref,
         git: crew.git,
+        tools: crew.tools,
         agents,
     })
 }
@@ -110,6 +116,7 @@ impl From<Fleet> for FleetSpec {
     fn from(fleet: Fleet) -> Self {
         Self {
             name: fleet.name.into(),
+            tools: fleet.tools,
             crews: fleet
                 .crews
                 .into_iter()
@@ -120,6 +127,7 @@ impl From<Fleet> for FleetSpec {
                             repo: crew.repo.clone_url(),
                             git_ref: crew.git_ref,
                             git: crew.git,
+                            tools: crew.tools,
                             agents: crew
                                 .agents
                                 .into_iter()
@@ -152,8 +160,10 @@ mod tests {
                         .iter()
                         .map(|a| (a.to_string(), AgentSettings::default()))
                         .collect(),
+                    ..Default::default()
                 },
             )]),
+            ..Default::default()
         }
     }
 
@@ -270,5 +280,25 @@ mod tests {
             Fleet::try_from(s).unwrap_err().to_string(),
             "crews.c.git.identity.email: must not be empty"
         );
+    }
+
+    #[test]
+    fn conversion_carries_the_fleet_and_crew_tool_tables() {
+        let spec = FleetSpec {
+            name: "f".into(),
+            tools: BTreeMap::from([("node".to_string(), "22.11.0".to_string())]),
+            crews: BTreeMap::from([(
+                "c".to_string(),
+                CrewSpec {
+                    repo: "o/r".into(),
+                    git_ref: "main".into(),
+                    tools: BTreeMap::from([("python".to_string(), "3.12.8".to_string())]),
+                    ..Default::default()
+                },
+            )]),
+        };
+        let fleet = Fleet::try_from(spec).unwrap();
+        assert_eq!(fleet.tools["node"], "22.11.0");
+        assert_eq!(fleet.crews[&"c".parse().unwrap()].tools["python"], "3.12.8");
     }
 }

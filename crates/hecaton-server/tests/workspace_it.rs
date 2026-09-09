@@ -66,8 +66,10 @@ fn spec(agents: &[&str]) -> FleetSpec {
                         )
                     })
                     .collect(),
+                ..Default::default()
             },
         )]),
+        ..Default::default()
     }
 }
 

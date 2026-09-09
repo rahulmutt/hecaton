@@ -858,8 +858,10 @@ mod tests {
                             (n.to_string(), s)
                         })
                         .collect(),
+                    ..Default::default()
                 },
             )]),
+            ..Default::default()
         }
     }
 

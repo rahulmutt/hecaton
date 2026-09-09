@@ -53,8 +53,10 @@ fn fleet(repo_url: &str) -> Fleet {
                     ..GitSettings::default()
                 },
                 agents: BTreeMap::from([("a".to_string(), s)]),
+                ..Default::default()
             },
         )]),
+        ..Default::default()
     })
     .unwrap()
 }

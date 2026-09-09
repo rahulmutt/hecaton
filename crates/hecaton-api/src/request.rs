@@ -65,6 +65,7 @@ mod tests {
             spec: FleetSpec {
                 name: "f".into(),
                 crews: BTreeMap::new(),
+                ..Default::default()
             },
             credentials: CredentialBundle::default(),
         };

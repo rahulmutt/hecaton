@@ -441,8 +441,10 @@ mod tests {
                         .iter()
                         .map(|a| (a.to_string(), AgentSettings::default()))
                         .collect(),
+                    ..Default::default()
                 },
             )]),
+            ..Default::default()
         }
     }
 

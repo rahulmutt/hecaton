@@ -33,8 +33,10 @@ fn fleet() -> Fleet {
                 git_ref: "main".into(),
                 git: GitSettings::default(),
                 agents: BTreeMap::from([("alice".to_string(), alice), ("bob".to_string(), bob)]),
+                ..Default::default()
             },
         )]),
+        ..Default::default()
     })
     .unwrap()
 }

@@ -22,6 +22,7 @@ fn fleet(agents: &[(&str, AgentPhase)]) -> FleetRecord {
     let mut r = FleetRecord::new(FleetSpec {
         name: "e2e".into(),
         crews: BTreeMap::new(),
+        ..Default::default()
     });
     for (id, phase) in agents {
         r.status.entry(id).phase = *phase;
