@@ -218,10 +218,17 @@ impl SystemToolchain for Runtime {
             .join("logs")
             .join("mise.system.log");
         let system = system_tools(&self.layout, "system")?;
-        if !pool.exists() {
-            // Drop a stale marker so `install_level` cannot short-circuit
-            // past a pool that is no longer there.
-            let _ = std::fs::remove_file(&marker);
+        // Drop a stale marker so `install_level` cannot short-circuit past a
+        // pool that is no longer there.
+        if !pool.exists()
+            && let Err(e) = std::fs::remove_file(&marker)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(MaterializeError::Io {
+                id: "system".to_string(),
+                path: marker,
+                message: e.to_string(),
+            });
         }
         tc.install_level(
             "system",
@@ -537,6 +544,26 @@ mod tests {
         assert!(
             !matches!(err, MaterializeError::Invalid { .. }),
             "a missing pool must drive a real install attempt, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_marker_removal_failure_other_than_missing_is_not_swallowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime(dir.path());
+        let marker = rt.layout.system_installed_marker();
+        // A directory where a file is expected: `remove_file` fails with
+        // something other than `NotFound`, and the pool does not exist
+        // either, so `ensure_system_pool` must try the removal and
+        // propagate that failure rather than silently proceed to
+        // `install_level` with a marker that is still there.
+        std::fs::create_dir_all(&marker).unwrap();
+        assert!(!rt.layout.mise_data_dir().exists(), "no pool yet");
+
+        let err = rt.ensure_system_pool().unwrap_err();
+        assert!(
+            matches!(err, MaterializeError::Io { .. }),
+            "a removal failure other than NotFound must surface as Io, got {err:?}"
         );
     }
 
