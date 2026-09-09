@@ -55,6 +55,7 @@ pub(crate) struct Cmd {
     cwd: Option<PathBuf>,
     log: Option<PathBuf>,
     log_stdout: bool,
+    timeout: Option<std::time::Duration>,
 }
 
 #[derive(Debug)]
@@ -92,6 +93,7 @@ impl Cmd {
             cwd: None,
             log: None,
             log_stdout: true,
+            timeout: None,
         }
     }
     pub(crate) fn args<I: IntoIterator<Item = S>, S: Into<String>>(mut self, a: I) -> Self {
@@ -133,6 +135,15 @@ impl Cmd {
     pub(crate) fn log_argv_only(mut self, file: &Path) -> Self {
         self.log = Some(file.to_path_buf());
         self.log_stdout = false;
+        self
+    }
+    /// Kills the child and fails if it outlives `d`. Only the daemon pool
+    /// install sets this today (Spec F §6); every other call is unbounded as
+    /// before.
+    // Task 3 (Spec F §3) is the first production caller; this comes off then.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn timeout(mut self, d: std::time::Duration) -> Self {
+        self.timeout = Some(d);
         self
     }
     pub(crate) fn tool(&self) -> String {
@@ -200,7 +211,33 @@ impl Cmd {
         let cannot_execute =
             |e: std::io::Error| failure(format!("cannot execute {}: {e}", self.program.display()));
         let out = match stdin {
-            None => c.output().map_err(cannot_execute)?,
+            None => match self.timeout {
+                None => c.output().map_err(cannot_execute)?,
+                Some(d) => {
+                    let child = c
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .map_err(cannot_execute)?;
+                    let pid = child.id();
+                    // `wait_with_output` drains both pipes; doing it on its
+                    // own thread is what keeps a chatty child from filling a
+                    // pipe buffer and deadlocking us while we wait.
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(child.wait_with_output());
+                    });
+                    match rx.recv_timeout(d) {
+                        Ok(out) => out.map_err(cannot_execute)?,
+                        Err(_) => {
+                            // The reader thread owns the child, so kill by
+                            // pid and let it observe the exit and finish.
+                            kill_pid(pid);
+                            return Err(failure(format!("timed out after {}s", d.as_secs())));
+                        }
+                    }
+                }
+            },
             Some(input) => {
                 let mut child = c
                     .stdin(Stdio::piped())
@@ -252,6 +289,14 @@ impl Cmd {
         }
         Ok(CmdOutput { stdout })
     }
+}
+
+/// `kill(1)` rather than a raw signal: the workspace forbids `unsafe`, and the
+/// reader thread owns the `Child`, so `Child::kill` is not reachable here.
+fn kill_pid(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status();
 }
 
 #[cfg(test)]
@@ -362,5 +407,54 @@ mod tests {
             .run()
             .unwrap_err();
         assert!(err.stderr.starts_with("cannot execute /nonexistent/tool"));
+    }
+
+    #[test]
+    fn a_timeout_kills_a_hung_child_and_reports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("logs").join("sleep.log");
+        let start = std::time::Instant::now();
+        let err = Cmd::new(Path::new("/bin/sh"))
+            .args(["-c", "sleep 30"])
+            .log(&log)
+            .timeout(std::time::Duration::from_millis(300))
+            .run()
+            .expect_err("a 30s sleep under a 300ms timeout must fail");
+        assert!(
+            err.stderr.contains("timed out"),
+            "expected a timeout message, got {:?}",
+            err.stderr
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "the timeout must not wait out the child"
+        );
+    }
+
+    #[test]
+    fn a_chatty_child_does_not_deadlock_under_a_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("logs").join("chatty.log");
+        // Far more than a pipe buffer (64 KiB on Linux): a implementation
+        // that polls without draining the pipes hangs here forever.
+        let out = Cmd::new(Path::new("/bin/sh"))
+            .args(["-c", "yes hecaton | head -c 400000"])
+            .log(&log)
+            .timeout(std::time::Duration::from_secs(30))
+            .run()
+            .expect("a fast chatty child must succeed well inside its timeout");
+        assert!(out.stdout.len() >= 400_000, "stdout was truncated");
+    }
+
+    #[test]
+    fn without_a_timeout_a_command_still_runs_to_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("logs").join("plain.log");
+        let out = Cmd::new(Path::new("/bin/sh"))
+            .args(["-c", "echo ok"])
+            .log(&log)
+            .run()
+            .expect("no timeout set: unchanged behaviour");
+        assert_eq!(out.stdout.trim(), "ok");
     }
 }
