@@ -441,7 +441,7 @@ impl<M: MatrixPort> Actor<M> {
             Err(e) => {
                 count("send_failed");
                 self.counters.errors.with_label_values(&["send_text"]).inc();
-                let body = format!("**not delivered to {agent}:** {e}");
+                let body = render::truncate(&format!("**not delivered to {agent}:** {e}"));
                 self.send(&message.room, Some(&root), &body, "notice").await;
                 self.react(&message, FAILED).await;
             }
@@ -1221,5 +1221,26 @@ mod tests {
         assert_eq!(notice.len(), 1, "the failure is posted in the thread");
         assert_eq!(notice[0].0, Some(root), "in the thread, not the room");
         assert!(notice[0].1.contains("no such window"), "{}", notice[0].1);
+    }
+
+    #[tokio::test]
+    async fn a_long_daemon_error_is_truncated_before_it_is_posted() {
+        let (fake, port, mut a, room, root) = with_thread().await;
+        let long_error = "x".repeat(crate::render::BODY_LIMIT * 2);
+        fake.fail_actions(Some(&long_error));
+        a.handle(Command::Inbound(inbound(
+            &room,
+            Some(&root),
+            "@rahul:example.org",
+            "run the tests",
+        )))
+        .await;
+        let notice = sends(&port.calls());
+        assert_eq!(notice.len(), 1, "the failure is posted in the thread");
+        assert!(
+            notice[0].1.len() <= crate::render::BODY_LIMIT + 32,
+            "the notice was not truncated: {} bytes",
+            notice[0].1.len()
+        );
     }
 }
