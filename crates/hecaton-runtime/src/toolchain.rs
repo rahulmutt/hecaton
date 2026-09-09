@@ -151,6 +151,16 @@ pub fn mise_env(paths: &AgentPaths, layout: &StateLayout) -> BTreeMap<String, St
 /// into `pool`, resolve through `parents` (read-only). Empty `parents`
 /// leaves `MISE_SHARED_INSTALL_DIRS` unset rather than empty — the daemon
 /// pool is the root of the chain and has nothing to fall back to.
+///
+/// `MISE_CONFIG_DIR`, `MISE_STATE_DIR` and `MISE_CACHE_DIR` are pinned under
+/// `pool` rather than left to mise's default (which falls back to the
+/// ambient `$HOME`, i.e. whatever user runs the daemon). A pool install must
+/// be fully determined by the layout alone — nothing in `hecaton-runtime`
+/// reads the process environment — and concurrent pool installs that shared
+/// a `$HOME`-derived cache/state dir were observed to race each other
+/// (spurious `mise where`/`mise install` failures under load). Only
+/// `pool.join("installs")` is ever exported to a child pool via
+/// `MISE_SHARED_INSTALL_DIRS`, so these extra subdirectories are harmless.
 pub fn level_env(config: &Path, pool: &Path, parents: &[PathBuf]) -> BTreeMap<String, String> {
     let mut env = BTreeMap::from([
         (
@@ -158,6 +168,18 @@ pub fn level_env(config: &Path, pool: &Path, parents: &[PathBuf]) -> BTreeMap<St
             config.display().to_string(),
         ),
         ("MISE_DATA_DIR".to_string(), pool.display().to_string()),
+        (
+            "MISE_CONFIG_DIR".to_string(),
+            pool.join("config").display().to_string(),
+        ),
+        (
+            "MISE_STATE_DIR".to_string(),
+            pool.join("state").display().to_string(),
+        ),
+        (
+            "MISE_CACHE_DIR".to_string(),
+            pool.join("cache").display().to_string(),
+        ),
         ("MISE_YES".to_string(), "1".to_string()),
         ("MISE_QUIET".to_string(), "1".to_string()),
         ("MISE_AUTO_INSTALL".to_string(), "false".to_string()),
@@ -380,6 +402,9 @@ mod tests {
         let env = level_env(&config, &pool, &parents);
         assert_eq!(env["MISE_GLOBAL_CONFIG_FILE"], "/p/crew/mise.toml");
         assert_eq!(env["MISE_DATA_DIR"], "/p/crew/mise");
+        assert_eq!(env["MISE_CONFIG_DIR"], "/p/crew/mise/config");
+        assert_eq!(env["MISE_STATE_DIR"], "/p/crew/mise/state");
+        assert_eq!(env["MISE_CACHE_DIR"], "/p/crew/mise/cache");
         assert_eq!(
             env["MISE_SHARED_INSTALL_DIRS"], "/p/fleet/mise/installs:/p/daemon/mise/installs",
             "parents are read-only; mise never writes into them"
@@ -390,13 +415,18 @@ mod tests {
             env.keys().collect::<Vec<_>>(),
             vec![
                 "MISE_AUTO_INSTALL",
+                "MISE_CACHE_DIR",
+                "MISE_CONFIG_DIR",
                 "MISE_DATA_DIR",
                 "MISE_GLOBAL_CONFIG_FILE",
                 "MISE_QUIET",
                 "MISE_SHARED_INSTALL_DIRS",
+                "MISE_STATE_DIR",
                 "MISE_YES",
             ],
-            "the exact key set level_env returns; no stray keys"
+            "the exact key set level_env returns; no stray keys — cache, state and\
+             config are pinned under the pool so a concurrent install never races\
+             another level over the ambient $HOME's mise cache"
         );
 
         let alone = level_env(&config, &pool, &[]);
