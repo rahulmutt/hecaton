@@ -126,12 +126,16 @@ impl Maps {
         self.set_thread(host, agent, thread).await
     }
 
-    /// Drops the agent entirely: `deactivate`.
+    /// Drops the agent entirely: `deactivate`. Deletes the store's row
+    /// first, matching every other mutator here: if the delete fails, the
+    /// in-memory maps still agree with what's on disk, and the caller can
+    /// retry rather than the agent silently coming back on the next `load`.
     pub async fn forget(&mut self, host: &Host, agent: &str) -> Result<(), SdkError> {
+        host.kv_delete(&thread_key(agent)).await?;
         if let Some(old) = self.threads.remove(agent) {
             self.routes.remove(&(old.room, old.root));
         }
-        host.kv_delete(&thread_key(agent)).await
+        Ok(())
     }
 
     pub fn route(&self, room: &str, root: &str) -> Option<&str> {
@@ -255,5 +259,35 @@ mod tests {
         assert!(maps.thread("f/c/a").is_none());
         assert_eq!(maps.route("!r:fake", "$root1"), None);
         assert!(!fake.kv().contains_key("thread/f/c/a"));
+    }
+
+    #[tokio::test]
+    async fn a_forget_whose_delete_fails_leaves_memory_agreeing_with_the_store() {
+        let (fake, host) = host().await;
+        let mut maps = Maps::new();
+        maps.set_thread(&host, "f/c/a", thread("s1", "$root1"))
+            .await
+            .unwrap();
+
+        // Same fake store, a token it rejects: the delete never reaches the
+        // row, the same way a real store's delete can fail.
+        let mut bad_env = fake.env("matrix", std::path::Path::new("scratch"));
+        bad_env.token = "wrong".into();
+        let bad_host = Host::new(bad_env).unwrap();
+
+        maps.forget(&bad_host, "f/c/a")
+            .await
+            .expect_err("the wrong token makes the store refuse the delete");
+        assert!(
+            maps.thread("f/c/a").is_some(),
+            "a failed delete leaves the agent in memory, agreeing with the still-present row"
+        );
+        assert!(fake.kv().contains_key("thread/f/c/a"));
+
+        let reloaded = Maps::load(&host).await.unwrap();
+        assert!(
+            reloaded.thread("f/c/a").is_some(),
+            "a later load from the same store agrees"
+        );
     }
 }
