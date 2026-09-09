@@ -226,6 +226,14 @@ pub trait Materializer: Send + Sync {
     fn purge_plugin(&self, name: &AgentName) -> Result<(), MaterializeError>;
 }
 
+/// Installs the daemon-level tool pool. Owned by one actor, never by the
+/// reconciler (Spec F, F-1). Implementations must be idempotent and cheap
+/// when nothing has changed: `Ok(())` means the pool matches the system
+/// table *and* exists on disk.
+pub trait SystemToolchain: Send + Sync {
+    fn ensure_system_pool(&self) -> Result<(), MaterializeError>;
+}
+
 /// Makes processes exist (or not) and reports what it sees.
 pub trait AgentRunner: Send + Sync {
     fn ensure_crew(&self, crew: &CrewRef) -> Result<(), RunnerError>;

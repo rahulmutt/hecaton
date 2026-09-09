@@ -22,8 +22,8 @@ pub use plugin::{
 };
 pub use ports::{
     AgentRunner, Clock, CrewTools, HookTarget, Keep, LaunchPlan, MaterializeError, Materializer,
-    ObservedState, ProcessState, PtyStream, RunnerError, WorkspaceError, WorkspaceReader,
-    first_line,
+    ObservedState, ProcessState, PtyStream, RunnerError, SystemToolchain, WorkspaceError,
+    WorkspaceReader, first_line,
 };
 pub use reconcile::{Plan, ReconcilePolicy, Step};
 pub use repo::{RepoError, RepoRef};
