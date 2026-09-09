@@ -7,14 +7,14 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hecaton_api::{HookEvent, OBSERVER_QUEUE};
+use hecaton_api::{HookEvent, OBSERVER_QUEUE, PluginAction};
 use hecaton_plugin_sdk::metrics::{IntCounter, IntCounterVec, IntGauge};
 use hecaton_plugin_sdk::{Host, Metrics, SdkError};
 use serde_json::Value;
 use tokio::sync::Notify;
 
 use crate::config::{AgentConfig, DaemonConfig};
-use crate::matrix::{Inbound, MatrixError, MatrixPort};
+use crate::matrix::{ACK, FAILED, Inbound, MatrixError, MatrixPort, REFUSED};
 use crate::render::{self, PhaseChange};
 use crate::routing::{Maps, Thread, crew_of};
 
@@ -402,8 +402,58 @@ impl<M: MatrixPort> Actor<M> {
         self.send(&room, root.as_deref(), &body, "phase").await;
     }
 
-    /// Task 10.
-    async fn on_inbound(&mut self, _message: Inbound) {}
+    /// A reply in a live thread of ours becomes a `send_text` (Spec G §9).
+    /// Every other shape is counted under its own outcome, and the ones a
+    /// person should see get a reaction.
+    async fn on_inbound(&mut self, message: Inbound) {
+        let count = |outcome: &str| self.counters.inbound.with_label_values(&[outcome]).inc();
+
+        if message.sender == self.port.user_id() {
+            count("own_message");
+            return;
+        }
+        let Some(root) = message.thread_root.clone() else {
+            count("not_a_thread");
+            self.react(&message, REFUSED).await;
+            return;
+        };
+        let Some(agent) = self.maps.route(&message.room, &root).map(str::to_string) else {
+            // A thread in a room we are in that is not one of ours. Silent
+            // on purpose: reacting to every unrelated thread would be noise.
+            count("unknown_thread");
+            return;
+        };
+        if self.maps.thread(&agent).is_some_and(|t| t.closed) {
+            count("stale_thread");
+            self.react(&message, REFUSED).await;
+            return;
+        }
+
+        let action = PluginAction::SendText {
+            text: message.body.clone(),
+            submit: true,
+        };
+        match self.host.action(&agent, &action).await {
+            Ok(()) => {
+                count("routed");
+                self.react(&message, ACK).await;
+            }
+            Err(e) => {
+                count("send_failed");
+                self.counters.errors.with_label_values(&["send_text"]).inc();
+                let body = format!("**not delivered to {agent}:** {e}");
+                self.send(&message.room, Some(&root), &body, "notice").await;
+                self.react(&message, FAILED).await;
+            }
+        }
+    }
+
+    async fn react(&self, message: &Inbound, key: &str) {
+        if let Err(e) = self.port.react(&message.room, &message.event_id, key).await {
+            self.counters.errors.with_label_values(&["react"]).inc();
+            tracing::warn!("matrix: reacting to {}: {e}", message.event_id);
+        }
+    }
 }
 
 /// One port call, retried once on a rate limit after the delay the
@@ -1024,5 +1074,152 @@ mod tests {
         assert!(fake.kv().contains_key("thread/f/c/alice"));
         a.handle(deactivate("f/c/alice")).await;
         assert!(!fake.kv().contains_key("thread/f/c/alice"));
+    }
+
+    use crate::matrix::{ACK, FAILED, REFUSED};
+    use hecaton_api::PluginAction;
+
+    fn inbound(room: &str, root: Option<&str>, sender: &str, body: &str) -> Inbound {
+        Inbound {
+            room: room.to_string(),
+            event_id: "$msg:fake".into(),
+            sender: sender.to_string(),
+            thread_root: root.map(str::to_string),
+            body: body.to_string(),
+        }
+    }
+
+    fn reactions(calls: &[Call]) -> Vec<String> {
+        calls
+            .iter()
+            .filter_map(|c| match c {
+                Call::React { key, .. } => Some(key.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// An actor with one live thread; returns the room and its root.
+    async fn with_thread() -> (FakeHost, FakePort, Actor<FakePort>, String, String) {
+        let (fake, port, mut a) = actor().await;
+        a.handle(Command::Configure(daemon_config())).await;
+        a.handle(Command::Activate {
+            agent: "f/c/alice".into(),
+            config: agent_config(&[]),
+        })
+        .await;
+        a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
+            .await;
+        let (room, root) = match port.calls().last() {
+            Some(Call::Send { room, .. }) => (room.clone(), "$evt2:fake".to_string()),
+            other => panic!("expected a root send, got {other:?}"),
+        };
+        port.take_calls();
+        (fake, port, a, room, root)
+    }
+
+    #[tokio::test]
+    async fn a_thread_reply_becomes_a_submitted_send_text_and_is_acknowledged() {
+        let (fake, port, mut a, room, root) = with_thread().await;
+        a.handle(Command::Inbound(inbound(
+            &room,
+            Some(&root),
+            "@rahul:example.org",
+            "run the tests",
+        )))
+        .await;
+        assert_eq!(
+            fake.actions_for("f/c/alice"),
+            vec![PluginAction::SendText {
+                text: "run the tests".into(),
+                submit: true,
+            }]
+        );
+        assert_eq!(reactions(&port.calls()), vec![ACK.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn our_own_message_is_ignored_without_a_reaction() {
+        let (fake, port, mut a, room, root) = with_thread().await;
+        a.handle(Command::Inbound(inbound(
+            &room,
+            Some(&root),
+            "@hecaton:example.org",
+            "a message we sent",
+        )))
+        .await;
+        assert!(fake.actions_for("f/c/alice").is_empty());
+        assert!(port.calls().is_empty(), "no reaction on our own message");
+    }
+
+    #[tokio::test]
+    async fn a_room_level_message_is_refused_and_an_unknown_thread_is_silent() {
+        let (fake, port, mut a, room, _root) = with_thread().await;
+        a.handle(Command::Inbound(inbound(
+            &room,
+            None,
+            "@rahul:example.org",
+            "hello room",
+        )))
+        .await;
+        assert!(fake.actions_for("f/c/alice").is_empty());
+        assert_eq!(reactions(&port.take_calls()), vec![REFUSED.to_string()]);
+
+        a.handle(Command::Inbound(inbound(
+            &room,
+            Some("$someone-elses-thread"),
+            "@rahul:example.org",
+            "not ours",
+        )))
+        .await;
+        assert!(
+            port.calls().is_empty(),
+            "a thread we do not own gets no reaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_in_a_closed_thread_is_refused() {
+        let (fake, port, mut a, room, root) = with_thread().await;
+        a.handle(Command::Events(vec![during(
+            "f/c/alice",
+            "s1",
+            "SessionEnd",
+            json!({ "reason": "clear" }),
+        )]))
+        .await;
+        port.take_calls();
+
+        a.handle(Command::Inbound(inbound(
+            &room,
+            Some(&root),
+            "@rahul:example.org",
+            "too late",
+        )))
+        .await;
+        assert!(
+            fake.actions_for("f/c/alice").is_empty(),
+            "nothing reaches the agent"
+        );
+        assert_eq!(reactions(&port.calls()), vec![REFUSED.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_send_text_is_reported_in_the_thread() {
+        let (fake, port, mut a, room, root) = with_thread().await;
+        fake.fail_actions(Some("no such window"));
+        a.handle(Command::Inbound(inbound(
+            &room,
+            Some(&root),
+            "@rahul:example.org",
+            "run the tests",
+        )))
+        .await;
+        let calls = port.calls();
+        assert_eq!(reactions(&calls), vec![FAILED.to_string()]);
+        let notice = sends(&calls);
+        assert_eq!(notice.len(), 1, "the failure is posted in the thread");
+        assert_eq!(notice[0].0, Some(root), "in the thread, not the room");
+        assert!(notice[0].1.contains("no such window"), "{}", notice[0].1);
     }
 }
