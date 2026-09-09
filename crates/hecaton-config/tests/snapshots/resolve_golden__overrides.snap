@@ -3,6 +3,9 @@ source: crates/hecaton-config/tests/resolve_golden.rs
 expression: spec
 ---
 name: overrides
+tools:
+  node: 22.11.0
+  python: 3.12.8
 crews:
   web:
     repo: "https://github.com/acme/web.git"

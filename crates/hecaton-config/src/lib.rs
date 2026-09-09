@@ -14,4 +14,4 @@ pub use hecaton_core::is_exact_version;
 pub use host::{HostDefaults, HostPaths};
 pub use merge::{merge, merge_layers, strip_nulls};
 pub use resolve::{ResolveOptions, resolve};
-pub use validate::{RESERVED_ENV_PREFIXES, validate_agent};
+pub use validate::{RESERVED_ENV_PREFIXES, tools_layer, validate_agent};

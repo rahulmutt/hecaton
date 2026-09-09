@@ -89,6 +89,49 @@ pub fn validate_agent(path: &str, settings: &AgentSettings) -> Result<(), Config
     Ok(())
 }
 
+/// The `tools` table of one settings layer, as the pool for that level
+/// wants it: absent or null is empty, a `null` value is the file's delete
+/// marker and is dropped, and every surviving version must be exact.
+/// `path` is the layer's config path, e.g. `defaults` or
+/// `crews.web.defaults`.
+pub fn tools_layer(
+    path: &str,
+    layer: &Value,
+) -> Result<std::collections::BTreeMap<String, String>, ConfigError> {
+    let invalid = |suffix: &str, message: String| ConfigError::Invalid {
+        path: format!("{path}.tools{suffix}"),
+        message,
+    };
+    let mut out = std::collections::BTreeMap::new();
+    let tools = match layer.get("tools") {
+        None | Some(Value::Null) => return Ok(out),
+        Some(Value::Object(t)) => t,
+        Some(_) => return Err(invalid("", "expected a mapping".to_string())),
+    };
+    for (tool, value) in tools {
+        let version = match value {
+            Value::Null => continue,
+            Value::String(s) => s,
+            _ => {
+                return Err(invalid(
+                    &format!(".{tool}"),
+                    "expected a version string".to_string(),
+                ));
+            }
+        };
+        if !is_exact_version(version) {
+            return Err(invalid(
+                &format!(".{tool}"),
+                format!(
+                    "expected an exact version, got {version:?} (try: mise latest {tool}@{version})"
+                ),
+            ));
+        }
+        out.insert(tool.clone(), version.clone());
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

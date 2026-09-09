@@ -3,6 +3,8 @@ source: crates/hecaton-config/tests/resolve_golden.rs
 expression: spec
 ---
 name: payments
+tools:
+  node: 22.11.0
 crews:
   backend:
     repo: acme/payments-api
@@ -10,6 +12,8 @@ crews:
     git:
       push: true
       auth: gh
+    tools:
+      python: 3.12.8
     agents:
       alice:
         claude:
