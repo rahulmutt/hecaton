@@ -174,8 +174,10 @@ impl Runtime {
         let daemon_pool = self.layout.mise_data_dir();
         let log = crew_paths.root.join("logs").join("mise.pools.log");
 
+        let crew_id = crew.to_string();
         let system = system_tools(&self.layout, &crew.fleet.to_string())?;
         tc.install_level(
+            &crew_id,
             "system",
             &self.layout.system_mise_toml_generated(),
             &daemon_pool,
@@ -185,6 +187,7 @@ impl Runtime {
             &log,
         )?;
         tc.install_level(
+            &crew_id,
             &format!("fleet {}", crew.fleet),
             &fleet.mise_toml,
             &fleet.mise_pool(),
@@ -194,6 +197,7 @@ impl Runtime {
             &log,
         )?;
         tc.install_level(
+            &crew_id,
             &format!("crew {crew}"),
             &crew_paths.mise_toml(),
             &crew_paths.mise_pool(),

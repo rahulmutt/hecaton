@@ -290,6 +290,7 @@ impl Toolchain<'_> {
     #[allow(clippy::too_many_arguments)]
     pub fn install_level(
         &self,
+        crew: &str,
         label: &str,
         toml_path: &Path,
         pool: &Path,
@@ -303,20 +304,16 @@ impl Toolchain<'_> {
         if std::fs::read_to_string(marker).ok().as_deref() == Some(digest.as_str()) {
             return Ok(());
         }
+        let id = format!("{crew}: {label}");
         let io = |path: &Path, e: std::io::Error| MaterializeError::Io {
-            id: label.to_string(),
+            id: id.clone(),
             path: path.to_path_buf(),
             message: e.to_string(),
         };
         write_atomic(toml_path, text.as_bytes(), 0o644).map_err(|e| io(toml_path, e))?;
         let env = level_env(toml_path, pool, parents);
-        self.run_mise(
-            label,
-            &env,
-            log,
-            &["trust", &toml_path.display().to_string()],
-        )?;
-        self.run_mise(label, &env, log, &["install"])?;
+        self.run_mise(&id, &env, log, &["trust", &toml_path.display().to_string()])?;
+        self.run_mise(&id, &env, log, &["install"])?;
         write_atomic(marker, digest.as_bytes(), 0o644).map_err(|e| io(marker, e))
     }
 }

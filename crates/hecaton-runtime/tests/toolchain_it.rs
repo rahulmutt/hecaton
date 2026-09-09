@@ -163,7 +163,9 @@ fn each_level_installs_into_its_own_pool_and_the_agent_resolves_them_all() {
         ("gitleaks".to_string(), gitleaks.clone()),
     ]);
 
+    let crew_id = crew_ref.to_string();
     tc.install_level(
+        &crew_id,
         "fleet f",
         &fleet_paths.mise_toml,
         &fleet_paths.mise_pool(),
@@ -174,6 +176,7 @@ fn each_level_installs_into_its_own_pool_and_the_agent_resolves_them_all() {
     )
     .unwrap();
     tc.install_level(
+        &crew_id,
         "crew f/c",
         &crew_paths.mise_toml(),
         &crew_paths.mise_pool(),
@@ -246,6 +249,7 @@ fn each_level_installs_into_its_own_pool_and_the_agent_resolves_them_all() {
     // The markers make a second pass a no-op.
     let before = std::fs::read_to_string(fleet_paths.installed_marker()).unwrap();
     tc.install_level(
+        &crew_id,
         "fleet f",
         &fleet_paths.mise_toml,
         &fleet_paths.mise_pool(),
@@ -326,6 +330,7 @@ fn a_crew_pins_its_own_version_without_disturbing_the_fleets() {
     };
     let log = crew_paths.root.join("logs").join("mise.pools.log");
     tc.install_level(
+        &id.crew_ref().to_string(),
         "crew f/c",
         &crew_paths.mise_toml(),
         &crew_paths.mise_pool(),
