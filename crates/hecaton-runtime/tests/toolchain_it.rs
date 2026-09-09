@@ -345,21 +345,67 @@ fn a_crew_pins_its_own_version_without_disturbing_the_fleets() {
             .exists(),
         "the fleet's version survives a crew that pins another"
     );
+    // Exact contents, not just "the other version is present": the fleet's
+    // version was never seeded into the crew pool and TOML cannot hold two
+    // values for one key, so a negative existence check here can't fail
+    // regardless of the pool-chain logic. Assert the crew pool's `gitleaks`
+    // directory holds exactly one version, and it is the crew's.
+    // mise also drops alias symlinks alongside the real version directory
+    // (`latest`, the major `8`, the minor `8.30`, all pointing at the exact
+    // version); only real directories count as an installed version here.
+    let mut crew_gitleaks_versions: Vec<String> =
+        std::fs::read_dir(crew_paths.mise_pool().join("installs").join("gitleaks"))
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| e.file_type().unwrap().is_dir())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+    crew_gitleaks_versions.sort();
+    assert_eq!(
+        crew_gitleaks_versions,
+        vec![other.clone()],
+        "the crew pool holds only what the crew declared"
+    );
+
+    // Spec E §7: "the agent resolves the crew's" version. The agent's own
+    // table pins `gitleaks` at the crew's version; only the crew pool holds
+    // that exact version, so this proves the agent's pool chain actually
+    // reaches the crew pool, not just that `install_level` placed files
+    // correctly.
+    let paths = layout.agent(&id);
+    std::fs::create_dir_all(&paths.root).unwrap();
+    let agent_tools = BTreeMap::from([("gitleaks".to_string(), other.clone())]);
+    tc.write(&id, &paths, &BTreeMap::new(), &agent_tools, false)
+        .unwrap();
+    tc.install(&id, &paths).unwrap();
+
     assert!(
-        crew_paths
-            .mise_pool()
-            .join("installs")
-            .join("gitleaks")
-            .join(&other)
-            .exists()
+        !paths.mise_data_dir().join("installs").exists()
+            || std::fs::read_dir(paths.mise_data_dir().join("installs"))
+                .unwrap()
+                .next()
+                .is_none(),
+        "the crew pool already held the pinned version, so nothing landed privately"
+    );
+
+    let out = Command::new(&tools.mise)
+        .args(["which", "gitleaks"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &paths.home)
+        .envs(&mise_env(&id, &paths, &layout))
+        .current_dir("/")
+        .output()
+        .unwrap();
+    let resolved = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(
+        out.status.success(),
+        "mise which gitleaks: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        !crew_paths
-            .mise_pool()
-            .join("installs")
-            .join("gitleaks")
-            .join(&gitleaks)
-            .exists(),
-        "the crew pool holds only what the crew declared"
+        resolved.starts_with(&crew_paths.mise_pool().display().to_string()),
+        "gitleaks resolved to {resolved}, expected the crew's pin under {}",
+        crew_paths.mise_pool().display()
     );
 }
