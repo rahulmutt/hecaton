@@ -190,6 +190,31 @@ mod tests {
     }
 
     #[test]
+    fn truncate_does_not_panic_when_the_limit_lands_inside_a_multi_byte_character() {
+        // "é" is 2 bytes; one leading ASCII byte shifts every following
+        // character's start to an odd offset, so BODY_LIMIT (a round 4000)
+        // lands on the second byte of the 2000th "é" rather than between
+        // two characters.
+        let long = format!("x{}", "é".repeat(2000));
+        assert_eq!(long.len(), 4001);
+        assert!(
+            !long.is_char_boundary(BODY_LIMIT),
+            "limit must split a character for this test to mean anything"
+        );
+
+        let cut = truncate(&long);
+
+        assert!(cut.len() <= BODY_LIMIT + 32, "len {}", cut.len());
+        assert!(cut.ends_with("truncated"), "{}", &cut[cut.len() - 40..]);
+        let body = cut.trim_end_matches("\n\n… truncated");
+        assert!(
+            std::str::from_utf8(body.as_bytes()).is_ok(),
+            "cut on a real character boundary"
+        );
+        assert!(body.chars().next_back().is_some());
+    }
+
+    #[test]
     fn a_short_session_is_the_first_eight_characters() {
         assert_eq!(short_session("0199aa11-2233-4455"), "0199aa11");
         assert_eq!(short_session("abc"), "abc");
