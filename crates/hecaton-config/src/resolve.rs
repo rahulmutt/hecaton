@@ -338,6 +338,19 @@ crews:
     }
 
     #[test]
+    fn a_non_string_tool_value_in_a_defaults_layer_is_rejected() {
+        let f = file(
+            "apiVersion: hecaton/v1\nkind: Fleet\nname: f\n\
+             defaults:\n  tools: { node: 22 }\ncrews:\n  c:\n    repo: o/r\n",
+        );
+        let e = resolve(&f, &ResolveOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("defaults.tools.node:"), "got {e}");
+        assert!(e.contains("expected a version string"), "got {e}");
+    }
+
+    #[test]
     fn validation_and_name_errors_propagate_with_paths() {
         let yaml = "apiVersion: hecaton/v1\nkind: Fleet\nname: f\ncrews:\n  c:\n    repo: o/r\n    agents:\n      a: { tools: { node: \"22\" } }\n";
         assert!(

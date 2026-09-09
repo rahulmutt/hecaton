@@ -23,6 +23,13 @@ pub const RESERVED_ENV_PREFIXES: &[&str] = &[
     "CLAUDE_CODE_TMPDIR",
 ];
 
+/// The message for a tool version `is_exact_version` refuses; shared by
+/// `validate_agent` and `tools_layer` so the two stay identical by
+/// construction rather than by two hand-kept copies.
+fn exact_version_message(tool: &str, version: &str) -> String {
+    format!("expected an exact version, got {version:?} (try: mise latest {tool}@{version})")
+}
+
 /// Validates one resolved settings block; `path` prefixes every message.
 pub fn validate_agent(path: &str, settings: &AgentSettings) -> Result<(), ConfigError> {
     let invalid = |suffix: &str, message: String| ConfigError::Invalid {
@@ -34,9 +41,7 @@ pub fn validate_agent(path: &str, settings: &AgentSettings) -> Result<(), Config
         if !is_exact_version(version) {
             return Err(invalid(
                 &format!("tools.{tool}"),
-                format!(
-                    "expected an exact version, got {version:?} (try: mise latest {tool}@{version})"
-                ),
+                exact_version_message(tool, version),
             ));
         }
     }
@@ -122,9 +127,7 @@ pub fn tools_layer(
         if !is_exact_version(version) {
             return Err(invalid(
                 &format!(".{tool}"),
-                format!(
-                    "expected an exact version, got {version:?} (try: mise latest {tool}@{version})"
-                ),
+                exact_version_message(tool, version),
             ));
         }
         out.insert(tool.clone(), version.clone());
