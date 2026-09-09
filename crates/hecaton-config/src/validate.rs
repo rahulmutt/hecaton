@@ -231,6 +231,17 @@ mod tests {
     }
 
     #[test]
+    fn tools_layer_treats_a_whole_table_null_as_empty() {
+        // A crew layer that removes every fleet tool by writing `tools:
+        // null` outright, rather than nulling each key individually: the
+        // one arm no other test reaches.
+        assert_eq!(
+            tools_layer("crews.web.defaults", &json!({"tools": null})).unwrap(),
+            BTreeMap::new()
+        );
+    }
+
+    #[test]
     fn reserved_env_keys_are_rejected() {
         for key in [
             "HOME",
