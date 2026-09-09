@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
         with: { version: 2026.9.2, install: false, cache: true }
-      - run: mise install rust cargo:cargo-nextest cargo-insta tmux nono gh
+      - run: mise install rust cargo:cargo-nextest cargo-insta tmux nono gh gitleaks
       - run: mise run check
   mutants:
     if: github.event_name == 'schedule'
