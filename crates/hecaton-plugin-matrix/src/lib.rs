@@ -6,3 +6,4 @@ pub mod config;
 pub mod matrix;
 pub mod render;
 pub mod routing;
+pub mod session;

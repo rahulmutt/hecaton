@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use hecaton_api::HOOK_EVENTS;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// The curated default event set (Spec G §4.2).
@@ -16,7 +16,7 @@ pub const DEFAULT_EVENTS: [&str; 4] = ["SessionStart", "Notification", "Stop", "
 pub const LIFECYCLE: [&str; 2] = ["SessionStart", "SessionEnd"];
 
 /// A credential. Hand-written `Debug` printing `<redacted>`, per AGENTS.md.
-#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Secret(String);
 
