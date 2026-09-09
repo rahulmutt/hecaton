@@ -432,9 +432,10 @@ mod tests {
     fn a_timeout_kills_a_hung_child_and_reports_it() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("logs").join("sleep.log");
+        let pidfile = dir.path().join("pid");
         let start = std::time::Instant::now();
         let err = Cmd::new(Path::new("/bin/sh"))
-            .args(["-c", "sleep 30"])
+            .args(["-c", &format!("echo $$ > {}; sleep 30", pidfile.display())])
             .log(&log)
             .timeout(std::time::Duration::from_millis(300))
             .run()
@@ -448,6 +449,35 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(5),
             "the timeout must not wait out the child"
         );
+
+        // The assertions above only check what `Cmd` *reports*; they still
+        // pass if `child.kill()` is deleted. Prove the child process itself
+        // is actually dead, not just that we stopped waiting on it
+        // (commit 87f7309 fixed exactly this gap). Linux-only (`/proc`) is
+        // fine: this crate is already Landlock-bound.
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap_or_else(|e| panic!("child never wrote its pid to {pidfile:?}: {e}"))
+            .trim()
+            .parse()
+            .expect("pidfile did not contain a pid");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            // A killed child that `Cmd` has also `wait()`-ed on (which it
+            // does right after `kill()`) is fully reaped: no `/proc` entry
+            // at all, not even a zombie. Checking for the directory's
+            // absence — rather than, say, just not erroring on a read — is
+            // what actually distinguishes "killed and reaped" from "still
+            // running" or "zombie, not yet reaped".
+            if !Path::new(&format!("/proc/{pid}")).exists() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "pid {pid} is still present under /proc 5s after the timeout should have killed it"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     #[test]
