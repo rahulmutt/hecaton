@@ -174,6 +174,33 @@ pub struct Toolchain<'a> {
 }
 
 impl Toolchain<'_> {
+    /// `mise <args>` against `env`, unsandboxed, with `cwd=/` so no project
+    /// `mise.toml` on the way up is discovered — only the caller's own
+    /// global file counts. Shared by `install` and `install_level`, which
+    /// differ only in which `id`/`label`, `env` and `log` they supply.
+    fn run_mise(
+        &self,
+        id: &str,
+        env: &BTreeMap<String, String>,
+        log: &Path,
+        args: &[&str],
+    ) -> Result<(), MaterializeError> {
+        Cmd::new(&self.tools.mise)
+            .args(args.iter().copied())
+            .envs(env)
+            .cwd(Path::new("/"))
+            .log(log)
+            .run()
+            .map(|_| ())
+            .map_err(|f| MaterializeError::Tool {
+                id: id.to_string(),
+                tool: f.tool,
+                subcommand: f.subcommand,
+                args: f.args,
+                stderr: f.stderr,
+            })
+    }
+
     /// Writes `mise.toml`; returns whether its content changed.
     pub fn write(
         &self,
@@ -204,24 +231,14 @@ impl Toolchain<'_> {
     pub fn install(&self, id: &AgentId, paths: &AgentPaths) -> Result<(), MaterializeError> {
         let env = mise_env(paths, self.layout);
         let log = paths.logs.join("mise.toolchain.log");
-        let run = |args: &[&str]| {
-            Cmd::new(&self.tools.mise)
-                .args(args.iter().copied())
-                .envs(&env)
-                .cwd(Path::new("/"))
-                .log(&log)
-                .run()
-                .map(|_| ())
-                .map_err(|f| MaterializeError::Tool {
-                    id: id.to_string(),
-                    tool: f.tool,
-                    subcommand: f.subcommand,
-                    args: f.args,
-                    stderr: f.stderr,
-                })
-        };
-        run(&["trust", &paths.mise_toml.display().to_string()])?;
-        run(&["install"])
+        let id = id.to_string();
+        self.run_mise(
+            &id,
+            &env,
+            &log,
+            &["trust", &paths.mise_toml.display().to_string()],
+        )?;
+        self.run_mise(&id, &env, &log, &["install"])
     }
 
     /// Installs one level's tools into its own pool. Writes `toml_path`,
@@ -253,24 +270,13 @@ impl Toolchain<'_> {
             return Ok(());
         }
         let env = level_env(toml_path, pool, parents);
-        let run = |args: &[&str]| {
-            Cmd::new(&self.tools.mise)
-                .args(args.iter().copied())
-                .envs(&env)
-                .cwd(Path::new("/"))
-                .log(log)
-                .run()
-                .map(|_| ())
-                .map_err(|f| MaterializeError::Tool {
-                    id: label.to_string(),
-                    tool: f.tool,
-                    subcommand: f.subcommand,
-                    args: f.args,
-                    stderr: f.stderr,
-                })
-        };
-        run(&["trust", &toml_path.display().to_string()])?;
-        run(&["install"])?;
+        self.run_mise(
+            label,
+            &env,
+            log,
+            &["trust", &toml_path.display().to_string()],
+        )?;
+        self.run_mise(label, &env, log, &["install"])?;
         write_atomic(marker, digest.as_bytes(), 0o644).map_err(|e| io(marker, e))
     }
 }
