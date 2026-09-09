@@ -58,7 +58,21 @@ phases; the rest exist in code today.
   installs run `mise install` with the daemon pool as their `MISE_DATA_DIR`
   and stay outside the `SystemPool` actor (Spec F, F-8). They do not share a
   config path, so only the install contention applies, not the temp-file
-  collision Spec F removed. The loser retries.
+  collision Spec F removed. The loser retries. A timed-out system install
+  only sends `Child::kill()`'s `SIGKILL` to `mise` itself, not its process
+  group — a process-group kill needs `killpg` (`unsafe`, forbidden by this
+  workspace) or shelling out to `kill` off the ambient `PATH` (rejected
+  earlier in this plan) — so a grandchild `mise install` spawned (download,
+  extract, build helpers) is orphaned and keeps running past the kill, still
+  holding the inherited pipe write-ends and potentially still writing into
+  the daemon pool when the next attempt starts its own `mise install` there
+  30 seconds later: briefly two writers in the pool again, the exact
+  condition this spec exists to remove. The same timeout also leaks the pair
+  of threads draining the killed child's stdout/stderr pipes and their
+  buffers — `Cmd` returns as soon as `child.wait()` reaps the process,
+  without joining them, which is what keeps a wedged child from hanging the
+  caller — but at the fixed 600s per-call timeout (`SYSTEM_POOL_INSTALL_TIMEOUT`)
+  that is at most one leaked pair per ten minutes: a slow leak, not a wedge.
 - **A malicious package is trusted at install time** — `mise trust` + `mise install` run outside the sandbox as the daemon user (`crates/hecaton-runtime/src/plugin.rs::install_plugin_tools`), and the manifest's `sandbox` block may widen the plugin's own grants; the sandbox defends against a plugin compromised at runtime, not against installing a hostile package. Packages are operator-declared and digest-pinned.
 - **Interceptors fail open**: a dead, slow or misbehaving `flow` plugin stops blocking — hook events are allowed and counted, never held. A plugin with `actions` can stop, restart or type into any agent it is active for; with `fleets` it sees every user fleet's resolved spec (never credentials or hook secrets).
 - **A plugin with `attach` has a keyboard into every agent it is active for**, and **anyone holding a browser session can type into every agent web lists** — both are the operator's own choices (`needs` in the manifest, `plugin open` on their own machine); the session dies with the daemon and the cookie never leaves the mount.
