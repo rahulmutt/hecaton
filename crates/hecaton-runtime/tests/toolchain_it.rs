@@ -65,7 +65,9 @@ fn installs_nothing_when_seeded_and_exec_resolves_read_only() {
         .unwrap();
     tc.install(&id, &paths).unwrap();
 
-    // read-only shared dir: does `mise exec` still resolve? (spec §4.4 row 2)
+    // the pool chain: does `mise exec` still resolve `gh` from the read-only
+    // daemon pool via `MISE_SHARED_INSTALL_DIRS`, with the agent's own data
+    // dir empty? (spec §4.4 row 2, Spec E §6)
     let ro = |on: bool| {
         let mode = if on { "a-w" } else { "u+w" };
         assert!(
@@ -82,7 +84,7 @@ fn installs_nothing_when_seeded_and_exec_resolves_read_only() {
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", &paths.home)
-        .envs(&mise_env(&paths, &layout))
+        .envs(&mise_env(&id, &paths, &layout))
         .current_dir("/")
         .output()
         .unwrap();

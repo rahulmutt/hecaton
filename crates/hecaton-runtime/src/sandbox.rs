@@ -21,6 +21,7 @@ pub struct Grants {
 }
 
 pub fn hecaton_grants(
+    id: &AgentId,
     paths: &AgentPaths,
     crew: &CrewPaths,
     layout: &StateLayout,
@@ -28,7 +29,10 @@ pub fn hecaton_grants(
     mise: &Path,
 ) -> Grants {
     let mut read: Vec<PathBuf> = SYSTEM_READ.iter().map(PathBuf::from).collect();
-    read.push(layout.mise_data_dir());
+    // Every pool the agent resolves through: crew, fleet, daemon. All
+    // read-only — an agent installs into its own `home/` and can never
+    // change a binary a crew-mate executes (Spec E, E-2).
+    read.extend(layout.agent_pools(id));
     // `MISE_GLOBAL_CONFIG_FILE` points at the agent's generated `mise.toml`,
     // which sits in the agent root — outside every `allow` below. Without
     // this single-file grant the sandboxed `mise exec` cannot read its own
@@ -284,6 +288,7 @@ mod tests {
         let paths = layout.agent(&id);
         let crew = layout.crew(&id.crew_ref());
         let grants = hecaton_grants(
+            &id,
             &paths,
             &crew,
             &layout,
@@ -303,17 +308,28 @@ mod tests {
         let p = render_profile(&id, &grants, 7643, &env, &json!({})).unwrap();
         assert_eq!(p["meta"]["name"], "hecaton-f-c-a");
         assert_eq!(p["filesystem"]["read"][0], "/usr");
-        assert_eq!(p["filesystem"]["read"][5], "/h/.local/share/hecaton/mise");
         assert_eq!(
-            p["filesystem"]["read"][6],
+            p["filesystem"]["read"][5], "/h/.local/state/hecaton/fleets/f/crews/c/mise",
+            "crew pool"
+        );
+        assert_eq!(
+            p["filesystem"]["read"][6], "/h/.local/state/hecaton/fleets/f/mise",
+            "fleet pool"
+        );
+        assert_eq!(
+            p["filesystem"]["read"][7], "/h/.local/share/hecaton/mise",
+            "daemon pool"
+        );
+        assert_eq!(
+            p["filesystem"]["read"][8],
             "/h/.local/state/hecaton/fleets/f/crews/c/agents/a/mise.toml"
         );
-        assert_eq!(p["filesystem"]["read"][7], "/opt/hecaton");
+        assert_eq!(p["filesystem"]["read"][9], "/opt/hecaton");
         assert_eq!(
-            p["filesystem"]["read"][8], "/opt/mise",
+            p["filesystem"]["read"][10], "/opt/mise",
             "mise may live outside /usr (CI installs it under $HOME)"
         );
-        assert_eq!(p["filesystem"]["read"].as_array().unwrap().len(), 9);
+        assert_eq!(p["filesystem"]["read"].as_array().unwrap().len(), 11);
         assert_eq!(
             p["filesystem"]["allow"][2],
             "/h/.local/state/hecaton/fleets/f/crews/c/repo/.git"
@@ -436,6 +452,36 @@ mod tests {
             e.to_string(),
             "f/c/a: sandbox.filesystem.read: expected an array"
         );
+    }
+
+    #[test]
+    fn every_pool_the_agent_resolves_through_is_readable() {
+        let layout = StateLayout::from_env(Path::new("/h"), |_| None);
+        let id: AgentId = "payments/backend/alice".parse().unwrap();
+        let paths = layout.agent(&id);
+        let crew = layout.crew(&id.crew_ref());
+        let g = hecaton_grants(
+            &id,
+            &paths,
+            &crew,
+            &layout,
+            Path::new("/tools/hecaton"),
+            Path::new("/tools/mise"),
+        );
+        for pool in layout.agent_pools(&id) {
+            assert!(
+                g.read.contains(&pool),
+                "{} must be readable inside the sandbox",
+                pool.display()
+            );
+        }
+        for pool in layout.agent_pools(&id) {
+            assert!(
+                !g.allow.contains(&pool),
+                "{} must never be writable",
+                pool.display()
+            );
+        }
     }
 
     #[test]

@@ -37,17 +37,23 @@ pub fn agent_env(
         // applied even though `mise trust` never covered it (mise 2026.9.1
         // honours `[tools]` from an untrusted config), which pulls in tools
         // the daemon never installed and the sandbox cannot download; an
-        // ancestor file that the profile does not grant is worse still —
-        // mise exits on the read error. A ceiling at the workspace stops the
-        // walk before either, leaving only the generated global file. This
-        // ceiling only stops the upward walk: a `mise.toml` in a
-        // subdirectory of the workspace is still discovered if the agent
-        // `cd`s there, same as it would be for any other mise invocation —
-        // and the sandbox has no network for installs either way, so a
-        // subdirectory config naming an uninstalled tool fails the same way
-        // the repository's own file would.
-        ("MISE_CEILING_PATHS".to_string(), s(&paths.workspace)),
-        ("MISE_DATA_DIR".to_string(), s(&layout.mise_data_dir())),
+        // Stops mise's upward config walk at the agent root, one level
+        // above the worktree. The worktree's own `mise.toml` is therefore
+        // discovered — an agent may `mise install` what its repository
+        // declares, into the private data dir below — while nothing outside
+        // the agent is: a config the profile does not grant would make mise
+        // exit on the read error. Installing is never a side effect of
+        // launch; `MISE_AUTO_INSTALL=false` keeps `mise exec claude`
+        // resolving even when the worktree names a tool nobody installed.
+        ("MISE_CEILING_PATHS".to_string(), s(&paths.root)),
+        ("MISE_AUTO_INSTALL".to_string(), "false".to_string()),
+        // The agent's own installs, writable, inside `home/`; the pools are
+        // read-only fallbacks searched crew-first (Spec E §6).
+        ("MISE_DATA_DIR".to_string(), s(&paths.mise_data_dir())),
+        (
+            "MISE_SHARED_INSTALL_DIRS".to_string(),
+            layout.shared_install_dirs(id),
+        ),
         ("MISE_CONFIG_DIR".to_string(), s(&paths.mise_config_dir())),
         ("MISE_STATE_DIR".to_string(), s(&paths.mise_state_dir())),
         ("MISE_CACHE_DIR".to_string(), s(&paths.mise_cache_dir())),
@@ -96,12 +102,32 @@ mod tests {
         );
         assert_eq!(env["RUST_LOG"], "info");
         assert_eq!(env["HECATON_AGENT_ID"], "payments/backend/alice");
-        assert_eq!(env["MISE_DATA_DIR"], "/h/.local/share/hecaton/mise");
         assert_eq!(env["HECATON_HOOK_SECRET"], "hook-s3");
+        let base = "/h/.local/state/hecaton/fleets/payments/crews/backend";
+        assert_eq!(
+            env["MISE_DATA_DIR"],
+            format!("{base}/agents/alice/home/.local/share/mise"),
+            "the agent installs into its own home, never a shared pool"
+        );
+        assert_eq!(
+            env["MISE_SHARED_INSTALL_DIRS"],
+            format!(
+                "{base}/mise/installs:/h/.local/state/hecaton/fleets/payments/mise/installs:\
+                 /h/.local/share/hecaton/mise/installs"
+            ),
+            "crew, then fleet, then daemon"
+        );
         assert_eq!(
             env["MISE_CEILING_PATHS"],
-            "/h/.local/state/hecaton/fleets/payments/crews/backend/agents/alice/workspace"
+            format!("{base}/agents/alice"),
+            "the walk stops above the worktree, so the repo's own mise.toml \
+             is discovered and nothing outside the agent is"
         );
+        assert_eq!(
+            env["MISE_AUTO_INSTALL"], "false",
+            "launch resolves; installing is the agent's explicit act"
+        );
+        assert_eq!(env.len(), 24);
         assert!(!env.contains_key("PATH"), "PATH is nono's");
         assert_eq!(
             env["TMPDIR"],
@@ -111,6 +137,5 @@ mod tests {
             env["CLAUDE_CODE_TMPDIR"], env["TMPDIR"],
             "claude checks its own variable before TMPDIR"
         );
-        assert_eq!(env.len(), 22);
     }
 }

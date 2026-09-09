@@ -89,6 +89,7 @@ impl Runtime {
         let profile = render_profile(
             id,
             &hecaton_grants(
+                id,
                 &paths,
                 &crew,
                 &self.layout,

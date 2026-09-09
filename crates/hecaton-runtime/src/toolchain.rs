@@ -129,14 +129,25 @@ fn toml_key(k: &str) -> String {
     }
 }
 
-pub fn mise_env(paths: &AgentPaths, layout: &StateLayout) -> BTreeMap<String, String> {
+/// The daemon-side environment for an agent's own `mise install`: the same
+/// private data dir and pool chain the sandbox will use, so what the daemon
+/// installs is exactly what the agent resolves.
+pub fn mise_env(
+    id: &AgentId,
+    paths: &AgentPaths,
+    layout: &StateLayout,
+) -> BTreeMap<String, String> {
     let s = |p: std::path::PathBuf| p.display().to_string();
     BTreeMap::from([
         (
             "MISE_GLOBAL_CONFIG_FILE".to_string(),
             s(paths.mise_toml.clone()),
         ),
-        ("MISE_DATA_DIR".to_string(), s(layout.mise_data_dir())),
+        ("MISE_DATA_DIR".to_string(), s(paths.mise_data_dir())),
+        (
+            "MISE_SHARED_INSTALL_DIRS".to_string(),
+            layout.shared_install_dirs(id),
+        ),
         ("MISE_CONFIG_DIR".to_string(), s(paths.mise_config_dir())),
         ("MISE_STATE_DIR".to_string(), s(paths.mise_state_dir())),
         ("MISE_CACHE_DIR".to_string(), s(paths.mise_cache_dir())),
@@ -251,7 +262,7 @@ impl Toolchain<'_> {
     /// hecaton itself sits in, during tests) is discovered: only the agent's
     /// global file counts.
     pub fn install(&self, id: &AgentId, paths: &AgentPaths) -> Result<(), MaterializeError> {
-        let env = mise_env(paths, self.layout);
+        let env = mise_env(id, paths, self.layout);
         let log = paths.logs.join("mise.toolchain.log");
         let id = id.to_string();
         self.run_mise(
