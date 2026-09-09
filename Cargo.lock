@@ -771,6 +771,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "hecaton-plugin-matrix"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hecaton-api",
+ "hecaton-plugin-sdk",
+ "insta",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "hecaton-plugin-sdk"
 version = "0.1.0"
 dependencies = [
