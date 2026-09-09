@@ -532,6 +532,26 @@ mod tests {
         (fake, port, a)
     }
 
+    /// The event id `FakePort` returned for the root send recorded at
+    /// `index`: it mints `$evt<n>:fake` on its nth successful call, so the
+    /// id is knowable from the call sequence alone. Asserting a child
+    /// against *this* is the point — a child threaded under the session id,
+    /// the room id or any other non-empty string satisfies `is_some()` but
+    /// lands nowhere a Matrix client would show it.
+    fn minted_root(calls: &[Call], index: usize) -> String {
+        assert!(
+            matches!(
+                calls.get(index),
+                Some(Call::Send {
+                    thread_root: None,
+                    ..
+                })
+            ),
+            "call {index} is not a thread root: {calls:?}"
+        );
+        format!("$evt{}:fake", index + 1)
+    }
+
     fn sends(calls: &[Call]) -> Vec<(Option<String>, String)> {
         calls
             .iter()
@@ -612,11 +632,18 @@ mod tests {
         ]))
         .await;
 
-        let s = sends(&port.calls());
+        let calls = port.calls();
+        // Call 0 is the room creation, so the root is call 1.
+        let root = minted_root(&calls, 1);
+        let s = sends(&calls);
         assert_eq!(s.len(), 2);
         assert_eq!(s[0].0, None, "root first");
         assert!(s[0].1.contains("session"), "{}", s[0].1);
-        assert!(s[1].0.is_some(), "the child is a thread reply");
+        assert_eq!(
+            s[1].0,
+            Some(root),
+            "the child hangs off the id the root send returned"
+        );
         assert!(s[1].1.contains("needs permission"), "{}", s[1].1);
     }
 
@@ -631,13 +658,18 @@ mod tests {
         .await;
         a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
             .await;
-        port.take_calls();
+        // Call 0 is the room creation, so the root is call 1.
+        let root = minted_root(&port.take_calls(), 1);
 
         a.handle(Command::Events(vec![started("f/c/alice", "s1", "compact")]))
             .await;
         let s = sends(&port.take_calls());
         assert_eq!(s.len(), 1);
-        assert!(s[0].0.is_some(), "a compaction posts inside the thread");
+        assert_eq!(
+            s[0].0,
+            Some(root),
+            "a compaction posts inside the very thread the root opened"
+        );
         assert!(s[0].1.contains("restarted"), "{}", s[0].1);
 
         a.handle(Command::Events(vec![started("f/c/alice", "s2", "clear")]))
@@ -750,6 +782,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_root_send_posts_nothing_and_stores_no_thread() {
+        let (fake, port, mut a) = actor().await;
+        let mut cfg = daemon_config();
+        // Pinning the room means the call that fails below is the thread
+        // root's send and not the room creation.
+        cfg.rooms.insert("f/c".into(), "!pinned:example.org".into());
+        a.handle(Command::Configure(cfg)).await;
+        a.handle(Command::Activate {
+            agent: "f/c/alice".into(),
+            config: agent_config(&["Notification"]),
+        })
+        .await;
+
+        port.fail_next(crate::matrix::MatrixError::Other("no rights".into()));
+        a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
+            .await;
+
+        assert!(sends(&port.calls()).is_empty(), "{:?}", port.calls());
+        assert!(
+            !fake.kv().contains_key("thread/f/c/alice"),
+            "a thread whose root never landed is not a thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_child_in_the_same_batch_as_a_failed_root_is_never_posted_rootless() {
+        let (fake, port, mut a) = actor().await;
+        let mut cfg = daemon_config();
+        cfg.rooms.insert("f/c".into(), "!pinned:example.org".into());
+        a.handle(Command::Configure(cfg)).await;
+        a.handle(Command::Activate {
+            agent: "f/c/alice".into(),
+            config: agent_config(&["Notification"]),
+        })
+        .await;
+
+        port.fail_next(crate::matrix::MatrixError::Other("no rights".into()));
+        a.handle(Command::Events(vec![
+            started("f/c/alice", "s1", "startup"),
+            during(
+                "f/c/alice",
+                "s1",
+                "Notification",
+                json!({ "message": "needs permission" }),
+            ),
+        ]))
+        .await;
+
+        // The `SessionStart`'s root never landed and nothing was stored for
+        // it, so the notification had to open a root of its own before it
+        // could post: had the actor kept a thread despite the failed send,
+        // the first thing recorded here would be a child under a root that
+        // does not exist in the room.
+        let calls = port.calls();
+        let root = minted_root(&calls, 0);
+        let s = sends(&calls);
+        assert_eq!(s.len(), 2, "a root, then the notification: {calls:?}");
+        assert_eq!(s[1].0, Some(root.clone()), "under the root that landed");
+        assert!(s[1].1.contains("needs permission"), "{}", s[1].1);
+        assert_eq!(
+            fake.kv_json("thread/f/c/alice").unwrap()["root"],
+            json!(root),
+            "and the stored root is the one that landed, not the one that failed"
+        );
+    }
+
+    #[tokio::test]
     async fn a_rate_limited_send_is_retried_once() {
         let (_fake, port, mut a) = actor().await;
         a.handle(Command::Configure(daemon_config())).await;
@@ -762,7 +861,8 @@ mod tests {
         // rate limit lands on would be `create_room`, not a send.
         a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
             .await;
-        port.take_calls();
+        // Call 0 is the room creation, so the root is call 1.
+        let root = minted_root(&port.take_calls(), 1);
 
         port.fail_next(crate::matrix::MatrixError::RateLimited { retry_after_ms: 1 });
         a.handle(Command::Events(vec![during(
@@ -780,7 +880,7 @@ mod tests {
         );
         let s = sends(&calls);
         assert_eq!(s.len(), 1, "the retry got through");
-        assert!(s[0].0.is_some(), "and it is still the thread reply");
+        assert_eq!(s[0].0, Some(root), "and it is still the thread reply");
         assert!(s[0].1.contains("needs permission"), "{}", s[0].1);
     }
 
@@ -826,7 +926,8 @@ mod tests {
         .await;
         a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
             .await;
-        port.take_calls();
+        // Call 0 is the room creation, so the root is call 1.
+        let root = minted_root(&port.take_calls(), 1);
         a.handle(Command::Phases(vec![PhaseChange {
             agent: "f/c/alice".into(),
             from: hecaton_api::AgentPhase::Ready,
@@ -836,7 +937,7 @@ mod tests {
         .await;
         let s = sends(&port.calls());
         assert_eq!(s.len(), 1);
-        assert!(s[0].0.is_some(), "in the thread");
+        assert_eq!(s[0].0, Some(root), "in the agent's own thread");
         assert!(s[0].1.contains("window gone"), "{}", s[0].1);
     }
 
