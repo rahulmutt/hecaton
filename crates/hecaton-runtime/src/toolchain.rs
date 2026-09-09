@@ -274,12 +274,19 @@ impl Toolchain<'_> {
         self.run_mise(&id, &env, &log, &["install"])
     }
 
-    /// Installs one level's tools into its own pool. Writes `toml_path`,
-    /// then does nothing more when `marker` already holds that file's
-    /// sha256; otherwise `mise trust` + `mise install` against `pool` with
-    /// `parents` as read-only fallbacks, and the marker is written on
-    /// success. `cwd=/` for the same reason `install` uses it: no project
-    /// `mise.toml` on the way up may be discovered.
+    /// Installs one level's tools into its own pool. Computes the digest of
+    /// the level's rendered table and returns early — writing nothing —
+    /// when `marker` already holds it; only then is `toml_path` written,
+    /// `mise trust` + `mise install` run against `pool` with `parents` as
+    /// read-only fallbacks, and the marker written on success. Checking the
+    /// marker before writing the file matters for the system level:
+    /// `toml_path` there is one file shared by every fleet, and fleet
+    /// actors run their passes in independent `spawn_blocking` tasks, so
+    /// two fleets' `ensure_crew` calls genuinely overlap in one process.
+    /// Skipping the write in the common case (nothing changed) means
+    /// nothing but this method ever touches that file, and no two threads
+    /// race `write_atomic` over it. `cwd=/` for the same reason `install`
+    /// uses it: no project `mise.toml` on the way up may be discovered.
     #[allow(clippy::too_many_arguments)]
     pub fn install_level(
         &self,
@@ -293,15 +300,15 @@ impl Toolchain<'_> {
     ) -> Result<(), MaterializeError> {
         let text = render_level_toml(label, tools);
         let digest = hex::encode(Sha256::digest(text.as_bytes()));
+        if std::fs::read_to_string(marker).ok().as_deref() == Some(digest.as_str()) {
+            return Ok(());
+        }
         let io = |path: &Path, e: std::io::Error| MaterializeError::Io {
             id: label.to_string(),
             path: path.to_path_buf(),
             message: e.to_string(),
         };
         write_atomic(toml_path, text.as_bytes(), 0o644).map_err(|e| io(toml_path, e))?;
-        if std::fs::read_to_string(marker).ok().as_deref() == Some(digest.as_str()) {
-            return Ok(());
-        }
         let env = level_env(toml_path, pool, parents);
         self.run_mise(
             label,
