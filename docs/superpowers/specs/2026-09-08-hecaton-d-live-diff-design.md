@@ -173,7 +173,7 @@ the fingerprint through `textContent` like every other value.
 | Assumption | Fallback | Verdict |
 |---|---|---|
 | `symlink_metadata().modified()` has sub-second resolution on the host filesystem, so an edit within the same second still changes the fingerprint | hash the first 4 KiB of each changed file as well | Verified 2026-09-08 (inspect_it: an edit within the same second changed the fingerprint) |
-| Scrolling the previously-top file header back into view after a render feels stable in the browser | restore the raw `scrollTop` only | Pending — by-hand `verify-claude` |
+| Scrolling the previously-top file header back into view after a render feels stable in the browser | restore the raw `scrollTop` only | Verified 2026-09-09 (by-hand `verify-claude` against the real `claude`: the diff refreshed live and the header snap-back read as stable; no fallback) |
 
 ## 8. Build order
 
