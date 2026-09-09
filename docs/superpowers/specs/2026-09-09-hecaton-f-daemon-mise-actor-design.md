@@ -84,7 +84,13 @@ detection:
 
 - At startup, and again on every resync tick, call `ensure_system_pool` on a
   blocking thread.
-- Publish the outcome on a `watch` channel carried in `Ports`.
+- Publish the outcome on a `watch` channel carried in `Shared`.
+
+`Shared`, not `Ports`. `Ports` is built at five separate call sites and
+`PluginHost::start` rebuilds it field by field, so a field there means editing
+all of them. `Shared` is created by `actor::shared()` inside `Daemon::start` —
+exactly where the actor is spawned — and the plugin host forwards it untouched,
+so the channel is born where it is needed and no construction site changes.
 
 No filesystem watcher and no new dependency. When the rendered table hashes to
 what the marker holds and the pool exists, the call returns before touching
@@ -94,7 +100,7 @@ bounded by one resync interval, which matters only for a hand-edited
 across an upgrade, which is a restart.
 
 ```rust
-// hecaton-server, beside `Ports` in actor.rs. The receiver goes in `Ports`.
+// hecaton-server, beside `Shared` in actor.rs. The receiver goes in `Shared`.
 pub enum SystemPoolState {
     Pending,
     Ready,
