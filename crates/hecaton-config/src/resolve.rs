@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use crate::ConfigError;
 use crate::file::FleetFile;
 use crate::merge::merge_layers;
-use crate::validate::validate_agent;
+use crate::validate::{tools_layer, validate_agent};
 
 /// Inputs to resolution that do not come from the file itself.
 #[derive(Debug, Clone, Default)]
@@ -48,11 +48,13 @@ pub fn resolve(file: &FleetFile, opts: &ResolveOptions) -> Result<FleetSpec, Con
         json!({ "claude": { "settings": s } })
     });
     expect_mapping("defaults", &file.defaults)?;
+    let fleet_tools = tools_layer("defaults", &file.defaults)?;
 
     let mut crews = BTreeMap::new();
     for (crew_name, crew) in &file.crews {
         let crew_path = format!("crews.{crew_name}");
         expect_mapping(&format!("{crew_path}.defaults"), &crew.defaults)?;
+        let crew_tools = tools_layer(&format!("{crew_path}.defaults"), &crew.defaults)?;
 
         let mut agents = BTreeMap::new();
         for (agent_name, layer) in &crew.agents {
@@ -78,12 +80,17 @@ pub fn resolve(file: &FleetFile, opts: &ResolveOptions) -> Result<FleetSpec, Con
                 repo: crew.repo.clone(),
                 git_ref: crew.git_ref.clone(),
                 git: crew.git.clone(),
+                tools: crew_tools,
                 agents,
             },
         );
     }
 
-    let spec = FleetSpec { name, crews };
+    let spec = FleetSpec {
+        name,
+        tools: fleet_tools,
+        crews,
+    };
     Fleet::try_from(spec.clone())?; // names and repos
     Ok(spec)
 }
@@ -269,6 +276,78 @@ crews:
             err.to_string(),
             "name: \"watch\" is reserved: it would shadow the plugin host's fleets/watch route"
         );
+    }
+
+    #[test]
+    fn fleet_and_crew_tool_layers_are_kept_beside_the_merged_agent_table() {
+        let f = file(
+            "apiVersion: hecaton/v1\nkind: Fleet\nname: f\n\
+             defaults:\n  tools: { node: \"22.11.0\", python: \"3.12.8\" }\n\
+             crews:\n  c:\n    repo: o/r\n    defaults:\n      tools: { python: null, go: \"1.23.4\" }\n    \
+             agents:\n      a: { tools: { ripgrep: \"14.1.1\" } }\n",
+        );
+        let spec = resolve(&f, &ResolveOptions::default()).unwrap();
+        assert_eq!(
+            spec.tools,
+            BTreeMap::from([
+                ("node".to_string(), "22.11.0".to_string()),
+                ("python".to_string(), "3.12.8".to_string()),
+            ]),
+            "the fleet pool holds what the fleet declared, deletions included"
+        );
+        assert_eq!(
+            spec.crews["c"].tools,
+            BTreeMap::from([("go".to_string(), "1.23.4".to_string())]),
+            "a null deletes rather than becoming an entry"
+        );
+        let merged = &spec.crews["c"].agents["a"].tools;
+        assert_eq!(merged["node"], "22.11.0");
+        assert_eq!(merged["go"], "1.23.4");
+        assert_eq!(merged["ripgrep"], "14.1.1");
+        assert!(!merged.contains_key("python"), "the crew deleted it");
+    }
+
+    #[test]
+    fn a_fuzzy_version_in_a_defaults_layer_is_rejected_with_its_path() {
+        let f = file(
+            "apiVersion: hecaton/v1\nkind: Fleet\nname: f\n\
+             defaults:\n  tools: { node: \"22\" }\ncrews:\n  c:\n    repo: o/r\n",
+        );
+        let e = resolve(&f, &ResolveOptions::default()).unwrap_err();
+        assert!(e.to_string().starts_with("defaults.tools.node:"), "got {e}");
+
+        let g = file(
+            "apiVersion: hecaton/v1\nkind: Fleet\nname: f\ncrews:\n  c:\n    repo: o/r\n    \
+             defaults:\n      tools: { node: \"22\" }\n",
+        );
+        let e = resolve(&g, &ResolveOptions::default()).unwrap_err();
+        assert!(
+            e.to_string().starts_with("crews.c.defaults.tools.node:"),
+            "got {e}"
+        );
+    }
+
+    #[test]
+    fn a_non_mapping_tools_layer_is_rejected() {
+        let f = file(
+            "apiVersion: hecaton/v1\nkind: Fleet\nname: f\n\
+             defaults:\n  tools: [node]\ncrews:\n  c:\n    repo: o/r\n",
+        );
+        let e = resolve(&f, &ResolveOptions::default()).unwrap_err();
+        assert!(e.to_string().starts_with("defaults.tools:"), "got {e}");
+    }
+
+    #[test]
+    fn a_non_string_tool_value_in_a_defaults_layer_is_rejected() {
+        let f = file(
+            "apiVersion: hecaton/v1\nkind: Fleet\nname: f\n\
+             defaults:\n  tools: { node: 22 }\ncrews:\n  c:\n    repo: o/r\n",
+        );
+        let e = resolve(&f, &ResolveOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("defaults.tools.node:"), "got {e}");
+        assert!(e.contains("expected a version string"), "got {e}");
     }
 
     #[test]

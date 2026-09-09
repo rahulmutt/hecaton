@@ -140,8 +140,10 @@ mod tests {
                         ("bob".to_string(), AgentSettings::default()),
                         ("alice".to_string(), AgentSettings::default()),
                     ]),
+                    ..Default::default()
                 },
             )]),
+            ..Default::default()
         })
         .unwrap()
     }

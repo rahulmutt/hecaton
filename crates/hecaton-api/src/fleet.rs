@@ -8,16 +8,21 @@ use serde::{Deserialize, Serialize};
 use crate::settings::AgentSettings;
 
 /// A fully-resolved fleet: every agent carries a complete settings block.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FleetSpec {
     pub name: String,
+    /// Tools declared in the fleet file's top-level `defaults`. Installed
+    /// once into the fleet pool and shared read-only with every agent in
+    /// the fleet (Spec E §3).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tools: BTreeMap<String, String>,
     #[serde(default)]
     pub crews: BTreeMap<String, CrewSpec>,
 }
 
 /// One crew: a shared repository plus its agents.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CrewSpec {
     /// GitHub `owner/name` shorthand or a full clone URL.
@@ -27,6 +32,10 @@ pub struct CrewSpec {
     pub git_ref: String,
     #[serde(default)]
     pub git: GitSettings,
+    /// This crew's own `defaults.tools` layer, never merged with the
+    /// fleet's: the fleet pool is already a parent of the crew pool.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tools: BTreeMap<String, String>,
     #[serde(default)]
     pub agents: BTreeMap<String, AgentSettings>,
 }
@@ -117,8 +126,10 @@ mod tests {
                     git_ref: "main".into(),
                     git: GitSettings::default(),
                     agents: BTreeMap::from([("alice".to_string(), AgentSettings::default())]),
+                    ..Default::default()
                 },
             )]),
+            ..Default::default()
         };
         let back: FleetSpec = serde_json::from_str(&serde_json::to_string(&spec).unwrap()).unwrap();
         assert_eq!(back, spec);
@@ -151,5 +162,27 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn tools_default_to_empty_and_are_omitted_when_empty() {
+        let json = r#"{"name":"f","crews":{"c":{"repo":"o/r","ref":"main"}}}"#;
+        let spec: FleetSpec = serde_json::from_str(json).unwrap();
+        assert!(spec.tools.is_empty(), "an older fleet.json still loads");
+        assert!(spec.crews["c"].tools.is_empty());
+        let back = serde_json::to_string(&spec).unwrap();
+        assert!(
+            !back.contains("tools"),
+            "an empty table stays out of the wire format: {back}"
+        );
+    }
+
+    #[test]
+    fn tools_round_trip_at_both_levels() {
+        let json = r#"{"name":"f","tools":{"node":"22.11.0"},
+            "crews":{"c":{"repo":"o/r","ref":"main","tools":{"python":"3.12.8"}}}}"#;
+        let spec: FleetSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.tools["node"], "22.11.0");
+        assert_eq!(spec.crews["c"].tools["python"], "3.12.8");
     }
 }

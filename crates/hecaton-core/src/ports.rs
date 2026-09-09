@@ -185,6 +185,15 @@ pub trait WorkspaceReader: Send + Sync {
     fn version(&self, agent: &AgentId, base_ref: &str) -> Result<WorkspaceVersion, WorkspaceError>;
 }
 
+/// The two read-only tool tables a crew's pools are built from: the fleet's
+/// own `defaults.tools` and this crew's `defaults.tools` layer. Each is that
+/// level's declaration, never a merge of the level above (Spec E §4).
+#[derive(Debug, Clone, Copy)]
+pub struct CrewTools<'a> {
+    pub fleet: &'a BTreeMap<String, String>,
+    pub crew: &'a BTreeMap<String, String>,
+}
+
 /// Makes files exist (or not) for crews and agents.
 pub trait Materializer: Send + Sync {
     fn ensure_crew(
@@ -194,6 +203,7 @@ pub trait Materializer: Send + Sync {
         git_ref: &str,
         git: &GitSettings,
         creds: &CredentialBundle,
+        tools: CrewTools<'_>,
     ) -> Result<(), MaterializeError>;
     fn materialize(
         &self,
@@ -214,6 +224,14 @@ pub trait Materializer: Send + Sync {
     /// Deletes `plugins/<name>/` — kv, scratch, home, everything
     /// (`plugin remove --purge`). Not part of any reconcile pass.
     fn purge_plugin(&self, name: &AgentName) -> Result<(), MaterializeError>;
+}
+
+/// Installs the daemon-level tool pool. Owned by one actor, never by the
+/// reconciler (Spec F, F-1). Implementations must be idempotent and cheap
+/// when nothing has changed: `Ok(())` means the pool matches the system
+/// table *and* exists on disk.
+pub trait SystemToolchain: Send + Sync {
+    fn ensure_system_pool(&self) -> Result<(), MaterializeError>;
 }
 
 /// Makes processes exist (or not) and reports what it sees.

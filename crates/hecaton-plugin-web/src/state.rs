@@ -261,6 +261,7 @@ mod tests {
         let mut r = FleetRecord::new(FleetSpec {
             name: name.into(),
             crews: BTreeMap::new(),
+            ..Default::default()
         });
         for (id, phase, message) in agents {
             let s = r.status.entry(id);

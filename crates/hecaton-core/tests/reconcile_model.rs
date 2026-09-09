@@ -264,8 +264,10 @@ fn fleet_of(map: &BTreeMap<String, u32>) -> Fleet {
                         (n.clone(), s)
                     })
                     .collect(),
+                ..Default::default()
             },
         )]),
+        ..Default::default()
     })
     .unwrap()
 }

@@ -17,6 +17,7 @@ pub mod plugins;
 pub mod proxy;
 pub mod sessions;
 pub mod store;
+pub mod system_pool;
 pub mod testing;
 pub mod vault;
 pub mod watch;
@@ -37,5 +38,6 @@ pub use plugins::{
     PluginHost, PluginHostConfig, PluginInfo, PluginKv, PluginRegistry,
 };
 pub use store::FileFleetStore;
+pub use system_pool::{SystemPoolConfig, SystemPoolState};
 pub use vault::{Vault, VaultError, random_hex};
 pub use watch::{PING_INTERVAL, serve_watch};

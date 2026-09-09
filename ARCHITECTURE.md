@@ -194,9 +194,25 @@ text has newlines.
   `Down` fleet re-applies in place; only `--purge` deletes (P3-5).
 - **A failing pass retries at the resync cadence**, not at `next_restart_at`, so a
   flapping clone never spins the daemon.
+- **Tool installs are a pool hierarchy.** Each level of the fleet file is
+  installed into its own read-only mise data dir — the system table into the
+  daemon pool, `defaults.tools` into the fleet pool, a crew's
+  `defaults.tools` into the crew pool — and every agent runs with its own
+  writable data dir in `home/`, reaching the three pools through
+  `MISE_SHARED_INSTALL_DIRS` (crew, then fleet, then daemon). An agent can
+  therefore `mise install` what its worktree declares without touching a
+  binary any other agent executes.
+- **The daemon pool has one owner.** The system table is installed by a
+  `SystemPool` actor at daemon start and re-checked each resync tick, not by
+  whichever crew's pass reached it first. Its readiness is a live condition:
+  a fleet pass is skipped, not failed, while the pool is unready, and a pool
+  deleted underneath a running daemon is noticed at the next tick. A failed
+  install is never fatal — the daemon stays up, publishes the reason and
+  retries.
 - **The sandbox pins mise's config walk** (`MISE_CEILING_PATHS` = the agent
-  workspace) because mise applies an untrusted repo `mise.toml`'s `[tools]`; a
-  repo's own mise config is therefore invisible to agents, by design.
+  root) so the walk sees the worktree's own `mise.toml` and nothing above
+  it. `MISE_AUTO_INSTALL=false` keeps installing an explicit act rather than
+  a side effect of launch.
 - **Plugins ride the reconciler as a synthetic fleet.** `plugin_fleet()`
   renders plugins as agents whose only setting is the plugin hash;
   `plan`/`execute`/`apply` were not touched, and `cargo mutants` still covers

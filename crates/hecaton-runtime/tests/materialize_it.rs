@@ -6,8 +6,12 @@ use std::path::Path;
 use std::process::Command;
 
 use hecaton_api::{AgentSettings, CredentialBundle, CrewSpec, FleetSpec, GitAuth, GitSettings};
-use hecaton_core::{Fleet, HookTarget, Keep, Materializer, ResolvedAgent};
+use hecaton_core::{CrewRef, CrewTools, Fleet, HookTarget, Keep, Materializer, ResolvedAgent};
 use hecaton_runtime::{Runtime, embedded_system_tools};
+
+fn no_tools() -> BTreeMap<String, String> {
+    BTreeMap::new()
+}
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -53,8 +57,10 @@ fn fleet(repo_url: &str) -> Fleet {
                     ..GitSettings::default()
                 },
                 agents: BTreeMap::from([("a".to_string(), s)]),
+                ..Default::default()
             },
         )]),
+        ..Default::default()
     })
     .unwrap()
 }
@@ -125,8 +131,19 @@ fn materialize_then_remove_round_trip() {
         secret: "s".into(),
     };
 
-    rt.ensure_crew(&crew, &agent.repo, &agent.git_ref, &agent.git, &creds)
-        .unwrap();
+    let (f_tools, c_tools) = (no_tools(), no_tools());
+    rt.ensure_crew(
+        &crew,
+        &agent.repo,
+        &agent.git_ref,
+        &agent.git,
+        &creds,
+        CrewTools {
+            fleet: &f_tools,
+            crew: &c_tools,
+        },
+    )
+    .unwrap();
     let plan = rt.materialize(&agent, &creds, &hooks).unwrap();
     let paths = layout.agent(&agent.id);
     assert!(paths.workspace.join("README").exists());
@@ -138,8 +155,18 @@ fn materialize_then_remove_round_trip() {
     );
     assert_eq!(plan.cwd, paths.workspace);
     // idempotent
-    rt.ensure_crew(&crew, &agent.repo, &agent.git_ref, &agent.git, &creds)
-        .unwrap();
+    rt.ensure_crew(
+        &crew,
+        &agent.repo,
+        &agent.git_ref,
+        &agent.git,
+        &creds,
+        CrewTools {
+            fleet: &f_tools,
+            crew: &c_tools,
+        },
+    )
+    .unwrap();
     rt.materialize(&agent, &creds, &hooks).unwrap();
     assert!(paths.installed_marker().exists());
     let mise_log = std::fs::read_to_string(paths.logs.join("mise.toolchain.log")).unwrap();
@@ -189,6 +216,7 @@ fn gh_auth_without_a_token_is_a_clear_error() {
     let rt = Runtime::new(support::layout(&root), tools);
     let f = fleet("file:///nowhere.git");
     let agent = ResolvedAgent::from_fleet(&f).remove(0);
+    let (f_tools, c_tools) = (no_tools(), no_tools());
     let err = rt
         .ensure_crew(
             &agent.id.crew_ref(),
@@ -196,10 +224,63 @@ fn gh_auth_without_a_token_is_a_clear_error() {
             "main",
             &GitSettings::default(),
             &CredentialBundle::default(),
+            CrewTools {
+                fleet: &f_tools,
+                crew: &c_tools,
+            },
         )
         .unwrap_err();
     assert_eq!(
         err.to_string(),
         "f/c: git.auth is gh but no gh token was provided (run `gh auth login` on the client)"
     );
+}
+
+#[test]
+fn ensure_crew_no_longer_writes_the_daemon_pool() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("mise", false));
+        return;
+    };
+    let root = support::temp_root("no-daemon-pool");
+    let layout = support::layout(&root);
+    let rt = Runtime::new(layout.clone(), tools);
+    let daemon_pool = layout.mise_data_dir();
+    std::fs::create_dir_all(&daemon_pool).unwrap();
+
+    let before = pool_snapshot(&daemon_pool);
+    let crew: CrewRef = "f/c".parse().unwrap();
+    let (f, c) = (BTreeMap::new(), BTreeMap::new());
+    let _ = rt.install_pools(
+        &crew,
+        hecaton_core::CrewTools {
+            fleet: &f,
+            crew: &c,
+        },
+    );
+    assert_eq!(
+        pool_snapshot(&daemon_pool),
+        before,
+        "install_pools must not touch the daemon pool any more (Spec F §3)"
+    );
+}
+
+/// Every path under `dir`, sorted, so an unchanged pool compares equal.
+fn pool_snapshot(dir: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            out.push(p.display().to_string());
+            if p.is_dir() {
+                stack.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
 }

@@ -17,8 +17,9 @@ use crate::agent::{CrewRef, ResolvedAgent};
 use crate::name::{AgentId, AgentName, FleetName};
 use crate::plugin::ResolvedPlugin;
 use crate::ports::{
-    AgentRunner, Clock, HookTarget, Keep, LaunchPlan, MaterializeError, Materializer,
-    ObservedState, ProcessState, PtyStream, RunnerError, WorkspaceError, WorkspaceReader,
+    AgentRunner, Clock, CrewTools, HookTarget, Keep, LaunchPlan, MaterializeError, Materializer,
+    ObservedState, ProcessState, PtyStream, RunnerError, SystemToolchain, WorkspaceError,
+    WorkspaceReader,
 };
 use crate::repo::RepoRef;
 
@@ -47,6 +48,8 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[derive(Default)]
 pub struct FakeMaterializer {
     rec: Mutex<Recorder>,
+    #[allow(clippy::type_complexity)]
+    crew_tools: Mutex<Vec<(String, Vec<String>, Vec<String>)>>,
 }
 
 impl FakeMaterializer {
@@ -57,6 +60,11 @@ impl FakeMaterializer {
         lock(&self.rec)
             .fail_next
             .push((method.into(), id.into(), stderr.into()));
+    }
+    /// Each `ensure_crew` call as (crew, fleet tools, crew tools), with
+    /// each table flattened to sorted `name=version` strings.
+    pub fn crew_tools(&self) -> Vec<(String, Vec<String>, Vec<String>)> {
+        lock(&self.crew_tools).clone()
     }
     fn check(&self, method: &str, id: &str, tool: &str) -> Result<(), MaterializeError> {
         match lock(&self.rec).record(method, id) {
@@ -80,7 +88,14 @@ impl Materializer for FakeMaterializer {
         _: &str,
         _: &GitSettings,
         _: &CredentialBundle,
+        tools: CrewTools<'_>,
     ) -> Result<(), MaterializeError> {
+        let flat = |t: &BTreeMap<String, String>| {
+            t.iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+        };
+        lock(&self.crew_tools).push((crew.to_string(), flat(tools.fleet), flat(tools.crew)));
         self.check("ensure_crew", &crew.to_string(), "git")
     }
     fn materialize(
@@ -560,6 +575,84 @@ impl Clock for FakeClock {
     }
 }
 
+/// A `SystemToolchain` that fails a fixed number of times before succeeding.
+/// `calls()` is how the actor's retry behaviour is asserted.
+pub struct FakeSystemToolchain {
+    remaining_failures: Mutex<usize>,
+    forever: bool,
+    calls: Mutex<usize>,
+    succeed_first: Mutex<usize>,
+}
+
+impl FakeSystemToolchain {
+    pub fn ready() -> Self {
+        Self {
+            remaining_failures: Mutex::new(0),
+            forever: false,
+            calls: Mutex::new(0),
+            succeed_first: Mutex::new(usize::MAX),
+        }
+    }
+    pub fn failing(times: usize) -> Self {
+        Self {
+            remaining_failures: Mutex::new(times),
+            forever: false,
+            calls: Mutex::new(0),
+            succeed_first: Mutex::new(usize::MAX),
+        }
+    }
+    pub fn always_failing() -> Self {
+        Self {
+            remaining_failures: Mutex::new(0),
+            forever: true,
+            calls: Mutex::new(0),
+            succeed_first: Mutex::new(usize::MAX),
+        }
+    }
+    /// Succeeds `ok` times, then fails forever. Drives the "readiness is not
+    /// a latch" test (Spec F, F-4).
+    pub fn ready_then_failing(ok: usize) -> Self {
+        Self {
+            remaining_failures: Mutex::new(0),
+            forever: false,
+            calls: Mutex::new(0),
+            succeed_first: Mutex::new(ok),
+        }
+    }
+    pub fn calls(&self) -> usize {
+        *lock(&self.calls)
+    }
+}
+
+impl SystemToolchain for FakeSystemToolchain {
+    fn ensure_system_pool(&self) -> Result<(), MaterializeError> {
+        *lock(&self.calls) += 1;
+
+        let mut first = lock(&self.succeed_first);
+        if *first > 0 && *first != usize::MAX {
+            *first -= 1;
+            return Ok(());
+        }
+        if *first == 0 {
+            return Err(MaterializeError::Invalid {
+                id: "system".to_string(),
+                message: "fake system pool failure".to_string(),
+            });
+        }
+        drop(first);
+
+        let mut left = lock(&self.remaining_failures);
+        if self.forever || *left > 0 {
+            *left = left.saturating_sub(1);
+            return Err(MaterializeError::Invalid {
+                id: "system".to_string(),
+                message: "fake system pool failure".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -682,6 +775,23 @@ mod tests {
         assert_eq!(c.now(), Timestamp(105));
         c.set(Timestamp(1));
         assert_eq!(c.now(), Timestamp(1));
+    }
+
+    #[test]
+    fn the_fake_system_toolchain_counts_calls_and_recovers_after_n_failures() {
+        let tc = FakeSystemToolchain::failing(2);
+        assert!(tc.ensure_system_pool().is_err(), "first attempt fails");
+        assert!(tc.ensure_system_pool().is_err(), "second attempt fails");
+        assert!(tc.ensure_system_pool().is_ok(), "third attempt succeeds");
+        assert_eq!(tc.calls(), 3);
+
+        let always = FakeSystemToolchain::always_failing();
+        assert!(always.ensure_system_pool().is_err());
+        assert!(always.ensure_system_pool().is_err());
+        assert_eq!(always.calls(), 2);
+
+        let ok = FakeSystemToolchain::ready();
+        assert!(ok.ensure_system_pool().is_ok());
     }
 
     /// Drains `reader` on a thread: one message per read, ending at EOF or

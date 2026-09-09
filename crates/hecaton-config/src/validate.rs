@@ -23,6 +23,13 @@ pub const RESERVED_ENV_PREFIXES: &[&str] = &[
     "CLAUDE_CODE_TMPDIR",
 ];
 
+/// The message for a tool version `is_exact_version` refuses; shared by
+/// `validate_agent` and `tools_layer` so the two stay identical by
+/// construction rather than by two hand-kept copies.
+fn exact_version_message(tool: &str, version: &str) -> String {
+    format!("expected an exact version, got {version:?} (try: mise latest {tool}@{version})")
+}
+
 /// Validates one resolved settings block; `path` prefixes every message.
 pub fn validate_agent(path: &str, settings: &AgentSettings) -> Result<(), ConfigError> {
     let invalid = |suffix: &str, message: String| ConfigError::Invalid {
@@ -34,9 +41,7 @@ pub fn validate_agent(path: &str, settings: &AgentSettings) -> Result<(), Config
         if !is_exact_version(version) {
             return Err(invalid(
                 &format!("tools.{tool}"),
-                format!(
-                    "expected an exact version, got {version:?} (try: mise latest {tool}@{version})"
-                ),
+                exact_version_message(tool, version),
             ));
         }
     }
@@ -87,6 +92,47 @@ pub fn validate_agent(path: &str, settings: &AgentSettings) -> Result<(), Config
         }
     }
     Ok(())
+}
+
+/// The `tools` table of one settings layer, as the pool for that level
+/// wants it: absent or null is empty, a `null` value is the file's delete
+/// marker and is dropped, and every surviving version must be exact.
+/// `path` is the layer's config path, e.g. `defaults` or
+/// `crews.web.defaults`.
+pub fn tools_layer(
+    path: &str,
+    layer: &Value,
+) -> Result<std::collections::BTreeMap<String, String>, ConfigError> {
+    let invalid = |suffix: &str, message: String| ConfigError::Invalid {
+        path: format!("{path}.tools{suffix}"),
+        message,
+    };
+    let mut out = std::collections::BTreeMap::new();
+    let tools = match layer.get("tools") {
+        None | Some(Value::Null) => return Ok(out),
+        Some(Value::Object(t)) => t,
+        Some(_) => return Err(invalid("", "expected a mapping".to_string())),
+    };
+    for (tool, value) in tools {
+        let version = match value {
+            Value::Null => continue,
+            Value::String(s) => s,
+            _ => {
+                return Err(invalid(
+                    &format!(".{tool}"),
+                    "expected a version string".to_string(),
+                ));
+            }
+        };
+        if !is_exact_version(version) {
+            return Err(invalid(
+                &format!(".{tool}"),
+                exact_version_message(tool, version),
+            ));
+        }
+        out.insert(tool.clone(), version.clone());
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -181,6 +227,17 @@ mod tests {
         assert_eq!(
             validate_agent("p", &s).unwrap_err().to_string(),
             "p.claude.settings: expected a mapping"
+        );
+    }
+
+    #[test]
+    fn tools_layer_treats_a_whole_table_null_as_empty() {
+        // A crew layer that removes every fleet tool by writing `tools:
+        // null` outright, rather than nulling each key individually: the
+        // one arm no other test reaches.
+        assert_eq!(
+            tools_layer("crews.web.defaults", &json!({"tools": null})).unwrap(),
+            BTreeMap::new()
         );
     }
 

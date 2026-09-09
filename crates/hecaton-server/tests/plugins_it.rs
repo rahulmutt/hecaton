@@ -225,8 +225,10 @@ async fn plugins_sync_hello_list_and_purge() {
                 git_ref: "main".into(),
                 git: GitSettings::default(),
                 agents: BTreeMap::from([("a".to_string(), AgentSettings::default())]),
+                ..Default::default()
             },
         )]),
+        ..Default::default()
     };
     let req = serde_json::to_value(FleetRequest {
         spec,
@@ -353,8 +355,10 @@ async fn a_stored_fleet_under_the_reserved_name_is_ignored() {
                 git_ref: "main".into(),
                 git: GitSettings::default(),
                 agents: BTreeMap::from([("hello".to_string(), AgentSettings::default())]),
+                ..Default::default()
             },
         )]),
+        ..Default::default()
     });
     record.status.entry("hecaton/plugins/hello");
     let ports = hecaton_server::Ports {
@@ -379,6 +383,7 @@ async fn a_stored_fleet_under_the_reserved_name_is_ignored() {
         h.registry.clone(),
         h.client.clone(),
         h.kv.clone(),
+        hecaton_server::testing::ready_toolchain(),
     );
     daemon.sync_plugins().await.unwrap();
 

@@ -28,8 +28,10 @@ fn spec(agents: &[&str]) -> FleetSpec {
                     .iter()
                     .map(|a| (a.to_string(), AgentSettings::default()))
                     .collect(),
+                ..Default::default()
             },
         )]),
+        ..Default::default()
     }
 }
 

@@ -220,6 +220,7 @@ pub fn plugin_fleet(plugins: &[ResolvedPlugin]) -> Fleet {
         .collect();
     Fleet {
         name: RESERVED_FLEET.parse().unwrap_or_else(|_| unreachable!()),
+        tools: BTreeMap::new(),
         crews: BTreeMap::from([(
             PLUGIN_CREW.parse().unwrap_or_else(|_| unreachable!()),
             Crew {
@@ -230,6 +231,7 @@ pub fn plugin_fleet(plugins: &[ResolvedPlugin]) -> Fleet {
                     auth: GitAuth::None,
                     identity: None,
                 },
+                tools: BTreeMap::new(),
                 agents,
             },
         )]),

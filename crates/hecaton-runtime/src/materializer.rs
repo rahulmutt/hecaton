@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use hecaton_api::{CredentialBundle, GitAuth, GitSettings};
 use hecaton_core::{
-    AgentId, AgentName, CrewRef, HookTarget, Keep, LaunchPlan, MaterializeError, Materializer,
-    RepoRef, ResolvedAgent, ResolvedPlugin,
+    AgentId, AgentName, CrewRef, CrewTools, HookTarget, Keep, LaunchPlan, MaterializeError,
+    Materializer, RepoRef, ResolvedAgent, ResolvedPlugin, SystemToolchain,
 };
 
 use crate::env::agent_env;
@@ -71,7 +71,7 @@ impl Runtime {
             },
         )?;
 
-        let system = system_tools(&self.layout, id)?;
+        let system = system_tools(&self.layout, &id.to_string())?;
         let tools_changed = Toolchain {
             tools: &self.tools,
             layout: &self.layout,
@@ -89,6 +89,7 @@ impl Runtime {
         let profile = render_profile(
             id,
             &hecaton_grants(
+                id,
                 &paths,
                 &crew,
                 &self.layout,
@@ -152,7 +153,103 @@ impl Runtime {
             message: e.to_string(),
         })
     }
+
+    /// The two fleet-owned pools, outermost first: the fleet's tools into
+    /// the fleet pool, this crew's into the crew pool. Each is skipped when
+    /// its marker already matches its rendered table, and each resolves
+    /// through the pools above it, so a version an outer pool already holds
+    /// is never downloaded twice (Spec E §5). The daemon pool is not
+    /// installed here: it belongs to the `SystemPool` actor (Spec F §3).
+    pub fn install_pools(
+        &self,
+        crew: &CrewRef,
+        tools: CrewTools<'_>,
+    ) -> Result<(), MaterializeError> {
+        let tc = Toolchain {
+            tools: &self.tools,
+            layout: &self.layout,
+        };
+        let fleet = self.layout.fleet(&crew.fleet);
+        let crew_paths = self.layout.crew(crew);
+        let daemon_pool = self.layout.mise_data_dir();
+        let log = crew_paths.root.join("logs").join("mise.pools.log");
+
+        let crew_id = crew.to_string();
+        tc.install_level(
+            &crew_id,
+            &format!("fleet {}", crew.fleet),
+            &fleet.mise_toml,
+            &fleet.mise_pool(),
+            std::slice::from_ref(&daemon_pool),
+            &fleet.installed_marker(),
+            tools.fleet,
+            &log,
+            None,
+        )?;
+        tc.install_level(
+            &crew_id,
+            &format!("crew {crew}"),
+            &crew_paths.mise_toml(),
+            &crew_paths.mise_pool(),
+            &[fleet.mise_pool(), daemon_pool],
+            &crew_paths.installed_marker(),
+            tools.crew,
+            &log,
+            None,
+        )
+    }
 }
+
+impl SystemToolchain for Runtime {
+    /// The daemon pool, owned by the `SystemPool` actor (Spec F §3). Returns
+    /// `Ok` only when the pool matches the system table *and* exists: a
+    /// marker that survived a deleted pool would otherwise report ready over
+    /// an empty directory (F-5).
+    fn ensure_system_pool(&self) -> Result<(), MaterializeError> {
+        let tc = Toolchain {
+            tools: &self.tools,
+            layout: &self.layout,
+        };
+        let pool = self.layout.mise_data_dir();
+        let marker = self.layout.system_installed_marker();
+        let log = self
+            .layout
+            .server_dir()
+            .join("logs")
+            .join("mise.system.log");
+        let system = system_tools(&self.layout, "system")?;
+        // Drop a stale marker so `install_level` cannot short-circuit past a
+        // pool that is no longer there.
+        if !pool.exists()
+            && let Err(e) = std::fs::remove_file(&marker)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(MaterializeError::Io {
+                id: "system".to_string(),
+                path: marker,
+                message: e.to_string(),
+            });
+        }
+        tc.install_level(
+            "system",
+            "system",
+            &self.layout.system_mise_toml_generated(),
+            &pool,
+            &[],
+            &marker,
+            &system,
+            &log,
+            Some(SYSTEM_POOL_INSTALL_TIMEOUT),
+        )
+    }
+}
+
+/// How long `ensure_system_pool` lets one `mise trust`/`mise install` call
+/// run before killing it (Spec F §6). 600s is the value Spec F's `SystemPool`
+/// actor design documents as its default `attempt_timeout` (Task 4); once
+/// the actor's configured value is threaded down here instead, this constant
+/// goes away.
+const SYSTEM_POOL_INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
 
 impl Runtime {
     fn workspace(&self, fleet: &hecaton_core::FleetName, git: &GitSettings) -> Workspace<'_> {
@@ -216,6 +313,7 @@ impl Materializer for Runtime {
         git_ref: &str,
         git: &GitSettings,
         creds: &CredentialBundle,
+        tools: CrewTools<'_>,
     ) -> Result<(), MaterializeError> {
         let id = crew.to_string();
         if git.auth == GitAuth::Gh {
@@ -225,6 +323,7 @@ impl Materializer for Runtime {
             })?;
             Workspace::write_fleet_gh_config(&self.layout.fleet_gh_dir(&crew.fleet), token, &id)?;
         }
+        self.install_pools(crew, tools)?;
         self.workspace(&crew.fleet, git)
             .ensure_repo(&id, &self.layout.crew(crew), repo, git_ref)
     }
@@ -352,8 +451,10 @@ mod tests {
                     git_ref: "main".into(),
                     git: GitSettings::default(),
                     agents: BTreeMap::from([("a".to_string(), s)]),
+                    ..Default::default()
                 },
             )]),
+            ..Default::default()
         })
         .unwrap();
         ResolvedAgent::from_fleet(&fleet).remove(0)
@@ -418,6 +519,52 @@ mod tests {
         assert!(rt.install_and_validate(&a).is_err());
         std::fs::write(paths.installed_marker(), "").unwrap();
         rt.install_and_validate(&a).unwrap();
+    }
+
+    #[test]
+    fn a_matching_marker_with_no_pool_is_treated_as_stale() {
+        use sha2::Digest;
+
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime(dir.path());
+        let layout = &rt.layout;
+
+        // Write a marker holding the digest of the table that would be
+        // rendered, but never create the pool.
+        let system = system_tools(layout, "system").unwrap();
+        let text = crate::toolchain::render_level_toml("system", &system);
+        let digest = hex::encode(sha2::Sha256::digest(text.as_bytes()));
+        std::fs::create_dir_all(layout.system_installed_marker().parent().unwrap()).unwrap();
+        std::fs::write(layout.system_installed_marker(), &digest).unwrap();
+        assert!(!layout.mise_data_dir().exists(), "no pool yet");
+
+        // With a fake mise that cannot really install, the call must still
+        // *attempt* it rather than short-circuit on the marker.
+        let err = rt.ensure_system_pool().unwrap_err();
+        assert!(
+            !matches!(err, MaterializeError::Invalid { .. }),
+            "a missing pool must drive a real install attempt, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_marker_removal_failure_other_than_missing_is_not_swallowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime(dir.path());
+        let marker = rt.layout.system_installed_marker();
+        // A directory where a file is expected: `remove_file` fails with
+        // something other than `NotFound`, and the pool does not exist
+        // either, so `ensure_system_pool` must try the removal and
+        // propagate that failure rather than silently proceed to
+        // `install_level` with a marker that is still there.
+        std::fs::create_dir_all(&marker).unwrap();
+        assert!(!rt.layout.mise_data_dir().exists(), "no pool yet");
+
+        let err = rt.ensure_system_pool().unwrap_err();
+        assert!(
+            matches!(err, MaterializeError::Io { .. }),
+            "a removal failure other than NotFound must surface as Io, got {err:?}"
+        );
     }
 
     #[test]

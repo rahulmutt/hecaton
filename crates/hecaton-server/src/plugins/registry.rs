@@ -490,6 +490,7 @@ mod tests {
         let mut record = FleetRecord::new(FleetSpec {
             name: "f".into(),
             crews: BTreeMap::new(),
+            ..Default::default()
         });
         record.status.entry("f/c/a");
         record.status.entry("f/c/b");

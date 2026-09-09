@@ -7,8 +7,12 @@ use std::sync::{Arc, Mutex, Mutex as StdMutex};
 use std::time::Duration;
 
 use hecaton_api::Timestamp;
-use hecaton_core::fakes::{FakeClock, FakeMaterializer, FakeRunner, FakeWorkspace};
-use hecaton_core::{FleetName, FleetRecord, FleetSecrets, FleetStore, ReconcilePolicy, StoreError};
+use hecaton_core::fakes::{
+    FakeClock, FakeMaterializer, FakeRunner, FakeSystemToolchain, FakeWorkspace,
+};
+use hecaton_core::{
+    FleetName, FleetRecord, FleetSecrets, FleetStore, ReconcilePolicy, StoreError, SystemToolchain,
+};
 
 use crate::actor::Ports;
 use crate::daemon::{Daemon, DaemonHandler};
@@ -124,6 +128,7 @@ impl Harness {
             token,
             Metrics::new().unwrap_or_else(|e| panic!("metrics: {e}")),
             Vec::new(),
+            ready_toolchain(),
         )
     }
 
@@ -136,16 +141,26 @@ impl Harness {
         plugin_dir: &Path,
         metrics: Metrics,
     ) -> Arc<Daemon> {
-        self.daemon_full(handler, plugin_dir, "admin-tok", metrics, Vec::new())
+        self.daemon_full(
+            handler,
+            plugin_dir,
+            "admin-tok",
+            metrics,
+            Vec::new(),
+            ready_toolchain(),
+        )
     }
 
-    /// The same, starting from stored records — what a daemon restart
-    /// hands `Daemon::start`.
+    /// The same, starting from stored records and over a system toolchain
+    /// the caller controls: the records are what a daemon restart hands
+    /// `Daemon::start`, and the toolchain is what its pool actor drives —
+    /// the only thing that opens the fleets' readiness gate (Spec F §4).
     pub fn daemon_with_existing(
         &self,
         handler: Arc<dyn DaemonHandler>,
         plugin_dir: &Path,
         existing: Vec<(FleetRecord, FleetSecrets)>,
+        toolchain: Arc<dyn SystemToolchain>,
     ) -> Arc<Daemon> {
         self.daemon_full(
             handler,
@@ -153,6 +168,7 @@ impl Harness {
             "admin-tok",
             Metrics::new().unwrap_or_else(|e| panic!("metrics: {e}")),
             existing,
+            toolchain,
         )
     }
 
@@ -163,6 +179,7 @@ impl Harness {
         token: &str,
         metrics: Metrics,
         existing: Vec<(FleetRecord, FleetSecrets)>,
+        toolchain: Arc<dyn SystemToolchain>,
     ) -> Arc<Daemon> {
         let ports = Ports {
             materializer: self.materializer.clone(),
@@ -184,8 +201,16 @@ impl Harness {
             self.registry.clone(),
             self.client.clone(),
             self.kv.clone(),
+            toolchain,
         )
     }
+}
+
+/// The system toolchain every daemon helper that does not care about the
+/// pool is built with: ready on the first attempt, so the readiness gate
+/// (Spec F §5) is open and these tests see the behaviour they always did.
+pub fn ready_toolchain() -> Arc<dyn SystemToolchain> {
+    Arc::new(FakeSystemToolchain::ready())
 }
 
 /// A `PluginHostConfig` under a test directory: no `plugins.yaml` yet, so

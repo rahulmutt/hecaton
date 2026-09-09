@@ -20,14 +20,15 @@ fn generated_profile_validates_and_enforces_isolation() {
     let id: AgentId = "f/c/a".parse().unwrap();
     let paths = layout.agent(&id);
     let crew = layout.crew(&id.crew_ref());
-    for d in [
-        &paths.home,
-        &paths.workspace,
-        &paths.nono_home,
-        &paths.logs,
-        &crew.repo.join(".git"),
-        &layout.mise_data_dir(),
-    ] {
+    let mut dirs = vec![
+        paths.home.clone(),
+        paths.workspace.clone(),
+        paths.nono_home.clone(),
+        paths.logs.clone(),
+        crew.repo.join(".git"),
+    ];
+    dirs.extend(layout.agent_pools(&id));
+    for d in &dirs {
         std::fs::create_dir_all(d).unwrap();
     }
     let env = agent_env(
@@ -40,7 +41,7 @@ fn generated_profile_validates_and_enforces_isolation() {
     );
     let profile = render_profile(
         &id,
-        &hecaton_grants(&paths, &crew, &layout, &tools.hecaton, &tools.mise),
+        &hecaton_grants(&id, &paths, &crew, &layout, &tools.hecaton, &tools.mise),
         7643,
         &env,
         &serde_json::json!({}),

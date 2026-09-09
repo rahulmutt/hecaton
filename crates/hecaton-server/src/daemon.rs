@@ -12,7 +12,8 @@ use hecaton_api::{
 };
 use hecaton_core::{
     AgentId, AgentName, AgentRunner, EventHandler, Fleet, FleetName, FleetRecord, FleetSecrets,
-    Keep, Outcome, WorkspaceReader, is_reserved_fleet, plugin_id, reserved_fleet_reason,
+    Keep, Outcome, SystemToolchain, WorkspaceReader, is_reserved_fleet, plugin_id,
+    reserved_fleet_reason,
 };
 use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
@@ -26,6 +27,7 @@ use crate::plugins::{
     PluginRegistry,
 };
 use crate::sessions::Sessions;
+use crate::system_pool::SystemPoolConfig;
 
 /// The chain handler's hello hook; `PassThrough` has nothing to clear.
 pub trait HelloObserver: Send + Sync {
@@ -104,8 +106,12 @@ impl Daemon {
         registry: Arc<PluginRegistry>,
         client: PluginClient,
         kv: Arc<PluginKv>,
+        system_toolchain: Arc<dyn SystemToolchain>,
     ) -> Arc<Self> {
-        let (shared, purged) = actor::shared(metrics);
+        let (shared, purged, pool_tx) = actor::shared(metrics);
+        // Spec F §4: one owner for the daemon pool. Spawned before the fleet
+        // actors, though they gate on readiness rather than on spawn order.
+        crate::system_pool::spawn(system_toolchain, pool_tx, SystemPoolConfig::default());
         let plugins = PluginHost::start(plugin_config, &ports, shared.clone(), registry.clone());
         let ports = Arc::new(ports);
         let changes = Arc::new(watch::channel(0u64).0);
@@ -828,10 +834,11 @@ impl Daemon {
 mod tests {
     use super::*;
     use crate::plugins::PluginEventHandler;
-    use crate::testing::{Harness, StubScript, stub_plugin, write_plugin_package};
+    use crate::testing::{Harness, StubScript, ready_toolchain, stub_plugin, write_plugin_package};
     use hecaton_api::{
         ActivationState, AgentPhase, AgentSettings, CrewSpec, GitSettings, PluginAction,
     };
+    use hecaton_core::fakes::FakeSystemToolchain;
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::time::Duration;
@@ -858,8 +865,10 @@ mod tests {
                             (n.to_string(), s)
                         })
                         .collect(),
+                    ..Default::default()
                 },
             )]),
+            ..Default::default()
         }
     }
 
@@ -879,6 +888,19 @@ mod tests {
 
     /// The same, over stored records: what a daemon restart loads.
     async fn world_with(existing: Vec<(FleetRecord, FleetSecrets)>) -> World {
+        world_full(existing, ready_toolchain()).await
+    }
+
+    /// The same, over a system toolchain the test controls: the pool actor
+    /// `Daemon::start` spawns is the only thing that opens the fleets' gate.
+    async fn world_with_toolchain(toolchain: Arc<dyn SystemToolchain>) -> World {
+        world_full(Vec::new(), toolchain).await
+    }
+
+    async fn world_full(
+        existing: Vec<(FleetRecord, FleetSecrets)>,
+        toolchain: Arc<dyn SystemToolchain>,
+    ) -> World {
         let h = Harness::new(Duration::from_secs(3600));
         let dir = tempfile::tempdir().unwrap();
         write_plugin_package(
@@ -896,7 +918,7 @@ mod tests {
             h.client.clone(),
             Metrics::new().unwrap(),
         );
-        let daemon = h.daemon_with_existing(handler, dir.path(), existing);
+        let daemon = h.daemon_with_existing(handler, dir.path(), existing, toolchain);
         daemon.sync_plugins().await.unwrap();
         World {
             h,
@@ -961,6 +983,51 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// Polls to a bounded deadline. A bare sleep would be either flaky or
+    /// slow, and naming what was expected keeps the failure readable.
+    async fn eventually(what: &str, pred: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if pred() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    }
+
+    /// Spec F §4: the daemon pool has exactly one owner, spawned by
+    /// `Daemon::start`, and it is what opens every fleet's gate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_spawns_the_system_pool_actor_and_fleets_wait_for_it() {
+        // Fails its first attempt and the next one is a whole tick away, so
+        // the pool stays unready for this test's lifetime: the daemon must
+        // come up regardless (F-7), and fleets must not reconcile.
+        let tc = Arc::new(FakeSystemToolchain::failing(1));
+        let w = world_with_toolchain(tc.clone()).await;
+        let name: FleetName = "f".parse().unwrap();
+
+        // The API serves at once, whatever the pool is doing (F-3).
+        let rec = w
+            .daemon
+            .apply(&name, spec(&[("a", &[])]), Default::default(), false)
+            .await
+            .unwrap();
+        assert_eq!(rec.generation, 1);
+
+        // Someone owns the pool: an actor is running and driving the port.
+        eventually("the pool's first attempt", || tc.calls() >= 1).await;
+
+        // And until it succeeds, no fleet pass materializes anything.
+        assert!(
+            w.h.materializer.calls().is_empty(),
+            "fleets wait for the pool: {:?}",
+            w.h.materializer.calls()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

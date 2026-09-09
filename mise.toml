@@ -11,7 +11,7 @@ gitleaks = "8.30.1"
 tmux = "3.7c"
 gh = "2.100.0"
 nono = "0.75.0"
-claude = "2.1.263"
+claude = "2.1.266"
 
 [tasks.fmt]
 description = "Format all crates"

@@ -16,6 +16,7 @@ use hecaton_core::{
 use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
 use crate::metrics::Metrics;
+use crate::system_pool::SystemPoolState;
 use crate::vault::random_hex;
 
 /// The hook event that means "Claude is up and accepting input".
@@ -86,18 +87,43 @@ pub struct Shared {
     /// An actor announces its own name here after a purge; the registry
     /// drops the handle.
     pub purged: mpsc::Sender<FleetName>,
+    /// The daemon pool's live state. Read at the top of every pass; a pass
+    /// does not run unless this is `Ready` (Spec F §5).
+    pub system_pool: watch::Receiver<SystemPoolState>,
 }
 
-pub fn shared(metrics: Metrics) -> (Shared, mpsc::Receiver<FleetName>) {
+/// The shared state, the purge inbox and the readiness sender the
+/// `SystemPool` actor is spawned with (`crate::system_pool::spawn`). That
+/// sender is the channel's only writer: drop it and every fleet gates shut
+/// for good, so it belongs to whoever owns the pool.
+pub fn shared(
+    metrics: Metrics,
+) -> (
+    Shared,
+    mpsc::Receiver<FleetName>,
+    watch::Sender<SystemPoolState>,
+) {
     let (purged, rx) = mpsc::channel(16);
+    let (pool_tx, pool_rx) = watch::channel(SystemPoolState::Pending);
     (
         Shared {
             hook_secrets: Arc::default(),
             metrics,
             purged,
+            system_pool: pool_rx,
         },
         rx,
+        pool_tx,
     )
+}
+
+/// Resolves when the daemon pool's state changes. A closed channel — the
+/// pool's owner is gone — never resolves, rather than resolving instantly
+/// for ever and spinning the actor's loop at full tilt.
+async fn pool_changed(rx: &mut watch::Receiver<SystemPoolState>) {
+    if rx.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
 }
 
 /// Starts the actor. `initial_pass` is true for records loaded at startup
@@ -142,6 +168,13 @@ struct Actor {
 
 impl Actor {
     async fn run(mut self, initial_pass: bool) {
+        // Whatever the pool's state is now is where this actor starts from;
+        // only a change *after* that is a reason to wake. Without marking it
+        // seen, an actor spawned once the pool is already ready reads its
+        // clone's stale version as an unseen change and runs a pass nobody
+        // asked for — `initial_pass` is false for a fresh `POST` precisely
+        // so that the `Apply` is the first pass.
+        self.shared.system_pool.borrow_and_update();
         self.seed_index().await;
         if initial_pass && !self.record.is_down() {
             self.pass().await;
@@ -154,6 +187,9 @@ impl Actor {
                     None => return,
                 },
                 () = tokio::time::sleep_until(deadline) => None,
+                // A pool that goes ready two seconds in must not leave every
+                // fleet idle for a whole resync interval.
+                () = pool_changed(&mut self.shared.system_pool) => None,
             };
             match msg {
                 Some(Msg::Apply {
@@ -295,6 +331,13 @@ impl Actor {
     }
 
     async fn pass(&mut self) {
+        // Spec F §5: the daemon pool is a precondition, not the fleet's
+        // fault. Skip the pass and leave status alone; a crew marked failed
+        // here would move restart counters for a daemon-level condition.
+        if *self.shared.system_pool.borrow() != SystemPoolState::Ready {
+            tracing::debug!(fleet = %self.name, "skipping the pass: daemon mise pool not ready");
+            return;
+        }
         let ports = self.ports.clone();
         let name = self.name.clone();
         let desired = match self.record.desired {
@@ -441,8 +484,10 @@ mod tests {
                         .iter()
                         .map(|a| (a.to_string(), AgentSettings::default()))
                         .collect(),
+                    ..Default::default()
                 },
             )]),
+            ..Default::default()
         }
     }
 
@@ -502,8 +547,25 @@ mod tests {
         rx.await.unwrap()
     }
 
-    fn start(h: &Harness) -> (FleetHandle, Shared, mpsc::Receiver<FleetName>) {
-        let (shared, purged) = shared(Metrics::new().unwrap());
+    /// Everything a test must hold for as long as the actor runs. The
+    /// `watch::Sender` is one of them: dropping it closes the readiness
+    /// channel the actor selects on.
+    type Started = (
+        FleetHandle,
+        Shared,
+        mpsc::Receiver<FleetName>,
+        watch::Sender<SystemPoolState>,
+    );
+
+    /// An actor over a pool that is already `Ready` — what every test but
+    /// the gate's own wants.
+    fn start(h: &Harness) -> Started {
+        start_with_pool(h, SystemPoolState::Ready)
+    }
+
+    fn start_with_pool(h: &Harness, state: SystemPoolState) -> Started {
+        let (shared, purged, pool) = shared(Metrics::new().unwrap());
+        pool.send(state).unwrap();
         let handle = spawn(
             "f".parse().unwrap(),
             FleetRecord::new(spec(&[])),
@@ -512,13 +574,34 @@ mod tests {
             shared.clone(),
             false,
         );
-        (handle, shared, purged)
+        (handle, shared, purged, pool)
+    }
+
+    /// A `Shared` whose pool is already `Ready`, for the tests that spawn
+    /// their actor by hand. The sender comes back so the caller can keep
+    /// the channel open.
+    fn ready_shared() -> (
+        Shared,
+        mpsc::Receiver<FleetName>,
+        watch::Sender<SystemPoolState>,
+    ) {
+        let (shared, purged, pool) = shared(Metrics::new().unwrap());
+        pool.send(SystemPoolState::Ready).unwrap();
+        (shared, purged, pool)
+    }
+
+    /// A round trip that lands *after* the pass the previous message
+    /// triggered: the actor handles one message at a time and replies to
+    /// this one only once that pass has finished. A skipped pass publishes
+    /// nothing, so this is how these tests know one has happened.
+    async fn after_pass(h: &FleetHandle) {
+        set_stopped(h, "f/c/a", false).await;
     }
 
     #[tokio::test]
     async fn apply_reconciles_mints_secrets_and_persists() {
         let h = Harness::new(Duration::from_secs(3600));
-        let (handle, shared, _purged) = start(&h);
+        let (handle, shared, _purged, _pool) = start(&h);
         let reply = apply(&handle, spec(&["a", "b"])).await;
         assert_eq!(reply.generation, 1);
         assert_eq!(reply.desired, Desired::Up);
@@ -545,7 +628,7 @@ mod tests {
     #[tokio::test]
     async fn session_start_readies_an_agent_and_a_new_apply_keeps_its_secret() {
         let h = Harness::new(Duration::from_secs(3600));
-        let (handle, shared, _purged) = start(&h);
+        let (handle, shared, _purged, _pool) = start(&h);
         apply(&handle, spec(&["a", "b"])).await;
         let mut rx = handle.status.clone();
         wait(&mut rx, |r| r.status.observed_generation == 1).await;
@@ -607,7 +690,7 @@ mod tests {
     #[tokio::test]
     async fn down_settles_then_purge_removes_everything_and_ends_the_task() {
         let h = Harness::new(Duration::from_secs(3600));
-        let (handle, shared, mut purged) = start(&h);
+        let (handle, shared, mut purged, _pool) = start(&h);
         apply(&handle, spec(&["a"])).await;
         let mut rx = handle.status.clone();
         wait(&mut rx, |r| r.status.observed_generation == 1).await;
@@ -647,7 +730,7 @@ mod tests {
             backoff_cap_secs: 0,
         };
         let h = Harness::with_policy(Duration::from_millis(50), policy);
-        let (handle, shared, _purged) = start(&h);
+        let (handle, shared, _purged, _pool) = start(&h);
         apply(&handle, spec(&["a"])).await;
         let mut rx = handle.status.clone();
         wait(&mut rx, |r| r.status.observed_generation == 1).await;
@@ -681,7 +764,7 @@ mod tests {
     #[tokio::test]
     async fn a_loaded_record_seeds_the_secret_index_and_reconciles_once() {
         let h = Harness::new(Duration::from_secs(3600));
-        let (shared, _purged) = shared(Metrics::new().unwrap());
+        let (shared, _purged, _pool) = ready_shared();
         let mut record = FleetRecord::new(spec(&["a"]));
         record.generation = 3;
         record.status.generation = 3;
@@ -727,7 +810,7 @@ mod tests {
                 ..AgentStatus::default()
             },
         );
-        let (shared, _purged) = shared(Metrics::new().unwrap());
+        let (shared, _purged, _pool) = ready_shared();
         let handle = spawn(
             "f".parse().unwrap(),
             record,
@@ -769,7 +852,7 @@ mod tests {
             backoff_cap_secs: 0,
         };
         let h = Harness::with_policy(Duration::from_millis(200), policy);
-        let (handle, shared, _purged) = start(&h);
+        let (handle, shared, _purged, _pool) = start(&h);
         apply(&handle, spec(&["a"])).await;
         let mut rx = handle.status.clone();
         wait(&mut rx, |r| r.status.observed_generation == 1).await;
@@ -829,7 +912,7 @@ mod tests {
     #[tokio::test]
     async fn set_stopped_stops_resumes_and_apply_clears_it() {
         let h = Harness::new(Duration::from_secs(3600));
-        let (handle, _shared, _purged) = start(&h);
+        let (handle, _shared, _purged, _pool) = start(&h);
         apply(&handle, spec(&["a", "b"])).await;
         let mut rx = handle.status.clone();
         wait(&mut rx, |r| r.status.observed_generation == 1).await;
@@ -869,6 +952,148 @@ mod tests {
                 .filter(|c| *c == "ensure_agent f/c/b")
                 .count()
                 >= 2
+        );
+    }
+
+    /// A fleet created by a fresh `POST` gets its first pass from its
+    /// `Apply` and never before it: that is what `initial_pass = false`
+    /// buys, and callers rely on it — `Daemon::apply` spawns the actor with
+    /// a record the `Apply` is about to replace.
+    ///
+    /// The readiness channel is the trap. `Shared` is cloned into every
+    /// actor and a `watch::Receiver` clone keeps the *original's* seen
+    /// version, which nothing in the daemon ever advances. An actor spawned
+    /// once the pool is already `Ready` — the normal case after startup,
+    /// and what `start_with_pool` reproduces by sending before it spawns —
+    /// therefore reads that as an unseen change, wakes on it and runs a
+    /// pass nobody asked for.
+    ///
+    /// Nothing is sent to this actor, and its resync is an hour: a
+    /// readiness wake is the only branch of its select that can be ready,
+    /// so the window below cannot fail spuriously. It can only be slow.
+    #[tokio::test]
+    async fn a_new_fleet_runs_no_pass_before_its_first_apply() {
+        let h = Harness::new(Duration::from_secs(3600));
+        let (handle, _shared, _purged, _pool) = start_with_pool(&h, SystemPoolState::Ready);
+        let mut rx = handle.status.clone();
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), rx.changed())
+                .await
+                .is_err(),
+            "the actor published a snapshot before it was asked to do anything"
+        );
+        assert!(
+            h.runner.calls().is_empty(),
+            "no pass may have run yet — every pass observes: {:?}",
+            h.runner.calls()
+        );
+        assert!(
+            h.materializer.calls().is_empty(),
+            "nor may anything have been materialized: {:?}",
+            h.materializer.calls()
+        );
+
+        // And the `Apply` is the first pass, over the spec it carries.
+        apply(&handle, spec(&["a"])).await;
+        wait(&mut rx, |r| r.status.observed_generation == 1).await;
+        assert!(h.runner.calls().contains(&"ensure_agent f/c/a".to_string()));
+    }
+
+    /// Spec F §5: the daemon pool is a precondition the fleet cannot
+    /// influence, so an unready pool skips the pass rather than failing it.
+    #[tokio::test]
+    async fn a_pass_is_skipped_while_the_system_pool_is_not_ready() {
+        let h = Harness::new(Duration::from_secs(3600));
+        let (handle, shared, _purged, _pool) = start_with_pool(&h, SystemPoolState::Pending);
+        let applied = apply(&handle, spec(&["a"])).await;
+        after_pass(&handle).await;
+
+        assert!(
+            h.materializer.calls().is_empty(),
+            "an unready pool must stop the pass before it materializes anything: {:?}",
+            h.materializer.calls()
+        );
+        assert!(
+            h.runner.calls().is_empty(),
+            "nor may it reach the runner: {:?}",
+            h.runner.calls()
+        );
+        // A skipped pass is not a failed pass: no crew failed, no counter
+        // moved. Reusing the failure path here would move restart counters
+        // for a daemon-level condition.
+        assert_eq!(
+            handle.status.borrow().status,
+            applied.status,
+            "a skipped pass leaves status exactly as the apply left it"
+        );
+        let encoded = shared.metrics.encode();
+        assert!(
+            !encoded.contains("hecaton_reconcile_errors_total{fleet=\"f\"}"),
+            "a skip is not an error: {encoded}"
+        );
+        assert!(
+            !encoded.contains("hecaton_reconcile_duration_seconds_count{fleet=\"f\"}"),
+            "a skipped pass is not observed as a pass: {encoded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pass_runs_once_the_system_pool_is_ready() {
+        let h = Harness::new(Duration::from_secs(3600));
+        let (handle, _shared, _purged, _pool) = start_with_pool(&h, SystemPoolState::Ready);
+        apply(&handle, spec(&["a"])).await;
+        let mut rx = handle.status.clone();
+        wait(&mut rx, |r| r.status.observed_generation == 1).await;
+        assert!(
+            !h.materializer.calls().is_empty(),
+            "a ready pool lets the pass run"
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_is_re_read_every_pass_not_latched() {
+        let h = Harness::new(Duration::from_secs(3600));
+        let (handle, _shared, _purged, pool) = start_with_pool(&h, SystemPoolState::Ready);
+        apply(&handle, spec(&["a"])).await;
+        let mut rx = handle.status.clone();
+        wait(&mut rx, |r| r.status.observed_generation == 1).await;
+        let after_first = h.materializer.calls().len();
+        assert!(after_first > 0);
+
+        pool.send(SystemPoolState::Unready {
+            reason: "gone".to_string(),
+        })
+        .unwrap();
+        apply(&handle, spec(&["a", "b"])).await;
+        after_pass(&handle).await;
+        assert_eq!(
+            h.materializer.calls().len(),
+            after_first,
+            "readiness is live: a pool that goes away must stop later passes too (F-4)"
+        );
+    }
+
+    /// The gate's second rule: a skipped pass waits on whichever comes
+    /// first, readiness or the tick. The resync here is an hour, so only
+    /// the readiness change can make this pass run.
+    #[tokio::test]
+    async fn a_pool_that_becomes_ready_wakes_a_waiting_fleet_before_the_next_tick() {
+        let h = Harness::new(Duration::from_secs(3600));
+        let (handle, _shared, _purged, pool) = start_with_pool(&h, SystemPoolState::Pending);
+        apply(&handle, spec(&["a"])).await;
+        after_pass(&handle).await;
+        assert!(
+            h.materializer.calls().is_empty(),
+            "the pool is not ready yet"
+        );
+
+        pool.send(SystemPoolState::Ready).unwrap();
+        let mut rx = handle.status.clone();
+        wait(&mut rx, |r| r.status.observed_generation == 1).await;
+        assert!(
+            !h.materializer.calls().is_empty(),
+            "readiness alone must wake the fleet"
         );
     }
 }

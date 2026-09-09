@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -55,6 +55,7 @@ pub(crate) struct Cmd {
     cwd: Option<PathBuf>,
     log: Option<PathBuf>,
     log_stdout: bool,
+    timeout: Option<std::time::Duration>,
 }
 
 #[derive(Debug)]
@@ -92,6 +93,7 @@ impl Cmd {
             cwd: None,
             log: None,
             log_stdout: true,
+            timeout: None,
         }
     }
     pub(crate) fn args<I: IntoIterator<Item = S>, S: Into<String>>(mut self, a: I) -> Self {
@@ -133,6 +135,13 @@ impl Cmd {
     pub(crate) fn log_argv_only(mut self, file: &Path) -> Self {
         self.log = Some(file.to_path_buf());
         self.log_stdout = false;
+        self
+    }
+    /// Kills the child and fails if it outlives `d`. Only the daemon pool
+    /// install sets this today (Spec F §6); every other call is unbounded as
+    /// before.
+    pub(crate) fn timeout(mut self, d: std::time::Duration) -> Self {
+        self.timeout = Some(d);
         self
     }
     pub(crate) fn tool(&self) -> String {
@@ -200,7 +209,62 @@ impl Cmd {
         let cannot_execute =
             |e: std::io::Error| failure(format!("cannot execute {}: {e}", self.program.display()));
         let out = match stdin {
-            None => c.output().map_err(cannot_execute)?,
+            None => match self.timeout {
+                None => c.output().map_err(cannot_execute)?,
+                Some(d) => {
+                    let mut child = c
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .map_err(cannot_execute)?;
+                    // Only the pipe handles move to the drain threads; the
+                    // parent keeps the `Child` so it can poll and, on
+                    // expiry, kill it directly (safe: no PATH lookup, no
+                    // `unsafe`). Draining stdout and stderr on their own
+                    // threads is what keeps a chatty child from filling a
+                    // pipe buffer and deadlocking us while we poll.
+                    let (mut stdout_pipe, mut stderr_pipe) =
+                        match (child.stdout.take(), child.stderr.take()) {
+                            (Some(o), Some(e)) => (o, e),
+                            _ => {
+                                return Err(failure(
+                                    "cannot capture output: stdout/stderr pipe missing after spawn"
+                                        .to_string(),
+                                ));
+                            }
+                        };
+                    let stdout_thread = std::thread::spawn(move || {
+                        let mut buf = Vec::new();
+                        let _ = stdout_pipe.read_to_end(&mut buf);
+                        buf
+                    });
+                    let stderr_thread = std::thread::spawn(move || {
+                        let mut buf = Vec::new();
+                        let _ = stderr_pipe.read_to_end(&mut buf);
+                        buf
+                    });
+                    let deadline = std::time::Instant::now() + d;
+                    let status = loop {
+                        match child.try_wait().map_err(cannot_execute)? {
+                            Some(status) => break Some(status),
+                            None if std::time::Instant::now() >= deadline => break None,
+                            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+                        }
+                    };
+                    match status {
+                        Some(status) => std::process::Output {
+                            status,
+                            stdout: stdout_thread.join().unwrap_or_default(),
+                            stderr: stderr_thread.join().unwrap_or_default(),
+                        },
+                        None => {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            return Err(failure(format!("timed out after {}s", d.as_secs())));
+                        }
+                    }
+                }
+            },
             Some(input) => {
                 let mut child = c
                     .stdin(Stdio::piped())
@@ -362,5 +426,84 @@ mod tests {
             .run()
             .unwrap_err();
         assert!(err.stderr.starts_with("cannot execute /nonexistent/tool"));
+    }
+
+    #[test]
+    fn a_timeout_kills_a_hung_child_and_reports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("logs").join("sleep.log");
+        let pidfile = dir.path().join("pid");
+        let start = std::time::Instant::now();
+        let err = Cmd::new(Path::new("/bin/sh"))
+            .args(["-c", &format!("echo $$ > {}; sleep 30", pidfile.display())])
+            .log(&log)
+            .timeout(std::time::Duration::from_millis(300))
+            .run()
+            .expect_err("a 30s sleep under a 300ms timeout must fail");
+        assert!(
+            err.stderr.contains("timed out"),
+            "expected a timeout message, got {:?}",
+            err.stderr
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "the timeout must not wait out the child"
+        );
+
+        // The assertions above only check what `Cmd` *reports*; they still
+        // pass if `child.kill()` is deleted. Prove the child process itself
+        // is actually dead, not just that we stopped waiting on it
+        // (commit 87f7309 fixed exactly this gap). Linux-only (`/proc`) is
+        // fine: this crate is already Landlock-bound.
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap_or_else(|e| panic!("child never wrote its pid to {pidfile:?}: {e}"))
+            .trim()
+            .parse()
+            .expect("pidfile did not contain a pid");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            // A killed child that `Cmd` has also `wait()`-ed on (which it
+            // does right after `kill()`) is fully reaped: no `/proc` entry
+            // at all, not even a zombie. Checking for the directory's
+            // absence — rather than, say, just not erroring on a read — is
+            // what actually distinguishes "killed and reaped" from "still
+            // running" or "zombie, not yet reaped".
+            if !Path::new(&format!("/proc/{pid}")).exists() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "pid {pid} is still present under /proc 5s after the timeout should have killed it"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_chatty_child_does_not_deadlock_under_a_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("logs").join("chatty.log");
+        // Far more than a pipe buffer (64 KiB on Linux): a implementation
+        // that polls without draining the pipes hangs here forever.
+        let out = Cmd::new(Path::new("/bin/sh"))
+            .args(["-c", "yes hecaton | head -c 400000"])
+            .log(&log)
+            .timeout(std::time::Duration::from_secs(30))
+            .run()
+            .expect("a fast chatty child must succeed well inside its timeout");
+        assert!(out.stdout.len() >= 400_000, "stdout was truncated");
+    }
+
+    #[test]
+    fn without_a_timeout_a_command_still_runs_to_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("logs").join("plain.log");
+        let out = Cmd::new(Path::new("/bin/sh"))
+            .args(["-c", "echo ok"])
+            .log(&log)
+            .run()
+            .expect("no timeout set: unchanged behaviour");
+        assert_eq!(out.stdout.trim(), "ok");
     }
 }

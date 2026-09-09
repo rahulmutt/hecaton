@@ -21,7 +21,7 @@ pub mod workspace;
 pub use env::agent_env;
 pub use home::{HOOK_EVENTS, HomeInputs, write_home};
 pub use launch::{hooks_port, render_launch, wants_continue};
-pub use layout::{AgentPaths, CrewPaths, PluginPaths, StateLayout};
+pub use layout::{AgentPaths, CrewPaths, FleetPaths, PluginPaths, StateLayout, shared_list};
 pub use materializer::{RenderOptions, RenderOutcome, Runtime};
 pub use plugin::{
     install_plugin_tools, plugin_env, plugin_grants, render_plugin_launch, write_plugin_home,
@@ -32,6 +32,9 @@ pub use sandbox::{
     validate_profile_at, write_profile, write_profile_at,
 };
 pub use tmux::{ANCHOR_WINDOW, ATTACH_SESSION_PREFIX, TmuxAttach, TmuxRunner};
-pub use toolchain::{Toolchain, embedded_system_tools, mise_env, render_mise_toml, system_tools};
+pub use toolchain::{
+    Toolchain, embedded_system_tools, level_env, mise_env, render_level_toml, render_mise_toml,
+    system_tools,
+};
 pub use tools::{MissingTool, ToolPaths};
 pub use workspace::Workspace;
