@@ -803,11 +803,17 @@ impl Harness {
     ) -> (String, tokio::task::JoinHandle<Result<(), SdkError>>) {
         let (listener, listen) = bind().await.unwrap_or_else(|e| panic!("Harness bind: {e}"));
         let plugin = Arc::new(plugin);
+        let served = plugin.clone();
         let token = token.to_string();
-        let server = tokio::spawn(async move { run(listener, plugin, &token).await });
-        host.hello("test", &listen)
+        let server = tokio::spawn(async move { run(listener, served, &token).await });
+        let reply = host
+            .hello("test", &listen)
             .await
             .unwrap_or_else(|e| panic!("Harness hello: {e}"));
+        plugin
+            .configure(reply.config)
+            .await
+            .unwrap_or_else(|e| panic!("Harness configure: {e}"));
         (listen, server)
     }
 
