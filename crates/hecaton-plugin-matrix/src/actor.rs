@@ -165,6 +165,15 @@ mod tests {
             let q = q.clone();
             tokio::spawn(async move { q.pop().await })
         };
+        // Hand control to the scheduler so the popper actually runs, finds
+        // the queue empty, and parks on `notified()` before the push below
+        // exercises the wake path.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            q.len(),
+            0,
+            "the popper should have found nothing and parked"
+        );
         q.push(deactivate("f/c/a"));
         assert_eq!(popper.await.unwrap(), deactivate("f/c/a"));
 
