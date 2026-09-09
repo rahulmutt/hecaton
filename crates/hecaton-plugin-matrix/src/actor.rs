@@ -755,13 +755,64 @@ mod tests {
         a.handle(Command::Configure(daemon_config())).await;
         a.handle(Command::Activate {
             agent: "f/c/alice".into(),
+            config: agent_config(&["Notification"]),
+        })
+        .await;
+        // The room and the thread root have to exist first, or the call the
+        // rate limit lands on would be `create_room`, not a send.
+        a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
+            .await;
+        port.take_calls();
+
+        port.fail_next(crate::matrix::MatrixError::RateLimited { retry_after_ms: 1 });
+        a.handle(Command::Events(vec![during(
+            "f/c/alice",
+            "s1",
+            "Notification",
+            json!({ "message": "needs permission" }),
+        )]))
+        .await;
+
+        let calls = port.take_calls();
+        assert!(
+            calls.iter().all(|c| matches!(c, Call::Send { .. })),
+            "the rate limit landed on a send, not a room creation: {calls:?}"
+        );
+        let s = sends(&calls);
+        assert_eq!(s.len(), 1, "the retry got through");
+        assert!(s[0].0.is_some(), "and it is still the thread reply");
+        assert!(s[0].1.contains("needs permission"), "{}", s[0].1);
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_room_creation_is_retried_once() {
+        let (_fake, port, mut a) = actor().await;
+        a.handle(Command::Configure(daemon_config())).await;
+        a.handle(Command::Activate {
+            agent: "f/c/alice".into(),
             config: agent_config(&[]),
         })
         .await;
+        // Nothing has been posted yet, so the first port call — and the one
+        // the rate limit lands on — is the room creation.
         port.fail_next(crate::matrix::MatrixError::RateLimited { retry_after_ms: 1 });
         a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
             .await;
-        assert_eq!(sends(&port.calls()).len(), 1, "the retry got through");
+
+        let calls = port.calls();
+        assert!(
+            matches!(calls.first(), Some(Call::CreateRoom { .. })),
+            "the retry created the room: {calls:?}"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| matches!(c, Call::CreateRoom { .. }))
+                .count(),
+            1,
+            "and only one room came of it"
+        );
+        assert_eq!(sends(&calls).len(), 1, "the thread root follows it");
     }
 
     #[tokio::test]
