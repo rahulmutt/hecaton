@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -214,25 +214,54 @@ impl Cmd {
             None => match self.timeout {
                 None => c.output().map_err(cannot_execute)?,
                 Some(d) => {
-                    let child = c
+                    let mut child = c
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped())
                         .spawn()
                         .map_err(cannot_execute)?;
-                    let pid = child.id();
-                    // `wait_with_output` drains both pipes; doing it on its
-                    // own thread is what keeps a chatty child from filling a
-                    // pipe buffer and deadlocking us while we wait.
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    std::thread::spawn(move || {
-                        let _ = tx.send(child.wait_with_output());
+                    // Only the pipe handles move to the drain threads; the
+                    // parent keeps the `Child` so it can poll and, on
+                    // expiry, kill it directly (safe: no PATH lookup, no
+                    // `unsafe`). Draining stdout and stderr on their own
+                    // threads is what keeps a chatty child from filling a
+                    // pipe buffer and deadlocking us while we poll.
+                    let (mut stdout_pipe, mut stderr_pipe) =
+                        match (child.stdout.take(), child.stderr.take()) {
+                            (Some(o), Some(e)) => (o, e),
+                            _ => {
+                                return Err(failure(
+                                    "cannot capture output: stdout/stderr pipe missing after spawn"
+                                        .to_string(),
+                                ));
+                            }
+                        };
+                    let stdout_thread = std::thread::spawn(move || {
+                        let mut buf = Vec::new();
+                        let _ = stdout_pipe.read_to_end(&mut buf);
+                        buf
                     });
-                    match rx.recv_timeout(d) {
-                        Ok(out) => out.map_err(cannot_execute)?,
-                        Err(_) => {
-                            // The reader thread owns the child, so kill by
-                            // pid and let it observe the exit and finish.
-                            kill_pid(pid);
+                    let stderr_thread = std::thread::spawn(move || {
+                        let mut buf = Vec::new();
+                        let _ = stderr_pipe.read_to_end(&mut buf);
+                        buf
+                    });
+                    let deadline = std::time::Instant::now() + d;
+                    let status = loop {
+                        match child.try_wait().map_err(cannot_execute)? {
+                            Some(status) => break Some(status),
+                            None if std::time::Instant::now() >= deadline => break None,
+                            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+                        }
+                    };
+                    match status {
+                        Some(status) => std::process::Output {
+                            status,
+                            stdout: stdout_thread.join().unwrap_or_default(),
+                            stderr: stderr_thread.join().unwrap_or_default(),
+                        },
+                        None => {
+                            let _ = child.kill();
+                            let _ = child.wait();
                             return Err(failure(format!("timed out after {}s", d.as_secs())));
                         }
                     }
@@ -289,14 +318,6 @@ impl Cmd {
         }
         Ok(CmdOutput { stdout })
     }
-}
-
-/// `kill(1)` rather than a raw signal: the workspace forbids `unsafe`, and the
-/// reader thread owns the `Child`, so `Child::kill` is not reachable here.
-fn kill_pid(pid: u32) {
-    let _ = std::process::Command::new("kill")
-        .args(["-TERM", &pid.to_string()])
-        .status();
 }
 
 #[cfg(test)]
