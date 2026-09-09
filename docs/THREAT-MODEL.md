@@ -54,7 +54,11 @@ phases; the rest exist in code today.
   already download and run anything the sandbox allows — and it reaches no
   other agent: no pool is writable, and one fleet's agents never see
   another fleet's pool.
-- **Two fleets can race installing the system-level mise pool.** `install_level` checks the system marker before writing anything, so the common case (nothing changed) touches no file; when the system table is genuinely stale (a fresh daemon, or the `claude` pin bumped) and two fleets' `ensure_crew` calls overlap — fleet actors run their passes in independent `spawn_blocking` tasks — both may run `mise install` into the daemon pool at once. The loser's crew pass fails with a `MaterializeError::Tool` and retries at the next resync; nothing is corrupted, since both fleets render the identical table and mise's own install is idempotent per version. Spec E §5's concurrency argument covers crews within a fleet and agents within a crew; it is silent on two fleets here rather than contradicted, and a lock file is new machinery the spec never asked for.
+- **A plugin install and the daemon pool actor can still contend.** Plugin
+  installs run `mise install` with the daemon pool as their `MISE_DATA_DIR`
+  and stay outside the `SystemPool` actor (Spec F, F-8). They do not share a
+  config path, so only the install contention applies, not the temp-file
+  collision Spec F removed. The loser retries.
 - **A malicious package is trusted at install time** — `mise trust` + `mise install` run outside the sandbox as the daemon user (`crates/hecaton-runtime/src/plugin.rs::install_plugin_tools`), and the manifest's `sandbox` block may widen the plugin's own grants; the sandbox defends against a plugin compromised at runtime, not against installing a hostile package. Packages are operator-declared and digest-pinned.
 - **Interceptors fail open**: a dead, slow or misbehaving `flow` plugin stops blocking — hook events are allowed and counted, never held. A plugin with `actions` can stop, restart or type into any agent it is active for; with `fleets` it sees every user fleet's resolved spec (never credentials or hook secrets).
 - **A plugin with `attach` has a keyboard into every agent it is active for**, and **anyone holding a browser session can type into every agent web lists** — both are the operator's own choices (`needs` in the manifest, `plugin open` on their own machine); the session dies with the daemon and the cookie never leaves the mount.

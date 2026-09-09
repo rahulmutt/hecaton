@@ -202,6 +202,13 @@ text has newlines.
   `MISE_SHARED_INSTALL_DIRS` (crew, then fleet, then daemon). An agent can
   therefore `mise install` what its worktree declares without touching a
   binary any other agent executes.
+- **The daemon pool has one owner.** The system table is installed by a
+  `SystemPool` actor at daemon start and re-checked each resync tick, not by
+  whichever crew's pass reached it first. Its readiness is a live condition:
+  a fleet pass is skipped, not failed, while the pool is unready, and a pool
+  deleted underneath a running daemon is noticed at the next tick. A failed
+  install is never fatal — the daemon stays up, publishes the reason and
+  retries.
 - **The sandbox pins mise's config walk** (`MISE_CEILING_PATHS` = the agent
   root) so the walk sees the worktree's own `mise.toml` and nothing above
   it. `MISE_AUTO_INSTALL=false` keeps installing an explicit act rather than
