@@ -133,6 +133,21 @@ fn deserialize<T: serde::de::DeserializeOwned>(config: &Value) -> Result<T, Conf
             .next()
             .unwrap_or(&inner)
             .to_string();
+        // `serde_path_to_error` only records a path for a field it visits; a
+        // required field that is simply absent is detected after the map is
+        // done, so the path comes back empty. Serde's own message still
+        // names the field (`missing field `homeserver``), so pull it out of
+        // the message and use it as the path rather than leave the error
+        // pathless.
+        let path = if path.is_empty() {
+            message
+                .strip_prefix("missing field `")
+                .and_then(|rest| rest.strip_suffix('`'))
+                .map(str::to_string)
+                .unwrap_or(path)
+        } else {
+            path
+        };
         ConfigError { path, message }
     })
 }
@@ -235,8 +250,23 @@ mod tests {
         let v = json!({ "userId": "@a:b" });
         assert_eq!(
             parse_daemon(&v).unwrap_err().to_string(),
-            "missing field `homeserver`"
+            "homeserver: missing field `homeserver`"
         );
+    }
+
+    #[test]
+    fn a_missing_required_field_names_itself_in_the_path() {
+        // `serde_path_to_error` never visits an absent field, so it would
+        // otherwise report an empty path; the message names the field
+        // regardless, and that name must become the path so every
+        // `ConfigError` starts with a config path (AGENTS.md).
+        let err = parse_daemon(&json!({ "userId": "@a:b" })).unwrap_err();
+        assert_eq!(err.path, "homeserver");
+        assert_eq!(err.to_string(), "homeserver: missing field `homeserver`");
+
+        let err = parse_daemon(&json!({ "homeserver": "https://example.org" })).unwrap_err();
+        assert_eq!(err.path, "userId");
+        assert_eq!(err.to_string(), "userId: missing field `userId`");
     }
 
     #[test]
