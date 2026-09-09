@@ -581,6 +581,7 @@ pub struct FakeSystemToolchain {
     remaining_failures: Mutex<usize>,
     forever: bool,
     calls: Mutex<usize>,
+    succeed_first: Mutex<usize>,
 }
 
 impl FakeSystemToolchain {
@@ -589,6 +590,7 @@ impl FakeSystemToolchain {
             remaining_failures: Mutex::new(0),
             forever: false,
             calls: Mutex::new(0),
+            succeed_first: Mutex::new(usize::MAX),
         }
     }
     pub fn failing(times: usize) -> Self {
@@ -596,6 +598,7 @@ impl FakeSystemToolchain {
             remaining_failures: Mutex::new(times),
             forever: false,
             calls: Mutex::new(0),
+            succeed_first: Mutex::new(usize::MAX),
         }
     }
     pub fn always_failing() -> Self {
@@ -603,6 +606,17 @@ impl FakeSystemToolchain {
             remaining_failures: Mutex::new(0),
             forever: true,
             calls: Mutex::new(0),
+            succeed_first: Mutex::new(usize::MAX),
+        }
+    }
+    /// Succeeds `ok` times, then fails forever. Drives the "readiness is not
+    /// a latch" test (Spec F, F-4).
+    pub fn ready_then_failing(ok: usize) -> Self {
+        Self {
+            remaining_failures: Mutex::new(0),
+            forever: false,
+            calls: Mutex::new(0),
+            succeed_first: Mutex::new(ok),
         }
     }
     pub fn calls(&self) -> usize {
@@ -613,6 +627,20 @@ impl FakeSystemToolchain {
 impl SystemToolchain for FakeSystemToolchain {
     fn ensure_system_pool(&self) -> Result<(), MaterializeError> {
         *lock(&self.calls) += 1;
+
+        let mut first = lock(&self.succeed_first);
+        if *first > 0 && *first != usize::MAX {
+            *first -= 1;
+            return Ok(());
+        }
+        if *first == 0 {
+            return Err(MaterializeError::Invalid {
+                id: "system".to_string(),
+                message: "fake system pool failure".to_string(),
+            });
+        }
+        drop(first);
+
         let mut left = lock(&self.remaining_failures);
         if self.forever || *left > 0 {
             *left = left.saturating_sub(1);
