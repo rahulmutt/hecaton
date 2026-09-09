@@ -6,7 +6,7 @@ use std::fmt;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolPaths {
@@ -54,6 +54,7 @@ pub(crate) struct Cmd {
     env_removals: Vec<String>,
     cwd: Option<PathBuf>,
     log: Option<PathBuf>,
+    log_stdout: bool,
 }
 
 #[derive(Debug)]
@@ -90,6 +91,7 @@ impl Cmd {
             env_removals: Vec::new(),
             cwd: None,
             log: None,
+            log_stdout: true,
         }
     }
     pub(crate) fn args<I: IntoIterator<Item = S>, S: Into<String>>(mut self, a: I) -> Self {
@@ -120,6 +122,17 @@ impl Cmd {
     /// Append `$ argv`, stdout and stderr to this file after the run.
     pub(crate) fn log(mut self, file: &Path) -> Self {
         self.log = Some(file.to_path_buf());
+        self.log_stdout = true;
+        self
+    }
+    /// `log` without the stdout: `$ argv`, stderr and the exit status
+    /// only. For a command whose output is the payload of a request
+    /// rather than a trace worth keeping — `inspect.rs` runs one
+    /// `diff -U3` per file per page load, and logging those would grow the
+    /// crew's `git.log` by the whole diff on every fetch.
+    pub(crate) fn log_argv_only(mut self, file: &Path) -> Self {
+        self.log = Some(file.to_path_buf());
+        self.log_stdout = false;
         self
     }
     pub(crate) fn tool(&self) -> String {
@@ -151,6 +164,25 @@ impl Cmd {
     }
 
     pub(crate) fn run(&self) -> Result<CmdOutput, CmdFailure> {
+        self.exec(&[0], None)
+    }
+
+    /// `run`, treating any exit code in `accepted` as success: `git diff
+    /// --no-index` exits 1 when the files differ, which is the answer.
+    pub(crate) fn run_with_exit_codes(&self, accepted: &[i32]) -> Result<CmdOutput, CmdFailure> {
+        self.exec(accepted, None)
+    }
+
+    /// `run`, feeding `input` on the child's stdin and closing it: how a
+    /// payload larger than an argv reaches a tool (`tmux load-buffer -`).
+    /// The write is synchronous and the pipe buffer is 64 KiB, so this
+    /// suits a tool that consumes stdin before it writes much of its own
+    /// output — which `load-buffer` does (it writes none).
+    pub(crate) fn run_with_stdin(&self, input: &[u8]) -> Result<CmdOutput, CmdFailure> {
+        self.exec(&[0], Some(input))
+    }
+
+    fn exec(&self, accepted: &[i32], stdin: Option<&[u8]>) -> Result<CmdOutput, CmdFailure> {
         let mut c = Command::new(&self.program);
         c.args(&self.args).envs(&self.env);
         for k in &self.env_removals {
@@ -165,9 +197,34 @@ impl Cmd {
             args: self.args.clone(),
             stderr,
         };
-        let out = c
-            .output()
-            .map_err(|e| failure(format!("cannot execute {}: {e}", self.program.display())))?;
+        let cannot_execute =
+            |e: std::io::Error| failure(format!("cannot execute {}: {e}", self.program.display()));
+        let out = match stdin {
+            None => c.output().map_err(cannot_execute)?,
+            Some(input) => {
+                let mut child = c
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .map_err(cannot_execute)?;
+                // Dropped (and so closed) before the wait: the child sees EOF.
+                let written = match child.stdin.take() {
+                    Some(mut pipe) => pipe.write_all(input),
+                    None => Ok(()),
+                };
+                if let Err(e) = written {
+                    // Do not wait on a child that may never read its input.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(failure(format!(
+                        "cannot write to {}: {e}",
+                        self.program.display()
+                    )));
+                }
+                child.wait_with_output().map_err(cannot_execute)?
+            }
+        };
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         if let Some(log) = &self.log {
@@ -175,16 +232,18 @@ impl Cmd {
                 let _ = std::fs::create_dir_all(dir);
             }
             if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(log) {
+                let logged_stdout = if self.log_stdout { stdout.as_str() } else { "" };
                 let _ = writeln!(
                     f,
-                    "$ {} {}\n{stdout}{stderr}[exit {}]",
+                    "$ {} {}\n{logged_stdout}{stderr}[exit {}]",
                     self.tool(),
                     self.args.join(" "),
                     out.status
                 );
             }
         }
-        if !out.status.success() {
+        let ok = out.status.code().is_some_and(|c| accepted.contains(&c));
+        if !ok {
             return Err(failure(if stderr.trim().is_empty() {
                 format!("exit status {}", out.status)
             } else {
@@ -249,6 +308,40 @@ mod tests {
         assert!(logged.contains("$ sh -c echo out"));
         assert!(logged.contains("err\n"), "stderr is logged even on success");
         assert!(logged.contains("[exit exit status: 3]"));
+    }
+
+    /// `log_argv_only` keeps the command and its exit status (and stderr,
+    /// which a failure needs) but never the stdout: `inspect.rs` logs one
+    /// `diff -U3` per file per page load, and the full diffs would grow
+    /// `git.log` by megabytes a fetch.
+    #[test]
+    fn an_argv_only_log_records_the_command_and_exit_but_no_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("logs").join("git.log");
+        // The marker is upper-cased by the command, so it appears in the
+        // stdout but not in the argv the log does keep.
+        let out = Cmd::new(Path::new("/bin/sh"))
+            .args(["-c", "echo the-diff | tr a-z A-Z; echo loud >&2"])
+            .log_argv_only(&log)
+            .run()
+            .unwrap();
+        assert_eq!(out.stdout, "THE-DIFF\n", "the caller still gets stdout");
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !logged.contains("THE-DIFF"),
+            "stdout must not be logged: {logged:?}"
+        );
+        assert!(logged.contains("$ sh -c echo the-diff | tr a-z A-Z; echo loud >&2"));
+        assert!(logged.contains("loud\n"), "stderr is still logged");
+        assert!(logged.contains("[exit exit status: 0]"));
+    }
+
+    #[test]
+    fn an_accepted_exit_code_is_success_and_keeps_stdout() {
+        let sh = Cmd::new(Path::new("/bin/sh")).args(["-c", "echo out; exit 1"]);
+        assert!(sh.run().is_err());
+        assert_eq!(sh.run_with_exit_codes(&[0, 1]).unwrap().stdout, "out\n");
+        assert!(sh.run_with_exit_codes(&[2]).is_err());
     }
 
     #[test]

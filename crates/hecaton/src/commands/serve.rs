@@ -158,11 +158,13 @@ fn run(
             .await
             .with_context(|| format!("cannot bind {bind}"))?;
         let url = format!("http://{}", listener.local_addr()?);
+        let runtime = Arc::new(Runtime::new(layout.clone(), tools.clone()));
         let ports = Ports {
-            materializer: Arc::new(Runtime::new(layout.clone(), tools.clone())),
+            materializer: runtime.clone(),
             runner: Arc::new(TmuxRunner::new(tools.tmux.clone(), tmux_socket)),
             clock: Arc::new(SystemClock),
             store: Arc::new(store),
+            workspace: runtime,
             policy: ReconcilePolicy::default(),
             hook_url: url.clone(),
             resync: RESYNC,

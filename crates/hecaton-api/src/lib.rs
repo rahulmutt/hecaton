@@ -15,6 +15,7 @@ pub mod record;
 pub mod request;
 pub mod settings;
 pub mod status;
+pub mod workspace;
 
 pub use credentials::CredentialBundle;
 pub use fleet::{CrewSpec, FleetSpec, GitAuth, GitIdentity, GitSettings};
@@ -34,6 +35,10 @@ pub use settings::{AgentSettings, ClaudeSettings, RunnerSettings};
 pub use status::{
     ActivationState, AgentPhase, AgentStatus, FleetPhase, FleetStatus, FleetSummary,
     PluginActivation, SpecHash, Timestamp,
+};
+pub use workspace::{
+    EntryKind, FileDiff, FileStatus, TreeEntry, WORKSPACE_FILE_COUNT_LIMIT, WORKSPACE_FILE_LIMIT,
+    WORKSPACE_PATCH_LIMIT, WorkspaceDiff, WorkspaceTree, WorkspaceVersion, check_path,
 };
 
 #[cfg(test)]

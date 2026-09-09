@@ -9,7 +9,9 @@ use axum::http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use hecaton_api::{Capability, KvKeys, PluginAction};
+use hecaton_api::{
+    Capability, KvKeys, PluginAction, WorkspaceDiff, WorkspaceTree, WorkspaceVersion,
+};
 use hecaton_core::{AgentId, AgentName, FleetName, FleetRecord, is_reserved_fleet};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -36,6 +38,22 @@ pub(crate) fn router() -> Router<AppState> {
         .route(
             "/v1/plugin-host/kv/{*key}",
             get(get_key).put(put_key).delete(delete_key),
+        )
+        .route(
+            "/v1/plugin-host/agents/{fleet}/{crew}/{agent}/workspace/diff",
+            get(workspace_diff),
+        )
+        .route(
+            "/v1/plugin-host/agents/{fleet}/{crew}/{agent}/workspace/file",
+            get(workspace_file),
+        )
+        .route(
+            "/v1/plugin-host/agents/{fleet}/{crew}/{agent}/workspace/tree",
+            get(workspace_tree),
+        )
+        .route(
+            "/v1/plugin-host/agents/{fleet}/{crew}/{agent}/workspace/version",
+            get(workspace_version),
         )
 }
 
@@ -149,6 +167,105 @@ async fn post_action(
         .execute_action(&agent, &action, Some(plugin.as_str()))
         .await?;
     Ok(Json(json!({})))
+}
+
+/// The plugin, active for `agent`, that a workspace route serves (Spec C
+/// §2.2): the `workspace` capability, then the pair.
+async fn workspace_caller(
+    state: &AppState,
+    headers: &HeaderMap,
+    path: Result<Path<(String, String, String)>, PathRejection>,
+) -> Result<AgentId, ApiError> {
+    let plugin = caller(state, headers, Capability::Workspace).await?;
+    let Path((f, c, a)) = path.map_err(|e| ApiError::new(e.status(), e.body_text()))?;
+    let agent: AgentId = format!("{f}/{c}/{a}")
+        .parse()
+        .map_err(|_: hecaton_core::NameError| ApiError::from(DaemonError::NotFound))?;
+    if !state.daemon.registry().is_active(&agent, &plugin) {
+        return Err(PluginError::NotActive(agent.to_string()).into());
+    }
+    Ok(agent)
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct PathQuery {
+    path: String,
+}
+
+fn path_query(q: Result<Query<PathQuery>, QueryRejection>) -> Result<String, ApiError> {
+    q.map(|Query(q)| q.path)
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.body_text()))
+}
+
+async fn workspace_diff(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    path: Result<Path<(String, String, String)>, PathRejection>,
+) -> Result<Json<WorkspaceDiff>, ApiError> {
+    let agent = workspace_caller(&state, &headers, path).await?;
+    let base_ref = state
+        .daemon
+        .base_ref(&agent)
+        .await
+        .ok_or(DaemonError::NotFound)?;
+    let ws = state.daemon.workspace();
+    let id = agent.clone();
+    let diff = tokio::task::spawn_blocking(move || ws.diff(&id, &base_ref))
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    Ok(Json(diff))
+}
+
+async fn workspace_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    path: Result<Path<(String, String, String)>, PathRejection>,
+    q: Result<Query<PathQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let agent = workspace_caller(&state, &headers, path).await?;
+    let rel = path_query(q)?;
+    let ws = state.daemon.workspace();
+    let bytes = tokio::task::spawn_blocking(move || ws.read_file(&agent, &rel))
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    Ok(([(CONTENT_TYPE, "application/octet-stream")], bytes).into_response())
+}
+
+async fn workspace_tree(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    path: Result<Path<(String, String, String)>, PathRejection>,
+    q: Result<Query<PathQuery>, QueryRejection>,
+) -> Result<Json<WorkspaceTree>, ApiError> {
+    let agent = workspace_caller(&state, &headers, path).await?;
+    let rel = path_query(q)?;
+    let ws = state.daemon.workspace();
+    let tree = tokio::task::spawn_blocking(move || ws.list_dir(&agent, &rel))
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    Ok(Json(tree))
+}
+
+/// Spec D §2.2: the worktree's fingerprint against the crew's base, gated
+/// like `diff`.
+async fn workspace_version(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    path: Result<Path<(String, String, String)>, PathRejection>,
+) -> Result<Json<WorkspaceVersion>, ApiError> {
+    let agent = workspace_caller(&state, &headers, path).await?;
+    let base_ref = state
+        .daemon
+        .base_ref(&agent)
+        .await
+        .ok_or(DaemonError::NotFound)?;
+    let ws = state.daemon.workspace();
+    let id = agent.clone();
+    let version = tokio::task::spawn_blocking(move || ws.version(&id, &base_ref))
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    Ok(Json(version))
 }
 
 #[derive(Debug, Default, Deserialize)]

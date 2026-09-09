@@ -11,7 +11,7 @@ use hecaton_api::{CredentialBundle, FleetSpec, Timestamp};
 use hecaton_core::reconcile::{ReconcileContext, agent_ready, reconcile_pass, set_desired};
 use hecaton_core::{
     AgentId, AgentRunner, Clock, Desired, Fleet, FleetName, FleetRecord, FleetSecrets, FleetStore,
-    HookTarget, Keep, Materializer, ReconcilePolicy, ResolvedAgent,
+    HookTarget, Keep, Materializer, ReconcilePolicy, ResolvedAgent, WorkspaceReader,
 };
 use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
@@ -66,6 +66,9 @@ pub struct Ports {
     pub runner: Arc<dyn AgentRunner>,
     pub clock: Arc<dyn Clock>,
     pub store: Arc<dyn FleetStore>,
+    /// Read-only worktree access for the plugin host's workspace routes
+    /// (Spec C §3.1). Not used by the reconciler.
+    pub workspace: Arc<dyn WorkspaceReader>,
     pub policy: ReconcilePolicy,
     /// `http://127.0.0.1:<port>`; every agent's hooks post here.
     pub hook_url: String,

@@ -42,9 +42,9 @@ profile environment (plugins spec §5.1):
 Base `HECATON_API_URL`, path prefix `/v1/plugin-host/`, bearer
 `HECATON_PLUGIN_TOKEN` on every call. Each route beyond `hello` is gated by
 a capability the manifest's `needs` must declare (`fleets`, `actions`,
-`attach`, `kv`); a call outside what is declared is rejected before the
-route runs, 403 `{ "error": "capability \"<cap>\" not declared in
-hecaton-plugin.yaml" }`. No fixture carries this status: `FakeHost` (the
+`attach`, `kv`, `workspace`); a call outside what is declared is rejected
+before the route runs, 403 `{ "error": "capability \"<cap>\" not declared
+in hecaton-plugin.yaml" }`. No fixture carries this status: `FakeHost` (the
 SDK's test double, §6) does not gate capabilities, so it cannot be
 exercised through the SDK conformance test; it is asserted against the real
 daemon by `crates/hecaton-server/tests/events_it.rs` (§6).
@@ -59,6 +59,12 @@ daemon by `crates/hecaton-server/tests/events_it.rs` (§6).
 | `GET fleets/watch` (WebSocket) | `fleets` | — | one text frame per change, each the complete `GET fleets` body | 101 | `fleets-watch.json` (Task 6) |
 | `GET agents/{fleet}/{crew}/{agent}/attach` (WebSocket) | `attach` | — | binary frames are terminal bytes both ways; the one text frame is `{ "resize": { "cols", "rows" } }` | 101 | `attach-resize.json` (Task 6) |
 | `GET agents/…/attach`, agent not active for this plugin | `attach` | — | `{ "error": "plugin is not active for agent <id>" }` | 404 | (as for actions) |
+| `GET agents/{fleet}/{crew}/{agent}/workspace/diff` | `workspace` | — | `WorkspaceDiff` | 200 | `workspace-diff.json` |
+| `GET agents/…/workspace/file?path=<rel>` | `workspace` | — | raw bytes | 200 | `workspace-file.json` |
+| `GET agents/…/workspace/tree?path=<rel>` | `workspace` | — | `{ path, entries }` | 200 | `workspace-tree.json` |
+| `GET agents/…/workspace/version` | `workspace` | — | `{ head, fingerprint }` | 200 | `workspace-version.json` |
+| `GET agents/…/workspace/*`, agent not active for this plugin | `workspace` | — | `{ "error": "plugin is not active for agent <id>" }` | 404 | (as for actions) |
+| `GET agents/…/workspace/*`, no worktree yet | `workspace` | — | `{ "error": "no workspace for agent <id>" }` | 404 | (asserted by `workspace_it.rs`, §6) |
 | `POST agents/{fleet}/{crew}/{agent}/actions` | `actions` | one of the three action shapes below | `{}` | 200 | `action.json` |
 | `POST agents/…/actions`, agent not active for this plugin | `actions` | — | `{ "error": "plugin is not active for agent <id>" }` | 404 | (same status as `fleet-missing.json`; asserted by `events_it.rs`, §6) |
 | `GET kv?prefix=` | `kv` | — | `{ keys }` | 200 | `kv-list.json` |
@@ -98,6 +104,26 @@ refused. The daemon closes with 1000 when the window ends and 1011 on a
 runner failure. Both take the plugin's bearer on the handshake and answer
 the usual 401/403 before upgrading. Because `fleets/watch` sits beside
 `fleets/{name}`, `watch` is not a fleet name: `up` refuses it.
+
+**Workspace** (Spec C §2.2). `diff` is the agent's worktree against the
+merge-base with `origin/<crew ref>`: `{ base_ref, merge_base, head, files,
+truncated }`, each file `{ path, old_path, status, uncommitted, binary,
+patch, truncated }` with `status` one of `added`, `modified`, `deleted`,
+`renamed`, `copied`, `typechange`; untracked files are `added` and
+`uncommitted`; a patch is unified with three lines of context, empty for a
+binary, cut at 256 KiB (`truncated`), and the list stops at 500 files
+(top-level `truncated`). `file` answers the bytes of one regular file, 404
+`no such path`, 400 `not a regular file` (a symlink is never followed),
+413 `file larger than 1 MiB`. `tree` lists one directory (`{ name, kind:
+file|dir|symlink|other, size }`, sorted, `.git` never listed, never
+recursive); the empty path is the root. `path` is relative, `/`-separated,
+at most 4096 bytes, with no empty, `.` or `..` segment, no `\`, no NUL and
+no `.git` segment, else 400 `workspace: invalid path: <reason>`. Two 404
+texts: `no workspace for agent <id>` (no worktree) and `no such path`.
+`version` (Spec D) answers `{ head, fingerprint }`: `head` is the
+worktree's `HEAD`, `fingerprint` 64 hex chars over `HEAD`, the merge-base
+and the size and mtime of every changed or untracked path — equal values
+mean `diff` would answer the same; compare, never parse.
 
 ## 4. Daemon → plugin
 
@@ -209,7 +235,7 @@ never activates simply never runs for that agent.
 
 ## 6. Conformance
 
-`docs/plugin-protocol/*.json` holds eighteen fixtures, one JSON object
+`docs/plugin-protocol/*.json` holds twenty-two fixtures, one JSON object
 each: `{ route, direction, request, status, response }` for
 `daemon-to-plugin` and most `plugin-to-daemon` routes; `raw` (base64)
 replaces `request`/`response` for the kv byte bodies, `health.json` and
@@ -242,7 +268,9 @@ Two statuses no fixture carries because `hecaton_plugin_sdk::testing::FakeHost`
 does not gate capabilities or activation the way the real daemon does — the
 403 capability gate and the 404 `plugin is not active for agent …` on
 `agents/…/actions` (§3) — are asserted against the real daemon by
-`crates/hecaton-server/tests/events_it.rs`.
+`crates/hecaton-server/tests/events_it.rs`, and
+`crates/hecaton-server/tests/workspace_it.rs` the workspace routes' 403,
+404s, 413 and 400.
 
 ## 7. Packaging and distribution
 

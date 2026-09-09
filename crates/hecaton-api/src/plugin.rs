@@ -53,6 +53,7 @@ pub enum Capability {
     Actions,
     Attach,
     Kv,
+    Workspace,
 }
 
 /// `$XDG_CONFIG_HOME/hecaton/plugins.yaml` (plugins spec §2.1). Order is
@@ -179,6 +180,10 @@ mod tests {
             serde_json::to_value(Capability::Kv).unwrap(),
             json!("kv"),
             "capabilities are lowercase on the wire"
+        );
+        assert_eq!(
+            serde_json::from_value::<Capability>(json!("workspace")).unwrap(),
+            Capability::Workspace
         );
     }
 

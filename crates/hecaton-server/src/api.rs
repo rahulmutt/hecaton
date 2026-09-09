@@ -106,6 +106,28 @@ impl From<PluginError> for ApiError {
     }
 }
 
+impl From<hecaton_core::WorkspaceError> for ApiError {
+    fn from(e: hecaton_core::WorkspaceError) -> Self {
+        use hecaton_core::WorkspaceError as W;
+        // An `Io` names a daemon-side path; the plugin gets a fixed line
+        // and the operator the real one in the log, as for kv.
+        if let W::Io { path, message } = &e {
+            tracing::warn!(path = %path.display(), "workspace read error: {message}");
+            return Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "workspace: storage error",
+            );
+        }
+        let status = match &e {
+            W::Missing(_) | W::NoSuchPath => StatusCode::NOT_FOUND,
+            W::InvalidPath(_) | W::NotAFile | W::NotADirectory => StatusCode::BAD_REQUEST,
+            W::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            W::Tool { .. } | W::Filter { .. } | W::Io { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        Self::new(status, e.to_string())
+    }
+}
+
 /// 20 events/s with a burst of 50 per agent (spec §3.5).
 const HOOK_RATE: f64 = 20.0;
 const HOOK_BURST: f64 = 50.0;

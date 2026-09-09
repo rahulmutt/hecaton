@@ -4,7 +4,8 @@
 
 use std::sync::Arc;
 
-use hecaton_plugin_sdk::metrics::{IntCounter, IntGauge};
+use hecaton_api::HookEvent;
+use hecaton_plugin_sdk::metrics::{IntCounter, IntCounterVec, IntGauge};
 use hecaton_plugin_sdk::{Host, Metrics, Plugin, SdkError};
 use serde_json::Value;
 
@@ -17,6 +18,11 @@ pub struct Shared {
     pub cache: Cache,
     pub terminals_open: IntGauge,
     pub terminals_total: IntCounter,
+    pub reviews_total: IntCounterVec,
+    pub review_comments_total: IntCounter,
+    pub events_buffered_total: IntCounter,
+    pub diff_refreshes_total: IntCounter,
+    pub version_failures_total: IntCounter,
 }
 
 pub struct WebPlugin {
@@ -38,12 +44,36 @@ impl WebPlugin {
         let terminals_open = metrics.int_gauge("terminals_open", "Browser terminals open now")?;
         let terminals_total =
             metrics.int_counter("terminals_total", "Browser terminals opened since start")?;
+        let reviews_total = metrics.int_counter_vec(
+            "reviews_total",
+            "Reviews submitted, by outcome",
+            &["outcome"],
+        )?;
+        let review_comments_total =
+            metrics.int_counter("review_comments_total", "Line comments sent in reviews")?;
+        let events_buffered_total = metrics.int_counter(
+            "events_buffered_total",
+            "Hook events appended to an agent's activity buffer",
+        )?;
+        let diff_refreshes_total = metrics.int_counter(
+            "diff_refreshes_total",
+            "diff.json fetches, one per refresh of a review page's diff",
+        )?;
+        let version_failures_total = metrics.int_counter(
+            "version_failures_total",
+            "workspace_version calls that failed during an events.json poll",
+        )?;
         Ok(Self {
             shared: Arc::new(Shared {
                 host,
                 cache: Cache::new(),
                 terminals_open,
                 terminals_total,
+                reviews_total,
+                review_comments_total,
+                events_buffered_total,
+                diff_refreshes_total,
+                version_failures_total,
             }),
             metrics,
         })
@@ -80,6 +110,22 @@ impl Plugin for WebPlugin {
 
     async fn deactivate(&self, agent: &str) {
         self.shared.cache.remove(agent);
+    }
+
+    /// Every observed event of an enabled agent joins its activity buffer
+    /// (Spec C §4.1); events of hidden agents are dropped.
+    async fn observe(&self, events: Vec<HookEvent>) {
+        for e in events {
+            let summary = crate::state::summarize(&e.name, &e.payload);
+            if self
+                .shared
+                .cache
+                .push_event(&e.agent, e.received_at, &e.name, summary, e.payload)
+                .is_some()
+            {
+                self.shared.events_buffered_total.inc();
+            }
+        }
     }
 
     fn metrics(&self) -> Option<&Metrics> {

@@ -1192,6 +1192,37 @@ fn raw_get(url: &str, headers: &[(&str, &str)]) -> (u16, Vec<(String, String)>, 
     (status, headers, text)
 }
 
+/// `POST` with explicit headers and a body, redirects not followed.
+fn raw_post(
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> (u16, Vec<(String, String)>, String) {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .build()
+        .into();
+    let mut req = agent.post(url);
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let mut resp = req.send(body).unwrap();
+    let status = resp.status().as_u16();
+    let headers = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+    let text = resp.body_mut().read_to_string().unwrap();
+    (status, headers, text)
+}
+
+fn body_index_has_review_link(mount: &str, cookie: &str) -> bool {
+    let (_, _, body) = raw_get(mount, &[("Cookie", cookie)]);
+    body.contains("/v1/plugins/web/agents/e2e/c/alice/review\">review</a>")
+}
+
 /// Plugins spec §14 and §18.6, "done when": through a real daemon, nono
 /// and tmux, `plugin open` mints a login URL, the browser's cookie opens
 /// the mount from the daemon's origin only, the index lists alice from
@@ -1440,6 +1471,156 @@ fn web_journey() {
         );
     });
 
+    // the review page's data: alice's worktree through the workspace
+    // routes, a review pasted into her stdin, the divider in her column
+    let (status, _, page) = raw_get(
+        &format!("{mount}agents/e2e/c/alice/review"),
+        &[("Cookie", &cookie)],
+    );
+    assert_eq!(status, 200);
+    assert!(
+        page.contains(r#"const prefix = "/v1/plugins/web""#),
+        "{page}"
+    );
+    assert!(body_index_has_review_link(&mount, &cookie));
+    fs::write(
+        w.agent_dir("alice").join("workspace/NOTES.md"),
+        "agent notes\n",
+    )
+    .unwrap();
+    let (status, _, body) = raw_get(
+        &format!("{mount}agents/e2e/c/alice/diff.json"),
+        &[("Cookie", &cookie)],
+    );
+    assert_eq!(status, 200, "{body}");
+    let diff: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(diff["base_ref"], "origin/main");
+    assert_eq!(diff["head"].as_str().unwrap().len(), 40);
+    let notes = diff["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == "NOTES.md")
+        .unwrap_or_else(|| panic!("NOTES.md in {diff}"));
+    assert_eq!(notes["status"], "added");
+    assert_eq!(notes["uncommitted"], true);
+    assert!(
+        notes["patch"].as_str().unwrap().contains("+agent notes"),
+        "{notes}"
+    );
+    let (status, _, text) = raw_get(
+        &format!("{mount}agents/e2e/c/alice/file?path=NOTES.md"),
+        &[("Cookie", &cookie)],
+    );
+    assert_eq!((status, text.as_str()), (200, "agent notes\n"));
+    let (status, _, text) = raw_get(
+        &format!("{mount}agents/e2e/c/alice/file?path=../home/.claude/settings.json"),
+        &[("Cookie", &cookie)],
+    );
+    assert_eq!(status, 400, "{text}");
+    assert!(text.contains("invalid path"), "{text}");
+    // the column already holds fake-claude's startup events
+    let (status, _, body) = raw_get(
+        &format!("{mount}agents/e2e/c/alice/events.json"),
+        &[("Cookie", &cookie)],
+    );
+    assert_eq!(status, 200, "{body}");
+    let events: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"] == "PreToolUse"),
+        "{events}"
+    );
+    // the version rides on events.json and changes when the worktree does
+    let fp0 = events["workspace"]["fingerprint"]
+        .as_str()
+        .unwrap_or_else(|| panic!("workspace in {events}"))
+        .to_string();
+    assert_eq!(fp0.len(), 64);
+    assert_eq!(events["workspace"]["head"], diff["head"]);
+    fs::write(
+        w.agent_dir("alice").join("workspace/NOTES.md"),
+        "agent notes\nmore\n",
+    )
+    .unwrap();
+    let (_, _, body) = raw_get(
+        &format!("{mount}agents/e2e/c/alice/events.json"),
+        &[("Cookie", &cookie)],
+    );
+    let again: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_ne!(again["workspace"]["fingerprint"], fp0, "{again}");
+    let (_, _, body) = raw_get(
+        &format!("{mount}agents/e2e/c/alice/diff.json"),
+        &[("Cookie", &cookie)],
+    );
+    let diff2: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let notes2 = diff2["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == "NOTES.md")
+        .unwrap();
+    assert!(
+        notes2["patch"].as_str().unwrap().contains("+more"),
+        "{notes2}"
+    );
+    let review = serde_json::json!({
+        "head": diff["head"],
+        "base_ref": diff["base_ref"],
+        "summary": "Looks fine.",
+        "comments": [{ "path": "NOTES.md", "side": "new", "line": 1, "text": "+agent notes",
+                       "body": "Please expand these notes." }]
+    });
+    let (status, _, body) = raw_post(
+        &format!("{mount}agents/e2e/c/alice/review"),
+        &[
+            ("Cookie", &cookie),
+            ("Sec-Fetch-Site", "same-origin"),
+            ("Content-Type", "application/json"),
+        ],
+        review.to_string().as_bytes(),
+    );
+    assert_eq!((status, body.as_str()), (200, "{}"));
+    // the paste is pumped line by line: wait for the last line, not a middle one
+    let stdin = wait_file_until(&w.agent_dir("alice").join("home/fake-claude.stdin"), |s| {
+        s.contains("Looks fine.")
+    });
+    assert!(stdin.contains("Review against origin/main at "), "{stdin}");
+    assert!(
+        stdin.contains("NOTES.md line 1 (new):\n> +agent notes\nPlease expand these notes."),
+        "{stdin}"
+    );
+    assert!(stdin.contains("Overall:\nLooks fine."), "{stdin}");
+    let start = Instant::now();
+    loop {
+        let (_, _, body) = raw_get(
+            &format!("{mount}agents/e2e/c/alice/events.json"),
+            &[("Cookie", &cookie)],
+        );
+        if body.contains("\"review_sent\"") && body.contains("review sent (1 comment)") {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "no divider: {body}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // a cross-origin POST is refused by the daemon, not the plugin
+    let (status, _, _) = raw_post(
+        &format!("{mount}agents/e2e/c/alice/review"),
+        &[
+            ("Cookie", &cookie),
+            ("Origin", "http://evil.example"),
+            ("Content-Type", "application/json"),
+        ],
+        review.to_string().as_bytes(),
+    );
+    assert_eq!(status, 403);
+
     // metrics: the proxy counted, the plugin's gauge rose and fell
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
@@ -1457,6 +1638,8 @@ fn web_journey() {
         if m.contains("hecaton_plugin_proxy_requests_total{plugin=\"web\",status=\"200\"}")
             && m.contains("hecaton_plugin_web_terminals_total 1")
             && m.contains("hecaton_plugin_web_terminals_open 0")
+            && m.contains("hecaton_plugin_web_reviews_total{outcome=\"sent\"} 1")
+            && m.contains("hecaton_plugin_web_diff_refreshes_total 2")
         {
             break;
         }
@@ -1494,6 +1677,11 @@ fn web_journey() {
         .unwrap()
         .to_string();
     assert!(!log.contains(&web_token));
+    // no workspace read went near the agent's home
+    assert!(
+        !log.contains(&w.agent_dir("alice").join("home").display().to_string()),
+        "server.log names the agent's home"
+    );
 
     // down: alice is deactivated and leaves the index; the tmux group is gone
     let out = w.ok(&["down", "e2e", "--keep", "--timeout", "60s"]);

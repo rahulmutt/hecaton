@@ -39,6 +39,11 @@ const IDLE_ARGV: [&str; 3] = ["/bin/sh", "-c", "while :; do sleep 3600; done"];
 pub const ATTACH_SESSION_PREFIX: &str = "hecaton-attach-";
 const ATTACH_TERM: &str = "xterm-256color";
 static ATTACH_SEQ: AtomicU64 = AtomicU64::new(0);
+static SEND_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Above this many bytes a single line is pasted through a buffer like a
+/// multi-line text: tmux refuses a command whose argv exceeds ~16 KiB
+/// (`command too long`), and `send-keys -l` carries the text as argv.
+pub(crate) const SEND_KEYS_LIMIT: usize = 4096;
 
 /// `hecaton-attach-<8 hex>`, unique per process: the clock, a counter and
 /// the pid folded into 32 bits.
@@ -152,6 +157,24 @@ impl TmuxRunner {
             .args(args.iter().copied())
             .run()
             .map(|o| o.stdout)
+            .map_err(|f| RunnerError::Tool {
+                id: id.to_string(),
+                subcommand: f.subcommand,
+                args: f.args,
+                stderr: f.stderr,
+            })
+    }
+
+    /// `run`, with `input` handed to the tmux client on its stdin: the
+    /// client packs a command's argv into a single message and refuses one
+    /// over 16 KiB ("command too long"), so a review-sized text cannot be
+    /// an argument of `set-buffer` and arrives through `load-buffer -`
+    /// instead.
+    fn run_with_stdin(&self, id: &str, args: &[&str], input: &[u8]) -> Result<(), RunnerError> {
+        self.cmd()
+            .args(args.iter().copied())
+            .run_with_stdin(input)
+            .map(|_| ())
             .map_err(|f| RunnerError::Tool {
                 id: id.to_string(),
                 subcommand: f.subcommand,
@@ -438,10 +461,39 @@ impl AgentRunner for TmuxRunner {
         Ok(out)
     }
 
+    /// One short line goes through `send-keys -l`; text with a newline, or
+    /// longer than `SEND_KEYS_LIMIT`, goes through a named buffer and
+    /// `paste-buffer -p` (Spec C §3.3): `-p`
+    /// wraps it in bracketed-paste markers when the application asked for
+    /// them, on which a multi-line paste is expected to arrive as one
+    /// message (verify with `mise run verify-claude`; Spec C §8, pending);
+    /// `-d` deletes the buffer. The buffer is filled by `load-buffer -`
+    /// from the tmux client's stdin, not by `set-buffer -- <text>`: the
+    /// client refuses a command whose packed argv exceeds 16 KiB, and
+    /// Spec C §4.4 allows a review of 64 KiB. Buffer names are unique per
+    /// process so two concurrent sends cannot swap texts; on a failed
+    /// paste (the target window gone, say) the buffer is deleted before
+    /// the error is returned, so failures do not leak buffers.
     fn send_text(&self, agent: &AgentId, text: &str, submit: bool) -> Result<(), RunnerError> {
         let id = agent.to_string();
         let target = Self::window_target(agent);
-        self.run(&id, &["send-keys", "-t", &target, "-l", "--", text])?;
+        if text.contains('\n') || text.len() > SEND_KEYS_LIMIT {
+            let buffer = format!(
+                "hecaton-send-{}-{}",
+                std::process::id(),
+                SEND_SEQ.fetch_add(1, Ordering::Relaxed)
+            );
+            self.run_with_stdin(&id, &["load-buffer", "-b", &buffer, "-"], text.as_bytes())?;
+            if let Err(err) = self.run(
+                &id,
+                &["paste-buffer", "-p", "-d", "-b", &buffer, "-t", &target],
+            ) {
+                let _ = self.run(&id, &["delete-buffer", "-b", &buffer]);
+                return Err(err);
+            }
+        } else {
+            self.run(&id, &["send-keys", "-t", &target, "-l", "--", text])?;
+        }
         if submit {
             self.run(&id, &["send-keys", "-t", &target, "Enter"])?;
         }

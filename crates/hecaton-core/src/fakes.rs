@@ -7,14 +7,18 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use hecaton_api::{CredentialBundle, GitSettings, Timestamp};
+use hecaton_api::{
+    CredentialBundle, EntryKind, GitSettings, Timestamp, TreeEntry, WORKSPACE_FILE_LIMIT,
+    WorkspaceDiff, WorkspaceTree, WorkspaceVersion, check_path,
+};
+use sha2::{Digest, Sha256};
 
 use crate::agent::{CrewRef, ResolvedAgent};
 use crate::name::{AgentId, AgentName, FleetName};
 use crate::plugin::ResolvedPlugin;
 use crate::ports::{
     AgentRunner, Clock, HookTarget, Keep, LaunchPlan, MaterializeError, Materializer,
-    ObservedState, ProcessState, PtyStream, RunnerError,
+    ObservedState, ProcessState, PtyStream, RunnerError, WorkspaceError, WorkspaceReader,
 };
 use crate::repo::RepoRef;
 
@@ -397,6 +401,144 @@ impl AgentRunner for FakeRunner {
     }
 }
 
+struct FakeTree {
+    diff: WorkspaceDiff,
+    files: BTreeMap<String, Vec<u8>>,
+}
+
+/// An in-memory `WorkspaceReader`: per agent, the diff to answer and a
+/// flat map of relative path → bytes from which `read_file` and
+/// `list_dir` answer. An agent never `set` has no workspace.
+#[derive(Default)]
+pub struct FakeWorkspace {
+    rec: Mutex<Recorder>,
+    agents: Mutex<BTreeMap<String, FakeTree>>,
+}
+
+impl FakeWorkspace {
+    pub fn set(&self, agent: &AgentId, diff: WorkspaceDiff, files: BTreeMap<String, Vec<u8>>) {
+        lock(&self.agents).insert(agent.to_string(), FakeTree { diff, files });
+    }
+    pub fn calls(&self) -> Vec<String> {
+        lock(&self.rec).calls.clone()
+    }
+    fn with<T>(
+        &self,
+        agent: &AgentId,
+        f: impl FnOnce(&FakeTree) -> Result<T, WorkspaceError>,
+    ) -> Result<T, WorkspaceError> {
+        let agents = lock(&self.agents);
+        match agents.get(&agent.to_string()) {
+            Some(tree) => f(tree),
+            None => Err(WorkspaceError::Missing(agent.to_string())),
+        }
+    }
+}
+
+/// The entries directly under `path` in a flat path map; `None` when
+/// nothing lives there.
+fn tree_of(files: &BTreeMap<String, Vec<u8>>, path: &str) -> Option<WorkspaceTree> {
+    let prefix = if path.is_empty() {
+        String::new()
+    } else {
+        format!("{path}/")
+    };
+    let mut entries: BTreeMap<String, TreeEntry> = BTreeMap::new();
+    for (key, bytes) in files {
+        let Some(rest) = key.strip_prefix(&prefix) else {
+            continue;
+        };
+        match rest.split_once('/') {
+            Some((dir, _)) => {
+                entries.entry(dir.to_string()).or_insert(TreeEntry {
+                    name: dir.to_string(),
+                    kind: EntryKind::Dir,
+                    size: None,
+                });
+            }
+            None => {
+                entries.insert(
+                    rest.to_string(),
+                    TreeEntry {
+                        name: rest.to_string(),
+                        kind: EntryKind::File,
+                        size: Some(bytes.len() as u64),
+                    },
+                );
+            }
+        }
+    }
+    if entries.is_empty() && !path.is_empty() {
+        return None;
+    }
+    Some(WorkspaceTree {
+        path: path.to_string(),
+        entries: entries.into_values().collect(),
+    })
+}
+
+/// The fakes' fingerprint: `sha256(head \0 (path \0 bytes \0)*)` over the
+/// file map, so a `set` with different bytes changes it. The SDK's
+/// `FakeHost` derives the same value (it may not depend on this crate),
+/// and the `workspace-version.json` fixture holds it for its files.
+pub fn fake_fingerprint(head: &str, files: &BTreeMap<String, Vec<u8>>) -> String {
+    let mut h = Sha256::new();
+    h.update(head.as_bytes());
+    h.update([0]);
+    for (path, bytes) in files {
+        h.update(path.as_bytes());
+        h.update([0]);
+        h.update(bytes);
+        h.update([0]);
+    }
+    hex::encode(h.finalize())
+}
+
+impl WorkspaceReader for FakeWorkspace {
+    fn diff(&self, agent: &AgentId, base_ref: &str) -> Result<WorkspaceDiff, WorkspaceError> {
+        let _ = lock(&self.rec).record("diff", &format!("{agent} {base_ref}"));
+        self.with(agent, |t| {
+            Ok(WorkspaceDiff {
+                base_ref: base_ref.to_string(),
+                ..t.diff.clone()
+            })
+        })
+    }
+    fn read_file(&self, agent: &AgentId, path: &str) -> Result<Vec<u8>, WorkspaceError> {
+        let _ = lock(&self.rec).record("read_file", &format!("{agent} {path}"));
+        check_path(path).map_err(WorkspaceError::InvalidPath)?;
+        self.with(agent, |t| match t.files.get(path) {
+            Some(bytes) if bytes.len() as u64 > WORKSPACE_FILE_LIMIT => {
+                Err(WorkspaceError::TooLarge {
+                    limit: WORKSPACE_FILE_LIMIT,
+                })
+            }
+            Some(bytes) => Ok(bytes.clone()),
+            None if tree_of(&t.files, path).is_some() => Err(WorkspaceError::NotAFile),
+            None => Err(WorkspaceError::NoSuchPath),
+        })
+    }
+    fn list_dir(&self, agent: &AgentId, path: &str) -> Result<WorkspaceTree, WorkspaceError> {
+        let _ = lock(&self.rec).record("list_dir", &format!("{agent} {path}"));
+        check_path(path).map_err(WorkspaceError::InvalidPath)?;
+        self.with(agent, |t| {
+            if t.files.contains_key(path) {
+                return Err(WorkspaceError::NotADirectory);
+            }
+            tree_of(&t.files, path).ok_or(WorkspaceError::NoSuchPath)
+        })
+    }
+    fn version(&self, agent: &AgentId, base_ref: &str) -> Result<WorkspaceVersion, WorkspaceError> {
+        let _ = lock(&self.rec).record("version", &format!("{agent} {base_ref}"));
+        self.with(agent, |t| {
+            Ok(WorkspaceVersion {
+                head: t.diff.head.clone(),
+                fingerprint: fake_fingerprint(&t.diff.head, &t.files),
+            })
+        })
+    }
+}
+
 pub struct FakeClock(Mutex<Timestamp>);
 
 impl FakeClock {
@@ -612,5 +754,143 @@ mod tests {
         assert_eq!(next(&rx), b"", "EOF after drop");
         r.fail_next("attach", "f/c/c", "no window");
         assert!(r.attach(&id("f/c/c")).is_err());
+    }
+
+    #[test]
+    fn the_fake_workspace_answers_from_what_the_test_set() {
+        use hecaton_api::{EntryKind, FileDiff, FileStatus, WorkspaceDiff};
+        let w = FakeWorkspace::default();
+        assert_eq!(
+            w.diff(&id("f/c/a"), "origin/main"),
+            Err(WorkspaceError::Missing("f/c/a".into()))
+        );
+        let diff = WorkspaceDiff {
+            base_ref: String::new(),
+            merge_base: "m".into(),
+            head: "h".into(),
+            files: vec![FileDiff {
+                path: "src/lib.rs".into(),
+                old_path: None,
+                status: FileStatus::Modified,
+                uncommitted: true,
+                binary: false,
+                patch: "p".into(),
+                truncated: false,
+            }],
+            truncated: false,
+        };
+        w.set(
+            &id("f/c/a"),
+            diff.clone(),
+            BTreeMap::from([
+                ("src/lib.rs".to_string(), b"fn a() {}\n".to_vec()),
+                ("src/sub/x.rs".to_string(), b"x".to_vec()),
+                ("README".to_string(), b"hi\n".to_vec()),
+            ]),
+        );
+        let got = w.diff(&id("f/c/a"), "origin/main").unwrap();
+        assert_eq!(got.base_ref, "origin/main", "the base the caller asked for");
+        assert_eq!(got.files, diff.files);
+        assert_eq!(
+            w.read_file(&id("f/c/a"), "src/lib.rs").unwrap(),
+            b"fn a() {}\n".to_vec()
+        );
+        assert_eq!(
+            w.read_file(&id("f/c/a"), "nope"),
+            Err(WorkspaceError::NoSuchPath)
+        );
+        assert_eq!(
+            w.read_file(&id("f/c/a"), "src"),
+            Err(WorkspaceError::NotAFile)
+        );
+        assert_eq!(
+            w.read_file(&id("f/c/a"), "../x"),
+            Err(WorkspaceError::InvalidPath("\"..\" segment".into()))
+        );
+        let big = vec![0u8; (hecaton_api::WORKSPACE_FILE_LIMIT + 1) as usize];
+        w.set(
+            &id("f/c/b"),
+            diff.clone(),
+            BTreeMap::from([("big".to_string(), big)]),
+        );
+        assert_eq!(
+            w.read_file(&id("f/c/b"), "big"),
+            Err(WorkspaceError::TooLarge {
+                limit: hecaton_api::WORKSPACE_FILE_LIMIT
+            })
+        );
+        let root = w.list_dir(&id("f/c/a"), "").unwrap();
+        assert_eq!(root.path, "");
+        let names: Vec<(&str, EntryKind, Option<u64>)> = root
+            .entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.kind, e.size))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("README", EntryKind::File, Some(3)),
+                ("src", EntryKind::Dir, None)
+            ]
+        );
+        let src = w.list_dir(&id("f/c/a"), "src").unwrap();
+        assert_eq!(src.entries.len(), 2);
+        assert_eq!(src.entries[1].name, "sub");
+        assert_eq!(
+            w.list_dir(&id("f/c/a"), "README"),
+            Err(WorkspaceError::NotADirectory)
+        );
+        assert_eq!(
+            w.list_dir(&id("f/c/a"), "nope"),
+            Err(WorkspaceError::NoSuchPath)
+        );
+        assert_eq!(
+            w.list_dir(&id("f/c/z"), ""),
+            Err(WorkspaceError::Missing("f/c/z".into()))
+        );
+        assert!(w.calls().contains(&"diff f/c/a origin/main".to_string()));
+        assert!(
+            w.calls()
+                .contains(&"read_file f/c/a src/lib.rs".to_string())
+        );
+        assert_eq!(
+            WorkspaceError::TooLarge { limit: 1 << 20 }.to_string(),
+            "file larger than 1 MiB"
+        );
+        assert_eq!(
+            WorkspaceError::InvalidPath("absolute".into()).to_string(),
+            "workspace: invalid path: absolute"
+        );
+        assert_eq!(
+            WorkspaceError::Filter {
+                key: "filter.lfs.clean".into()
+            }
+            .to_string(),
+            "repository config sets filter.lfs.clean; workspace diff refused"
+        );
+        let v = w.version(&id("f/c/a"), "origin/main").unwrap();
+        assert_eq!(v.head, "h");
+        assert_eq!(v.fingerprint.len(), 64);
+        assert!(v.fingerprint.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(
+            w.version(&id("f/c/a"), "origin/main").unwrap().fingerprint,
+            v.fingerprint,
+            "stable"
+        );
+        w.set(
+            &id("f/c/a"),
+            diff.clone(),
+            BTreeMap::from([("src/lib.rs".to_string(), b"fn a() {}\nfn b() {}\n".to_vec())]),
+        );
+        assert_ne!(
+            w.version(&id("f/c/a"), "origin/main").unwrap().fingerprint,
+            v.fingerprint,
+            "different bytes, different fingerprint"
+        );
+        assert_eq!(
+            w.version(&id("f/c/z"), "origin/main"),
+            Err(WorkspaceError::Missing("f/c/z".into()))
+        );
+        assert!(w.calls().contains(&"version f/c/a origin/main".to_string()));
     }
 }

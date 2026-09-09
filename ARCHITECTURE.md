@@ -22,8 +22,8 @@ against what was declared.
 - `hecaton-core` — the domain: validated names (`FleetName`, …), `RepoRef`, the
   `Fleet` that `FleetSpec` converts into with `TryFrom`, the pure reconciler
   (`reconcile::plan`/`execute`/`apply`), and the ports adapters implement —
-  `Materializer`, `AgentRunner`, `Clock` today; `FleetStore` and
-  `EventHandler` arrive with the server. Never does I/O, so it tests with
+  `Materializer`, `AgentRunner`, `Clock`, `WorkspaceReader` today; `FleetStore`
+  and `EventHandler` arrive with the server. Never does I/O, so it tests with
   fakes (`hecaton_core::fakes`).
 - `hecaton-config` — YAML → resolved `FleetSpec`. Parses the three-level file,
   deep-merges settings layers as JSON values, types and validates each agent.
@@ -38,7 +38,8 @@ against what was declared.
   adapters; it does the wiring.
 - `hecaton-runtime` — driven adapters over git, gh, mise, nono, tmux. One
   module per materialization step; every path from StateLayout, every binary
-  from ToolPaths; never reads the process environment.
+  from ToolPaths; never reads the process environment. `inspect.rs` reads a
+  worktree for the plugin host's workspace routes.
 - `hecaton-plugin-sdk` — the plugin side of the host protocol; depends on
   `api` only. `Host` (async, one method per route, including
   `Host::attach`/`watch_fleets`), the `Plugin` trait (`Plugin::routes`) and
@@ -52,7 +53,8 @@ against what was declared.
 - `hecaton-plugin-web` — the second in-tree plugin: a per-agent `enabled`
   flag (`config.rs`), a cache fed by `fleets/watch` (`state.rs`), the
   index, terminal page and the bridge to the daemon's attach on a
-  vendored xterm.js (`routes.rs`, `assets/`).
+  vendored xterm.js (`routes.rs`, `assets/`), the review page with the
+  diff, line comments and the agent's hook events (`review.rs`, `state.rs`).
 
 ## How it flows
 **Config (Phase 1):** `read` (file.rs) → `resolve` (resolve.rs): for each agent fold
@@ -130,6 +132,22 @@ with the crew's, in a `portable-pty` PTY — and `fleets/watch` sends the
 whole fleets list on every actor snapshot or activation change. `web`
 lists the agents whose `plugins.web` block enables it, with phases from a
 `fleets/watch`-fed cache, and bridges each browser tab to one attach.
+
+**Workspace reads and review (Spec C):** a plugin declaring `workspace`
+reads an agent's worktree through the daemon — `GET
+/v1/plugin-host/agents/{id}/workspace/{diff,file,tree}`, gated like
+`attach` by the capability and an active pair — and the daemon answers
+through the `WorkspaceReader` port, which the runtime implements over
+`git` in the worktree with the repository's config escape hatches
+closed. The diff is the worktree against the merge-base with
+`origin/<crew ref>`, committed, uncommitted and untracked alike. A
+fourth route, `version`, answers a cheap fingerprint of the worktree
+(Spec D) that the review page polls through `events.json` to refresh
+the diff live. `web` observes every hook event into a per-agent buffer
+and serves a review page: the diff with line comments, a collapsible
+activity column, and a submit that renders one message and sends it
+through `send_text`, which tmux delivers as a bracketed paste when the
+text has newlines.
 
 ## Non-obvious decisions
 - **Merge is a left fold, not associative.** `null` means "delete relative to the
@@ -251,3 +269,15 @@ lists the agents whose `plugins.web` block enables it, with phases from a
   the list differs from the last frame (§18.4).
 - **The web plugin never calls `GET fleets`.** Its index comes from the
   watch-fed cache alone, so a correct index is the watch's test (§18.5).
+- **Git is run by the daemon, never granted to a plugin.** A read-only
+  nono grant on `workspace/` would be fixed at plugin start, would need
+  the crew repo too (a worktree's `.git` is a file pointing there) and
+  would sit beside `home/`; the typed routes keep one audited set of git
+  invocations, in a repository an agent can write to (Spec C PC-1, PC-2).
+- **A review is a paste.** The review reaches the agent as one
+  `send_text`; `TmuxRunner` fills a named buffer with `load-buffer -`
+  from the tmux client's stdin (an argv over 16 KiB is refused, and a
+  review may be 64 KiB) and sends it with `paste-buffer -p`, which Claude
+  Code is expected to take as one message — verify with `mise run
+  verify-claude` (Spec C §8, pending). A literal newline through
+  `send-keys -l` is Ctrl-J to the application (Spec C PC-5).

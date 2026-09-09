@@ -224,6 +224,22 @@ mod tests {
         pid
     }
 
+    /// Polls `pred` every 10 ms for up to 5 s: a spawned `sh` and the
+    /// `sleep` it forks each carry the parent's argv until they exec, so
+    /// a `/proc` scan taken at once may see one pid too many or too few.
+    fn eventually(mut pred: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if pred() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn trailing_pid_reads_the_last_numeric_segment() {
         assert_eq!(trailing_pid("e2e-123"), Some(123));
@@ -329,10 +345,14 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        let found = processes_with_arg_pair("--tmux-socket", &marker);
+        let expected = vec![child.id()];
+        let settled = eventually(|| processes_with_arg_pair("--tmux-socket", &marker) == expected);
         child.kill().unwrap();
         child.wait().unwrap();
-        assert_eq!(found, vec![child.id()]);
+        assert!(
+            settled,
+            "the child (and only the child) carries the marker once it has exec'd"
+        );
         assert!(processes_with_arg_pair("--tmux-socket", "nobody-has-this").is_empty());
     }
 
@@ -351,9 +371,9 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        assert_eq!(
-            processes_with_arg_pair("--tmux-socket", &name),
-            vec![daemon.id()]
+        assert!(
+            eventually(|| processes_with_arg_pair("--tmux-socket", &name) == vec![daemon.id()]),
+            "the daemon is visible once it has exec'd"
         );
 
         let reaped = reap_dead_sessions(Path::new("tmux"), sockets.path(), "hecaton-e2e");

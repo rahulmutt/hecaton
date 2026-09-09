@@ -236,3 +236,45 @@ credentials, hook input, or sandbox rules.
   on `…Key=void 0`; `.gitleaks.toml` keeps the default ruleset and
   allowlists exactly the three vendored files by anchored path. Anything
   else under `assets/` is still scanned.
+- `send_text` with a newline, or longer than 4 KiB, goes through
+  `load-buffer -b <name> -` + `paste-buffer -p -d` (a bracketed paste);
+  shorter single lines go through `send-keys -l`. The text rides in on the
+  tmux client's *stdin*, not in the argv: the client refuses a command
+  whose packed argv is over 16 KiB ("command too long"), and a review may
+  be 64 KiB. The e2e's
+  `fake-claude` records a paste line by line; the real `claude` is expected
+  to arrive as one message — verify with `mise run verify-claude`
+  (Spec C §8, pending).
+- Workspace git calls (`hecaton-runtime/src/inspect.rs`) set
+  `GIT_OPTIONAL_LOCKS=0` and `-c core.fsmonitor=false -c core.hooksPath=<empty>`
+  and pass `--no-ext-diff --no-textconv --no-color --submodule=short
+  --ignore-submodules=dirty` to every `diff`: the crew's `.git/config` is
+  agent-writable, and the last two keep git out of a nested repository the
+  agent committed as a gitlink, whose own config (its `diff.external`) the
+  `-c` overrides reach but the argv flags do not. They also set
+  `GIT_CEILING_DIRECTORIES` to the agent's own root (canonical — git ignores
+  a ceiling that does not match the resolved path), so that deleting the
+  worktree's `.git` file makes git refuse instead of discovering the
+  repository that holds the state root. Keep those when adding a git call
+  there.
+- A workspace `diff` refuses with `repository config sets <key>; workspace
+  diff refused` when the crew's `.git/config` declares a
+  `filter.<x>.<clean|smudge|process>`, or when it sets
+  `extensions.worktreeconfig` (a `config.worktree` file could then hold a
+  filter the check's `--local` read cannot see, so the extension alone is
+  refused; `git sparse-checkout init/set` and `scalar` set it too, so it is
+  not always tampering) — an agent can write that config; the fix is to unset
+  the filter, or `git sparse-checkout disable` where sparse checkout set the
+  extension, rather than unsetting that key by hand.
+  `read_file`/`list_dir` run no git and are unaffected.
+- A workspace route's two 404s differ on purpose: `no workspace for agent`
+  (no worktree yet) and `no such path`; the SDK maps only the second to
+  `None`.
+- The workspace `version` fingerprint covers `HEAD`, the merge-base and the
+  size and mtime of every changed or untracked path — content, not index
+  state: a byte-identical `git add` is invisible by design, and a same-size
+  rewrite within the filesystem's mtime resolution is the theoretical miss.
+  The review page applies a changed diff automatically (3 s rate limit),
+  but never while a comment box is open.
+- `web`'s event buffer is memory only: after a plugin restart the review
+  page's column is empty until new events arrive (no observer catch-up).
