@@ -138,4 +138,31 @@ mod tests {
             "claude checks its own variable before TMPDIR"
         );
     }
+
+    /// Spec E's guarantee is "what the daemon installs is exactly what the
+    /// agent resolves" (toolchain.rs's `mise_env` doc comment). The two
+    /// functions build these two rows identically today, but only by
+    /// construction; nothing pins them together, so a future edit to one
+    /// could drift without either's own tests noticing.
+    #[test]
+    fn mise_env_and_agent_env_agree_on_the_agents_data_dir_and_pool_chain() {
+        let layout = StateLayout::from_env(Path::new("/h"), |_| None);
+        let id: AgentId = "payments/backend/alice".parse().unwrap();
+        let paths = layout.agent(&id);
+        let daemon = crate::toolchain::mise_env(&id, &paths, &layout);
+        let sandbox = agent_env(
+            &id,
+            &paths,
+            &layout,
+            "http://127.0.0.1:7643",
+            "hook-s3",
+            &BTreeMap::new(),
+        );
+        for key in ["MISE_DATA_DIR", "MISE_SHARED_INSTALL_DIRS"] {
+            assert_eq!(
+                daemon[key], sandbox[key],
+                "{key}: the daemon's own install must resolve exactly what the sandbox will"
+            );
+        }
+    }
 }
