@@ -339,7 +339,13 @@ impl<M: MatrixPort> Actor<M> {
                 closed: false,
             };
             if let Err(e) = self.maps.set_thread(&self.host, &event.agent, thread).await {
+                // `Maps` writes the store before memory, so memory still
+                // holds whatever thread this one was replacing. Going on
+                // would re-read *that* root and file this session's
+                // message under the previous session's thread. Dropping
+                // one message beats putting it in the wrong conversation.
                 tracing::warn!("matrix: storing thread for {}: {e}", event.agent);
+                return;
             }
             self.publish_gauges();
             // The root already says the session started.
