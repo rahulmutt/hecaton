@@ -205,8 +205,10 @@ impl PluginHost {
                 name,
                 package: dir,
                 manifest,
-                config: resolve_secrets(entry, &base)
-                    .map_err(|e| entry_error(i, "", e.to_string()))?,
+                config: resolve_secrets(entry, &base).map_err(|e| match e {
+                    PluginError::Config { path, message } => entry_error(i, &path, message),
+                    other => other,
+                })?,
                 digest,
             });
         }
