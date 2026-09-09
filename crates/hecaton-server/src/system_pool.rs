@@ -92,6 +92,42 @@ mod tests {
         }
     }
 
+    /// Generous relative to the 20ms tick these tests use (hundreds of
+    /// ticks), but still small next to nextest's 3-minute slow-test kill —
+    /// a regression fails fast and clearly instead of hanging.
+    const WAIT: Duration = Duration::from_secs(30);
+
+    /// Awaits one `changed()` notification, failing with a clear message
+    /// naming what was expected instead of hanging forever if the actor
+    /// never sends it (e.g. a broken `send_if_modified` comparison or a
+    /// `spawn_blocking` call that never resolves).
+    async fn next_change(rx: &mut watch::Receiver<SystemPoolState>, what: &str) {
+        tokio::time::timeout(WAIT, rx.changed())
+            .await
+            .unwrap_or_else(|_| panic!("timed out after {WAIT:?} waiting for {what}"))
+            .unwrap();
+    }
+
+    /// Awaits `changed()` in a loop until `pred` holds, bounding the whole
+    /// wait — not just one iteration — so a state that oscillates without
+    /// ever reaching the target still fails clearly instead of hanging.
+    async fn wait_until(
+        rx: &mut watch::Receiver<SystemPoolState>,
+        what: &str,
+        pred: impl Fn(&SystemPoolState) -> bool,
+    ) {
+        tokio::time::timeout(WAIT, async {
+            loop {
+                rx.changed().await.unwrap();
+                if pred(&rx.borrow()) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out after {WAIT:?} waiting for {what}"));
+    }
+
     #[tokio::test]
     async fn a_healthy_pool_goes_pending_then_ready_and_stays_ready() {
         let tc = Arc::new(FakeSystemToolchain::ready());
@@ -99,7 +135,7 @@ mod tests {
         assert_eq!(*rx.borrow(), SystemPoolState::Pending);
         let handle = spawn(tc, tx, fast());
 
-        rx.changed().await.unwrap();
+        next_change(&mut rx, "the pool to leave Pending").await;
         assert_eq!(*rx.borrow(), SystemPoolState::Ready);
 
         // Several more ticks must not disturb it.
@@ -114,7 +150,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::watch::channel(SystemPoolState::Pending);
         let handle = spawn(tc.clone(), tx, fast());
 
-        rx.changed().await.unwrap();
+        next_change(&mut rx, "the first state change").await;
         match &*rx.borrow() {
             SystemPoolState::Unready { reason } => {
                 assert!(!reason.is_empty(), "an unready state must carry a reason")
@@ -123,12 +159,10 @@ mod tests {
         }
 
         // It keeps trying and eventually succeeds — no fatal path (F-7).
-        loop {
-            rx.changed().await.unwrap();
-            if *rx.borrow() == SystemPoolState::Ready {
-                break;
-            }
-        }
+        wait_until(&mut rx, "the pool to recover to Ready", |s| {
+            *s == SystemPoolState::Ready
+        })
+        .await;
         assert!(tc.calls() >= 3, "one attempt per tick until it succeeds");
         assert!(!handle.is_finished(), "the actor must not exit on failure");
         handle.abort();
@@ -141,18 +175,14 @@ mod tests {
         let (tx, mut rx) = tokio::sync::watch::channel(SystemPoolState::Pending);
         let handle = spawn(tc, tx, fast());
 
-        loop {
-            rx.changed().await.unwrap();
-            if *rx.borrow() == SystemPoolState::Ready {
-                break;
-            }
-        }
-        loop {
-            rx.changed().await.unwrap();
-            if matches!(*rx.borrow(), SystemPoolState::Unready { .. }) {
-                break;
-            }
-        }
+        wait_until(&mut rx, "the pool to become Ready", |s| {
+            *s == SystemPoolState::Ready
+        })
+        .await;
+        wait_until(&mut rx, "the pool to drop back to Unready", |s| {
+            matches!(s, SystemPoolState::Unready { .. })
+        })
+        .await;
         handle.abort();
     }
 
