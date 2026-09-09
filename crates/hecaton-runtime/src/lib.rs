@@ -32,6 +32,9 @@ pub use sandbox::{
     validate_profile_at, write_profile, write_profile_at,
 };
 pub use tmux::{ANCHOR_WINDOW, ATTACH_SESSION_PREFIX, TmuxAttach, TmuxRunner};
-pub use toolchain::{Toolchain, embedded_system_tools, mise_env, render_mise_toml, system_tools};
+pub use toolchain::{
+    Toolchain, embedded_system_tools, level_env, mise_env, render_level_toml, render_mise_toml,
+    system_tools,
+};
 pub use tools::{MissingTool, ToolPaths};
 pub use workspace::Workspace;
