@@ -176,6 +176,7 @@ pub fn install_command(args: &PluginInstallArgs) -> Result<String> {
             name: manifest.name.clone(),
             source,
             sha256: sha256.clone(),
+            secrets: Default::default(),
             config: serde_json::Value::Object(serde_json::Map::new()),
         },
     )?;
@@ -346,6 +347,7 @@ mod tests {
             name: "web".into(),
             source: "/pkg/web.tar.gz".into(),
             sha256: Some("ab".into()),
+            secrets: Default::default(),
             config: serde_json::json!({}),
         };
         install_entry(&mut file, entry.clone()).unwrap();

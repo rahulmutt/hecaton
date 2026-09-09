@@ -183,6 +183,7 @@ mod tests {
             name: "flow".into(),
             source: "https://x/flow.tar.gz".into(),
             sha256: Some("0".repeat(64)),
+            secrets: Default::default(),
             config: serde_json::json!({}),
         };
         assert_eq!(
@@ -241,6 +242,7 @@ mod tests {
             name: "a".into(),
             source: "./a.tar.gz".into(),
             sha256: Some("0".repeat(64)),
+            secrets: Default::default(),
             config: serde_json::json!({}),
         };
         let e = resolve_source(&entry, dir.path()).unwrap_err().to_string();
