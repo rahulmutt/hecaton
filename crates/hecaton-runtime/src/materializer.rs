@@ -274,7 +274,6 @@ impl Materializer for Runtime {
         tools: CrewTools<'_>,
     ) -> Result<(), MaterializeError> {
         let id = crew.to_string();
-        self.install_pools(crew, tools)?;
         if git.auth == GitAuth::Gh {
             let token = creds.gh_token.as_deref().ok_or_else(|| MaterializeError::Invalid {
                 id: id.clone(),
@@ -282,6 +281,7 @@ impl Materializer for Runtime {
             })?;
             Workspace::write_fleet_gh_config(&self.layout.fleet_gh_dir(&crew.fleet), token, &id)?;
         }
+        self.install_pools(crew, tools)?;
         self.workspace(&crew.fleet, git)
             .ensure_repo(&id, &self.layout.crew(crew), repo, git_ref)
     }
