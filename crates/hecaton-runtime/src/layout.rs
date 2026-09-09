@@ -12,6 +12,15 @@ pub struct StateLayout {
     pub config_root: PathBuf,
 }
 
+/// Where one fleet's own files live. `mise_pool()` holds the tools declared
+/// in the fleet file's top-level `defaults.tools`, shared read-only with
+/// every agent of every crew in the fleet (Spec E §3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetPaths {
+    pub root: PathBuf,
+    pub mise_toml: PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrewPaths {
     pub root: PathBuf,
@@ -46,6 +55,29 @@ pub struct PluginPaths {
     pub profile: PathBuf,
     pub launch: PathBuf,
     pub logs: PathBuf,
+}
+
+impl FleetPaths {
+    /// A complete mise data dir; only `installs/` is exported to children.
+    pub fn mise_pool(&self) -> PathBuf {
+        self.root.join("mise")
+    }
+    /// sha256 of the `mise.toml` this pool was last installed from.
+    pub fn installed_marker(&self) -> PathBuf {
+        self.root.join("mise.installed")
+    }
+}
+
+impl CrewPaths {
+    pub fn mise_toml(&self) -> PathBuf {
+        self.root.join("mise.toml")
+    }
+    pub fn mise_pool(&self) -> PathBuf {
+        self.root.join("mise")
+    }
+    pub fn installed_marker(&self) -> PathBuf {
+        self.root.join("mise.installed")
+    }
 }
 
 impl StateLayout {
@@ -91,6 +123,13 @@ impl StateLayout {
             root,
         }
     }
+    pub fn fleet(&self, f: &FleetName) -> FleetPaths {
+        let root = self.fleet_dir(f);
+        FleetPaths {
+            mise_toml: root.join("mise.toml"),
+            root,
+        }
+    }
     pub fn agent(&self, id: &AgentId) -> AgentPaths {
         let root = self
             .crew(&id.crew_ref())
@@ -128,6 +167,25 @@ impl StateLayout {
             logs: root.join("logs"),
             root,
         }
+    }
+    /// sha256 of the system tool table the daemon pool was installed from.
+    pub fn system_installed_marker(&self) -> PathBuf {
+        self.data_root.join("mise.installed")
+    }
+    /// The read-only pools an agent's mise falls back through, nearest
+    /// first: crew, fleet, daemon.
+    pub fn agent_pools(&self, id: &AgentId) -> Vec<PathBuf> {
+        vec![
+            self.crew(&id.crew_ref()).mise_pool(),
+            self.fleet(&id.fleet).mise_pool(),
+            self.mise_data_dir(),
+        ]
+    }
+    /// `MISE_SHARED_INSTALL_DIRS` for an agent: every pool's `installs/`,
+    /// colon-separated. mise searches its own `MISE_DATA_DIR` first, then
+    /// these in order, and never writes into them.
+    pub fn shared_install_dirs(&self, id: &AgentId) -> String {
+        shared_list(&self.agent_pools(id))
     }
 }
 
@@ -208,6 +266,21 @@ impl AgentPaths {
     pub fn mise_cache_dir(&self) -> PathBuf {
         self.xdg_cache().join("mise")
     }
+    /// The agent's own `MISE_DATA_DIR`: writable, inside `home/`, so an
+    /// agent can `mise install` a tool the fleet never declared without
+    /// touching any shared pool (Spec E, E-2).
+    pub fn mise_data_dir(&self) -> PathBuf {
+        self.xdg_data().join("mise")
+    }
+}
+
+/// Joins pool roots into a `MISE_SHARED_INSTALL_DIRS` value.
+pub fn shared_list(pools: &[PathBuf]) -> String {
+    pools
+        .iter()
+        .map(|p| p.join("installs").display().to_string())
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 #[cfg(test)]
@@ -314,6 +387,71 @@ mod tests {
         assert_eq!(
             p.mise_state_dir(),
             PathBuf::from(format!("{base}/home/.local/state/mise"))
+        );
+    }
+
+    #[test]
+    fn pool_paths_hang_off_their_owner() {
+        let l = StateLayout::from_env(Path::new("/h"), no_env);
+        let fleet = l.fleet(&"payments".parse().unwrap());
+        assert_eq!(
+            fleet.root,
+            PathBuf::from("/h/.local/state/hecaton/fleets/payments")
+        );
+        assert_eq!(
+            fleet.mise_toml,
+            PathBuf::from("/h/.local/state/hecaton/fleets/payments/mise.toml")
+        );
+        assert_eq!(
+            fleet.mise_pool(),
+            PathBuf::from("/h/.local/state/hecaton/fleets/payments/mise")
+        );
+        assert_eq!(
+            fleet.installed_marker(),
+            PathBuf::from("/h/.local/state/hecaton/fleets/payments/mise.installed")
+        );
+
+        let crew = l.crew(&"payments/backend".parse().unwrap());
+        let base = "/h/.local/state/hecaton/fleets/payments/crews/backend";
+        assert_eq!(crew.mise_toml(), PathBuf::from(format!("{base}/mise.toml")));
+        assert_eq!(crew.mise_pool(), PathBuf::from(format!("{base}/mise")));
+        assert_eq!(
+            crew.installed_marker(),
+            PathBuf::from(format!("{base}/mise.installed"))
+        );
+
+        let a = l.agent(&"payments/backend/alice".parse().unwrap());
+        assert_eq!(
+            a.mise_data_dir(),
+            PathBuf::from(format!("{base}/agents/alice/home/.local/share/mise")),
+            "the agent's own installs live inside its writable home"
+        );
+        assert_eq!(
+            l.system_installed_marker(),
+            PathBuf::from("/h/.local/share/hecaton/mise.installed")
+        );
+    }
+
+    #[test]
+    fn agent_pools_run_nearest_first_and_join_into_the_shared_list() {
+        let l = StateLayout::from_env(Path::new("/h"), no_env);
+        let id: AgentId = "payments/backend/alice".parse().unwrap();
+        let state = "/h/.local/state/hecaton/fleets/payments";
+        assert_eq!(
+            l.agent_pools(&id),
+            vec![
+                PathBuf::from(format!("{state}/crews/backend/mise")),
+                PathBuf::from(format!("{state}/mise")),
+                PathBuf::from("/h/.local/share/hecaton/mise"),
+            ],
+            "crew beats fleet beats daemon"
+        );
+        assert_eq!(
+            l.shared_install_dirs(&id),
+            format!(
+                "{state}/crews/backend/mise/installs:{state}/mise/installs:\
+                 /h/.local/share/hecaton/mise/installs"
+            )
         );
     }
 }
