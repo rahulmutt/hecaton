@@ -20,9 +20,9 @@ credentials, hook input, or sandbox rules.
   (`HOME` is overridden, so it never touches your real state).
 - `verify-claude` — the interactive spec §8.1 check with a real `claude`
   (`scripts/verify-claude.sh`); `HECATON_VERIFY_FAKE=1` self-tests it with
-  `dev fake-claude`. Its data root (`target/tmp/verify-data`, the shared
-  `MISE_DATA_DIR`) is kept across runs so claude downloads once per
-  version; config and state under `target/tmp/verify-claude` are wiped.
+  `dev fake-claude`. Its data root (`target/tmp/verify-data`, the daemon
+  pool) is kept across runs so claude downloads once per version; config and
+  state under `target/tmp/verify-claude` are wiped.
 - `lint`, `test`, `fmt`, `precommit`, `audit` — defined in `mise.toml`.
 - `vendor-xterm` is a script, not a task: `scripts/vendor-xterm.sh` re-fetches
   and verifies the web plugin's assets against
