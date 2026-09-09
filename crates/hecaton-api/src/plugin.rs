@@ -130,18 +130,6 @@ fn empty_object() -> Value {
     Value::Object(serde_json::Map::new())
 }
 
-impl Default for PluginEntry {
-    fn default() -> Self {
-        PluginEntry {
-            name: String::default(),
-            source: String::default(),
-            sha256: Option::default(),
-            secrets: BTreeMap::default(),
-            config: empty_object(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
