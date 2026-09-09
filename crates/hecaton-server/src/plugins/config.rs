@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use hecaton_api::{PluginEntry, PluginsFile};
 use hecaton_core::name::validate_name;
+use serde_json::Value;
 
 use super::PluginError;
 
@@ -127,14 +128,157 @@ pub fn resolve_source(entry: &PluginEntry, base: &Path) -> Result<Source, Plugin
     }
 }
 
+/// The entry's `config` with every `secrets` key replaced by the contents
+/// of its file (plugins spec G-7). Paths resolve against the directory
+/// holding `plugins.yaml`, like `source`. Errors name the `secrets.<key>`
+/// path and never the value.
+pub fn resolve_secrets(entry: &PluginEntry, base: &Path) -> Result<Value, PluginError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if entry.secrets.is_empty() {
+        return Ok(entry.config.clone());
+    }
+    let err = |key: &str, message: String| PluginError::Config {
+        path: format!("secrets.{key}"),
+        message,
+    };
+    let mut config = entry.config.clone();
+    let Some(map) = config.as_object_mut() else {
+        return Err(PluginError::Config {
+            path: "secrets".into(),
+            message: "config is not a map".into(),
+        });
+    };
+    for (key, rel) in &entry.secrets {
+        if map.contains_key(key) {
+            return Err(err(key, format!("collides with config.{key}")));
+        }
+        let path = if rel.is_absolute() {
+            rel.clone()
+        } else {
+            base.join(rel)
+        };
+        let meta =
+            std::fs::metadata(&path).map_err(|e| err(key, format!("{}: {e}", path.display())))?;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(err(
+                key,
+                format!(
+                    "{} is mode {mode:04o}, expected no group or other access",
+                    path.display()
+                ),
+            ));
+        }
+        let body = std::fs::read_to_string(&path)
+            .map_err(|e| err(key, format!("{}: {e}", path.display())))?;
+        let body = body.strip_suffix('\n').unwrap_or(&body).to_string();
+        map.insert(key.clone(), Value::String(body));
+    }
+    Ok(config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn write(dir: &Path, text: &str) -> PathBuf {
         let p = dir.join("plugins.yaml");
         std::fs::write(&p, text).unwrap();
         p
+    }
+
+    fn secret_file(dir: &std::path::Path, name: &str, body: &str, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+        p
+    }
+
+    fn entry(config: Value, secrets: &[(&str, &str)]) -> PluginEntry {
+        PluginEntry {
+            name: "matrix".into(),
+            source: "./matrix".into(),
+            sha256: None,
+            secrets: secrets
+                .iter()
+                .map(|(k, v)| (k.to_string(), PathBuf::from(v)))
+                .collect(),
+            config,
+        }
+    }
+
+    #[test]
+    fn a_secret_file_becomes_a_config_value_and_one_trailing_newline_is_trimmed() {
+        let dir = tempfile::tempdir().unwrap();
+        secret_file(dir.path(), "pw", "hunter2\n", 0o600);
+        let e = entry(json!({ "homeserver": "https://h" }), &[("password", "pw")]);
+        let resolved = resolve_secrets(&e, dir.path()).unwrap();
+        assert_eq!(resolved["password"], "hunter2");
+        assert_eq!(resolved["homeserver"], "https://h");
+    }
+
+    #[test]
+    fn a_secret_that_collides_with_a_config_key_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        secret_file(dir.path(), "pw", "hunter2", 0o600);
+        let e = entry(json!({ "password": "inline" }), &[("password", "pw")]);
+        let err = resolve_secrets(&e, dir.path()).unwrap_err();
+        // `PluginError::Config`'s `Display` always leads with `plugins.yaml: `
+        // (see `mod.rs`); every direct assertion on `resolve_secrets`'s
+        // returned error carries that fixed prefix, same as every other
+        // `plugins.yaml`-level error in this file.
+        assert_eq!(
+            err.to_string(),
+            "plugins.yaml: secrets.password: collides with config.password"
+        );
+    }
+
+    #[test]
+    fn a_missing_secret_file_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = entry(json!({}), &[("password", "nope")]);
+        let err = resolve_secrets(&e, dir.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("plugins.yaml: secrets.password: "),
+            "path first: {err}"
+        );
+        assert!(err.to_string().contains("nope"), "names the file: {err}");
+    }
+
+    #[test]
+    fn a_secret_file_readable_by_group_or_other_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        secret_file(dir.path(), "pw", "hunter2", 0o644);
+        let e = entry(json!({}), &[("password", "pw")]);
+        let err = resolve_secrets(&e, dir.path()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "plugins.yaml: secrets.password: {} is mode 0644, expected no group or other access",
+                dir.path().join("pw").display()
+            )
+        );
+        secret_file(dir.path(), "pw", "hunter2", 0o400);
+        assert!(
+            resolve_secrets(&e, dir.path()).is_ok(),
+            "0400 is as acceptable as 0600"
+        );
+    }
+
+    #[test]
+    fn a_non_object_config_with_secrets_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        secret_file(dir.path(), "pw", "hunter2", 0o600);
+        let e = entry(json!([]), &[("password", "pw")]);
+        let err = resolve_secrets(&e, dir.path()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "plugins.yaml: secrets: config is not a map"
+        );
     }
 
     #[test]

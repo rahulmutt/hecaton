@@ -20,7 +20,7 @@ use hecaton_core::{
 use tokio::sync::{Mutex, oneshot, watch};
 
 use super::PluginError;
-use super::config::{load_plugins_file, resolve_source};
+use super::config::{load_plugins_file, resolve_secrets, resolve_source};
 use super::manifest::read_manifest;
 use super::materializer::{NullStore, PluginMaterializer};
 use super::package;
@@ -205,7 +205,8 @@ impl PluginHost {
                 name,
                 package: dir,
                 manifest,
-                config: entry.config.clone(),
+                config: resolve_secrets(entry, &base)
+                    .map_err(|e| entry_error(i, "", e.to_string()))?,
                 digest,
             });
         }
