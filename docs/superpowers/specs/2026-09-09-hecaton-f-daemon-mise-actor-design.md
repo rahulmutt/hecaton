@@ -41,8 +41,8 @@ discipline rather than guarding the violation with a lock.
 | F-3 | The API serves immediately; fleet actors gate on readiness. | Daemon availability must not depend on a download. Gating the passes rather than the listener keeps `hecaton status` usable while the pool fills. |
 | F-4 | Readiness is a **live condition**, re-evaluated at the top of every pass — not a latch. | Fail-closed means no agent runs against a pool that does not match the declared table. A latch reintroduces fail-open: a failed pin bump would silently hand every new agent the old version while the daemon reported itself healthy. A latch also keeps asserting ready over a pool deleted underneath it. |
 | F-5 | Readiness requires the marker to match **and** the pool to exist. | The marker records only what was rendered. Marker present plus pool wiped would otherwise read as ready, which F-4 makes load-bearing. |
-| F-6 | The initial install gets a per-attempt timeout and bounded retries; exhausting them is fatal. | Fail-closed's failure mode is otherwise "wait forever while looking alive". `Cmd::run` has no timeout today, so a stalled install is unbounded. Dying loudly is visible to a supervisor; hanging is not. |
-| F-7 | Mid-flight failure is never fatal. The daemon stays up, drops to unready, and retries each resync tick. | At startup nothing is running yet. Mid-flight, killing a healthy daemon over an edited file would drop live attach sessions and every `fleets/watch` client. Agents in tmux survive either way — the tmux server is a separate process — but the API should not. |
+| F-6 | Every attempt gets a timeout. `Cmd::run` has none today. | Without one the first attempt can hang forever and no retry ever fires — the actor would sit in a single stalled install indefinitely. The timeout exists to guarantee the loop keeps turning, not to bound a countdown to failure. |
+| F-7 | A failed install is **never fatal**, at startup or later. The daemon stays up, publishes unready with the reason, and retries on the next tick. There is no startup/mid-flight distinction. | This is meant to run under Kubernetes, where exiting is the wrong idiom: the kubelet restarts the container and a permanently bad table becomes CrashLoopBackOff, which churns the daemon and reports worse than a pod that stays up and fails its readiness probe. Staying up also keeps the API available to diagnose with, and agents in tmux are untouched either way since the tmux server is a separate process. |
 | F-8 | Plugin installs into the daemon pool are **out of scope** and stay unserialized. | Spec E's E-7 left plugins unchanged deliberately. Routing them through this actor is a larger change touching the plugin subsystem; the narrower residual is documented instead (§8). |
 
 ## 3. The port and what moves
@@ -102,10 +102,10 @@ pub enum SystemPoolState {
 }
 ```
 
-This state is the actor's own and the daemon log's. Exposing it through the
-API — a field on `hecaton status`, say — is deliberately out of scope; the
-reason for an unready pool belongs in the log until something needs to read it
-programmatically.
+This state is the actor's own and the daemon log's. Exposing it through the API
+is out of scope here but has a known future consumer: a Kubernetes readiness
+probe needs exactly this, read over HTTP. When that arrives it should read this
+channel rather than introduce a second notion of readiness (§9).
 
 ## 5. Readiness and the fleet gate
 
@@ -128,7 +128,7 @@ Gating the passes is what makes the live check meaningful. If fleets proceeded
 against a stale pool, re-checking would change nothing and readiness would be a
 latch by another name.
 
-## 6. Timeout, retries and the fatal path
+## 6. Timeout and retries
 
 **Timeout.** `Cmd` gains an optional timeout, set initially only by the system
 install. The implementation must be pipe-safe: today `output()` drains the
@@ -137,32 +137,29 @@ child that fills a pipe buffer. Run `wait_with_output` on its own thread, wait
 on a channel with a deadline, and kill the child by pid on expiry. Dependency
 free, and capture behaviour is unchanged.
 
-**Retries.** Bounded attempts with a short backoff. Retries are already
-idempotent: the marker is written only on success. Defaults, tunable in the
-actor's config: three attempts, backoff 2s then 10s, per-attempt timeout ten
-minutes (a cold `claude` download is slow).
+Default per-attempt timeout: ten minutes, tunable in the actor's config. A cold
+`claude` download is slow, and the timeout only needs to be shorter than
+"forever" for the loop to keep turning.
 
-Those defaults put the worst case before a fatal exit at roughly half an hour,
-with every fleet gated throughout. That is intentional under fail-closed and it
-is bounded and logged, but it is the number to revisit first if startup latency
-ever matters more than the guarantee.
+**Retries are the tick.** One attempt per tick, retried indefinitely; there is
+no separate retry budget and no backoff to tune. Retries are already
+idempotent, since the marker is written only on success. The actor's loop is
+sequential, so an attempt runs to completion or timeout before the next tick is
+considered — attempts never overlap, and a slow attempt simply delays the next
+one rather than stacking.
 
-**Fatal, initial install only.** When the initial attempts are exhausted, the
-actor does **not** call `std::process::exit` — that would skip cleanup and
-truncate logs from a background task. It sends the error on a channel the
-binary's wiring created and merged into the shutdown future `api::serve`
-already accepts. The listener drains gracefully, `run()` returns `Err` with the
-install error, and the process exits non-zero carrying it.
+**Failure is never fatal** (F-7). On any failure, at startup or later: log,
+publish `Unready { reason }`, keep serving, try again next tick. There is no
+fatal channel, `Daemon::start` keeps its signature, and nothing touches the
+shutdown future.
 
-A bad pin in an admin's `mise.toml` fails fast rather than hanging, so its
-retries exhaust in seconds and the daemon dies immediately with the real error.
-A config typo becomes an obvious startup failure instead of a silent stall.
-
-**Mid-flight** is the same call each tick. On failure: log, publish `Unready`
-with the reason, keep serving, retry next tick. Never fatal (F-7). The cost is
-explicit — a mid-flight failure that never recovers pauses reconciliation
-indefinitely — but the daemon is alive and reporting why, and agents already
-running in tmux are untouched.
+The cost is explicit and accepted: a system table that never installs — a
+typo'd pin, a dead network — leaves the daemon running with every fleet pass
+gated and nothing reconciling, indefinitely. That is fail-closed working as
+intended. It is visible in the log rather than silent, the API stays up to
+diagnose with, and agents already running in tmux are untouched. Under
+Kubernetes it is also the correct shape: the pod stays up and fails readiness
+instead of crash-looping.
 
 ## 7. Errors and testing
 
@@ -172,8 +169,11 @@ pool failures keep Spec E's semantics exactly.
 
 **Unit.**
 - The actor's state machine against a fake `SystemToolchain`: succeeds; fails
-  twice then succeeds; always fails. Assert the readiness transitions, the
-  attempt count, and that the fatal signal fires for the initial install only.
+  twice then succeeds; always fails. Assert the readiness transitions, that one
+  attempt runs per tick, and that a persistently failing install keeps the
+  actor retrying and the daemon alive rather than terminating anything.
+- A failure at the very first attempt is treated exactly like a later one —
+  unready plus a reason, then a retry — with no startup special case (F-7).
 - Readiness drops to `Unready` on a mid-flight failure and recovers on a later
   success (F-4) — the test that would have caught the latch.
 - `ensure_system_pool` treats a matching marker with a missing pool as stale
@@ -218,6 +218,11 @@ Closes #43. Closes the system-level half of #45.
 ## 9. Deliberately deferred
 
 - Routing plugin installs through the actor (F-8).
+- A readiness endpoint over HTTP. Wanted for a Kubernetes readiness probe, and
+  the reason this spec keeps `SystemPoolState` in a channel rather than a local
+  variable: the probe should read that channel, not invent a second notion of
+  readiness. Note the probe would report the *pool*, which is only one input to
+  whether the daemon is serving usefully.
 - Applying `Cmd`'s new timeout to any other tool call. The primitive gains the
   capability; only the system install sets it. Widening it is its own decision.
 - Pruning the daemon pool, still, as in Spec E §9.
@@ -231,7 +236,7 @@ Closes #43. Closes the system-level half of #45.
 - Deleting the daemon pool under a running daemon drops it to `Unready` at the
   next tick and it reinstalls, rather than reporting ready over an empty
   directory.
-- An unsatisfiable system table kills the daemon at startup with the install
-  error, and leaves a running daemon alive and unready when it appears
-  mid-flight.
+- An unsatisfiable system table leaves the daemon running and unready with the
+  install error in its log, whether it is present at startup or introduced
+  later, and the actor keeps retrying. Nothing exits.
 - The two documents reflect §3, §6 and §8.
