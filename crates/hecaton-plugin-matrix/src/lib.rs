@@ -2,4 +2,5 @@
 //! session, and a thread reply back to that agent as `send_text`.
 
 pub mod config;
+pub mod matrix;
 pub mod render;
