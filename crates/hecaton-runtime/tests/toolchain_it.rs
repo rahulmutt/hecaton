@@ -173,6 +173,7 @@ fn each_level_installs_into_its_own_pool_and_the_agent_resolves_them_all() {
         &fleet_paths.installed_marker(),
         &fleet_tools,
         &log,
+        None,
     )
     .unwrap();
     tc.install_level(
@@ -184,6 +185,7 @@ fn each_level_installs_into_its_own_pool_and_the_agent_resolves_them_all() {
         &crew_paths.installed_marker(),
         &crew_tools,
         &log,
+        None,
     )
     .unwrap();
 
@@ -268,6 +270,7 @@ fn each_level_installs_into_its_own_pool_and_the_agent_resolves_them_all() {
         &fleet_paths.installed_marker(),
         &fleet_tools,
         &log,
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -350,6 +353,7 @@ fn a_crew_pins_its_own_version_without_disturbing_the_fleets() {
         &crew_paths.installed_marker(),
         &BTreeMap::from([("gitleaks".to_string(), other.clone())]),
         &log,
+        None,
     )
     .unwrap();
 

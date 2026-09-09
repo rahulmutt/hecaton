@@ -140,8 +140,6 @@ impl Cmd {
     /// Kills the child and fails if it outlives `d`. Only the daemon pool
     /// install sets this today (Spec F §6); every other call is unbounded as
     /// before.
-    // Task 3 (Spec F §3) is the first production caller; this comes off then.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn timeout(mut self, d: std::time::Duration) -> Self {
         self.timeout = Some(d);
         self

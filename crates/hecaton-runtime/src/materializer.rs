@@ -6,7 +6,7 @@ use std::time::Duration;
 use hecaton_api::{CredentialBundle, GitAuth, GitSettings};
 use hecaton_core::{
     AgentId, AgentName, CrewRef, CrewTools, HookTarget, Keep, LaunchPlan, MaterializeError,
-    Materializer, RepoRef, ResolvedAgent, ResolvedPlugin,
+    Materializer, RepoRef, ResolvedAgent, ResolvedPlugin, SystemToolchain,
 };
 
 use crate::env::agent_env;
@@ -154,12 +154,12 @@ impl Runtime {
         })
     }
 
-    /// The three daemon-owned pools, outermost first: the system table into
-    /// the daemon pool, the fleet's tools into the fleet pool, this crew's
-    /// into the crew pool. Each is skipped when its marker already matches
-    /// its rendered table, and each resolves through the pools above it, so
-    /// a version an outer pool already holds is never downloaded twice
-    /// (Spec E §5).
+    /// The two fleet-owned pools, outermost first: the fleet's tools into
+    /// the fleet pool, this crew's into the crew pool. Each is skipped when
+    /// its marker already matches its rendered table, and each resolves
+    /// through the pools above it, so a version an outer pool already holds
+    /// is never downloaded twice (Spec E §5). The daemon pool is not
+    /// installed here: it belongs to the `SystemPool` actor (Spec F §3).
     pub fn install_pools(
         &self,
         crew: &CrewRef,
@@ -175,17 +175,6 @@ impl Runtime {
         let log = crew_paths.root.join("logs").join("mise.pools.log");
 
         let crew_id = crew.to_string();
-        let system = system_tools(&self.layout, &crew.fleet.to_string())?;
-        tc.install_level(
-            &crew_id,
-            "system",
-            &self.layout.system_mise_toml_generated(),
-            &daemon_pool,
-            &[],
-            &self.layout.system_installed_marker(),
-            &system,
-            &log,
-        )?;
         tc.install_level(
             &crew_id,
             &format!("fleet {}", crew.fleet),
@@ -195,6 +184,7 @@ impl Runtime {
             &fleet.installed_marker(),
             tools.fleet,
             &log,
+            None,
         )?;
         tc.install_level(
             &crew_id,
@@ -205,9 +195,54 @@ impl Runtime {
             &crew_paths.installed_marker(),
             tools.crew,
             &log,
+            None,
         )
     }
 }
+
+impl SystemToolchain for Runtime {
+    /// The daemon pool, owned by the `SystemPool` actor (Spec F §3). Returns
+    /// `Ok` only when the pool matches the system table *and* exists: a
+    /// marker that survived a deleted pool would otherwise report ready over
+    /// an empty directory (F-5).
+    fn ensure_system_pool(&self) -> Result<(), MaterializeError> {
+        let tc = Toolchain {
+            tools: &self.tools,
+            layout: &self.layout,
+        };
+        let pool = self.layout.mise_data_dir();
+        let marker = self.layout.system_installed_marker();
+        let log = self
+            .layout
+            .server_dir()
+            .join("logs")
+            .join("mise.system.log");
+        let system = system_tools(&self.layout, "system")?;
+        if !pool.exists() {
+            // Drop a stale marker so `install_level` cannot short-circuit
+            // past a pool that is no longer there.
+            let _ = std::fs::remove_file(&marker);
+        }
+        tc.install_level(
+            "system",
+            "system",
+            &self.layout.system_mise_toml_generated(),
+            &pool,
+            &[],
+            &marker,
+            &system,
+            &log,
+            Some(SYSTEM_POOL_INSTALL_TIMEOUT),
+        )
+    }
+}
+
+/// How long `ensure_system_pool` lets one `mise trust`/`mise install` call
+/// run before killing it (Spec F §6). 600s is the value Spec F's `SystemPool`
+/// actor design documents as its default `attempt_timeout` (Task 4); once
+/// the actor's configured value is threaded down here instead, this constant
+/// goes away.
+const SYSTEM_POOL_INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
 
 impl Runtime {
     fn workspace(&self, fleet: &hecaton_core::FleetName, git: &GitSettings) -> Workspace<'_> {
@@ -477,6 +512,32 @@ mod tests {
         assert!(rt.install_and_validate(&a).is_err());
         std::fs::write(paths.installed_marker(), "").unwrap();
         rt.install_and_validate(&a).unwrap();
+    }
+
+    #[test]
+    fn a_matching_marker_with_no_pool_is_treated_as_stale() {
+        use sha2::Digest;
+
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime(dir.path());
+        let layout = &rt.layout;
+
+        // Write a marker holding the digest of the table that would be
+        // rendered, but never create the pool.
+        let system = system_tools(layout, "system").unwrap();
+        let text = crate::toolchain::render_level_toml("system", &system);
+        let digest = hex::encode(sha2::Sha256::digest(text.as_bytes()));
+        std::fs::create_dir_all(layout.system_installed_marker().parent().unwrap()).unwrap();
+        std::fs::write(layout.system_installed_marker(), &digest).unwrap();
+        assert!(!layout.mise_data_dir().exists(), "no pool yet");
+
+        // With a fake mise that cannot really install, the call must still
+        // *attempt* it rather than short-circuit on the marker.
+        let err = rt.ensure_system_pool().unwrap_err();
+        assert!(
+            !matches!(err, MaterializeError::Invalid { .. }),
+            "a missing pool must drive a real install attempt, got {err:?}"
+        );
     }
 
     #[test]

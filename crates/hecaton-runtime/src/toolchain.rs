@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use hecaton_core::{AgentId, MaterializeError};
 use sha2::{Digest, Sha256};
@@ -217,21 +218,23 @@ impl Toolchain<'_> {
         env: &BTreeMap<String, String>,
         log: &Path,
         args: &[&str],
+        timeout: Option<Duration>,
     ) -> Result<(), MaterializeError> {
-        Cmd::new(&self.tools.mise)
+        let mut cmd = Cmd::new(&self.tools.mise)
             .args(args.iter().copied())
             .envs(env)
             .cwd(Path::new("/"))
-            .log(log)
-            .run()
-            .map(|_| ())
-            .map_err(|f| MaterializeError::Tool {
-                id: id.to_string(),
-                tool: f.tool,
-                subcommand: f.subcommand,
-                args: f.args,
-                stderr: f.stderr,
-            })
+            .log(log);
+        if let Some(d) = timeout {
+            cmd = cmd.timeout(d);
+        }
+        cmd.run().map(|_| ()).map_err(|f| MaterializeError::Tool {
+            id: id.to_string(),
+            tool: f.tool,
+            subcommand: f.subcommand,
+            args: f.args,
+            stderr: f.stderr,
+        })
     }
 
     /// Writes `mise.toml`; returns whether its content changed.
@@ -270,23 +273,21 @@ impl Toolchain<'_> {
             &env,
             &log,
             &["trust", &paths.mise_toml.display().to_string()],
+            None,
         )?;
-        self.run_mise(&id, &env, &log, &["install"])
+        self.run_mise(&id, &env, &log, &["install"], None)
     }
 
     /// Installs one level's tools into its own pool. Computes the digest of
     /// the level's rendered table and returns early — writing nothing —
     /// when `marker` already holds it; only then is `toml_path` written,
     /// `mise trust` + `mise install` run against `pool` with `parents` as
-    /// read-only fallbacks, and the marker written on success. Checking the
-    /// marker before writing the file matters for the system level:
-    /// `toml_path` there is one file shared by every fleet, and fleet
-    /// actors run their passes in independent `spawn_blocking` tasks, so
-    /// two fleets' `ensure_crew` calls genuinely overlap in one process.
-    /// Skipping the write in the common case (nothing changed) means
-    /// nothing but this method ever touches that file, and no two threads
-    /// race `write_atomic` over it. `cwd=/` for the same reason `install`
-    /// uses it: no project `mise.toml` on the way up may be discovered.
+    /// read-only fallbacks, and the marker written on success. `timeout`
+    /// bounds each `mise` call when set; only the system pool's caller
+    /// passes one (Spec F §6) — a wedged `mise install` there must not hang
+    /// the daemon forever, while the fleet and crew levels stay unbounded.
+    /// `cwd=/` for the same reason `install` uses it: no project
+    /// `mise.toml` on the way up may be discovered.
     #[allow(clippy::too_many_arguments)]
     pub fn install_level(
         &self,
@@ -298,13 +299,20 @@ impl Toolchain<'_> {
         marker: &Path,
         tools: &BTreeMap<String, String>,
         log: &Path,
+        timeout: Option<Duration>,
     ) -> Result<(), MaterializeError> {
         let text = render_level_toml(label, tools);
         let digest = hex::encode(Sha256::digest(text.as_bytes()));
         if std::fs::read_to_string(marker).ok().as_deref() == Some(digest.as_str()) {
             return Ok(());
         }
-        let id = format!("{crew}: {label}");
+        // The system level has no crew; passing "system" for both would
+        // otherwise double up as the error id "system: system".
+        let id = if crew == label {
+            crew.to_string()
+        } else {
+            format!("{crew}: {label}")
+        };
         let io = |path: &Path, e: std::io::Error| MaterializeError::Io {
             id: id.clone(),
             path: path.to_path_buf(),
@@ -312,8 +320,14 @@ impl Toolchain<'_> {
         };
         write_atomic(toml_path, text.as_bytes(), 0o644).map_err(|e| io(toml_path, e))?;
         let env = level_env(toml_path, pool, parents);
-        self.run_mise(&id, &env, log, &["trust", &toml_path.display().to_string()])?;
-        self.run_mise(&id, &env, log, &["install"])?;
+        self.run_mise(
+            &id,
+            &env,
+            log,
+            &["trust", &toml_path.display().to_string()],
+            timeout,
+        )?;
+        self.run_mise(&id, &env, log, &["install"], timeout)?;
         write_atomic(marker, digest.as_bytes(), 0o644).map_err(|e| io(marker, e))
     }
 }

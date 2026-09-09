@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::Command;
 
 use hecaton_api::{AgentSettings, CredentialBundle, CrewSpec, FleetSpec, GitAuth, GitSettings};
-use hecaton_core::{CrewTools, Fleet, HookTarget, Keep, Materializer, ResolvedAgent};
+use hecaton_core::{CrewRef, CrewTools, Fleet, HookTarget, Keep, Materializer, ResolvedAgent};
 use hecaton_runtime::{Runtime, embedded_system_tools};
 
 fn no_tools() -> BTreeMap<String, String> {
@@ -234,4 +234,53 @@ fn gh_auth_without_a_token_is_a_clear_error() {
         err.to_string(),
         "f/c: git.auth is gh but no gh token was provided (run `gh auth login` on the client)"
     );
+}
+
+#[test]
+fn ensure_crew_no_longer_writes_the_daemon_pool() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("mise", false));
+        return;
+    };
+    let root = support::temp_root("no-daemon-pool");
+    let layout = support::layout(&root);
+    let rt = Runtime::new(layout.clone(), tools);
+    let daemon_pool = layout.mise_data_dir();
+    std::fs::create_dir_all(&daemon_pool).unwrap();
+
+    let before = pool_snapshot(&daemon_pool);
+    let crew: CrewRef = "f/c".parse().unwrap();
+    let (f, c) = (BTreeMap::new(), BTreeMap::new());
+    let _ = rt.install_pools(
+        &crew,
+        hecaton_core::CrewTools {
+            fleet: &f,
+            crew: &c,
+        },
+    );
+    assert_eq!(
+        pool_snapshot(&daemon_pool),
+        before,
+        "install_pools must not touch the daemon pool any more (Spec F §3)"
+    );
+}
+
+/// Every path under `dir`, sorted, so an unchanged pool compares equal.
+fn pool_snapshot(dir: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            out.push(p.display().to_string());
+            if p.is_dir() {
+                stack.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
 }
