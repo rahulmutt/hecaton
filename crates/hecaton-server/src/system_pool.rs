@@ -49,6 +49,7 @@ pub fn spawn(
     tokio::spawn(async move {
         loop {
             let tc = toolchain.clone();
+            tracing::info!("daemon mise pool install starting");
             // The port is synchronous; a pass must not block the runtime.
             let outcome = tokio::task::spawn_blocking(move || tc.ensure_system_pool()).await;
             let next = match outcome {
@@ -64,11 +65,16 @@ pub fn spawn(
                 tracing::warn!(%reason, "daemon mise pool is not ready");
             }
             // `send_if_modified` keeps `changed()` meaningful: only a real
-            // transition wakes the fleet actors waiting on it.
+            // transition wakes the fleet actors waiting on it. Log only the
+            // actual Pending/Unready → Ready transition, not every tick that
+            // reconfirms an already-Ready pool.
             tx.send_if_modified(|cur| {
                 if *cur == next {
                     false
                 } else {
+                    if next == SystemPoolState::Ready && *cur != SystemPoolState::Ready {
+                        tracing::info!("daemon mise pool is ready");
+                    }
                     *cur = next.clone();
                     true
                 }
