@@ -12,7 +12,8 @@ use hecaton_api::{
 };
 use hecaton_core::{
     AgentId, AgentName, AgentRunner, EventHandler, Fleet, FleetName, FleetRecord, FleetSecrets,
-    Keep, Outcome, WorkspaceReader, is_reserved_fleet, plugin_id, reserved_fleet_reason,
+    Keep, Outcome, SystemToolchain, WorkspaceReader, is_reserved_fleet, plugin_id,
+    reserved_fleet_reason,
 };
 use tokio::sync::{RwLock, mpsc, oneshot, watch};
 
@@ -26,6 +27,7 @@ use crate::plugins::{
     PluginRegistry,
 };
 use crate::sessions::Sessions;
+use crate::system_pool::SystemPoolConfig;
 
 /// The chain handler's hello hook; `PassThrough` has nothing to clear.
 pub trait HelloObserver: Send + Sync {
@@ -104,8 +106,12 @@ impl Daemon {
         registry: Arc<PluginRegistry>,
         client: PluginClient,
         kv: Arc<PluginKv>,
+        system_toolchain: Arc<dyn SystemToolchain>,
     ) -> Arc<Self> {
-        let (shared, purged) = actor::shared(metrics);
+        let (shared, purged, pool_tx) = actor::shared(metrics);
+        // Spec F §4: one owner for the daemon pool. Spawned before the fleet
+        // actors, though they gate on readiness rather than on spawn order.
+        crate::system_pool::spawn(system_toolchain, pool_tx, SystemPoolConfig::default());
         let plugins = PluginHost::start(plugin_config, &ports, shared.clone(), registry.clone());
         let ports = Arc::new(ports);
         let changes = Arc::new(watch::channel(0u64).0);

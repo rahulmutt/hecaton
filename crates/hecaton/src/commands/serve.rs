@@ -164,7 +164,7 @@ fn run(
             runner: Arc::new(TmuxRunner::new(tools.tmux.clone(), tmux_socket)),
             clock: Arc::new(SystemClock),
             store: Arc::new(store),
-            workspace: runtime,
+            workspace: runtime.clone(),
             policy: ReconcilePolicy::default(),
             hook_url: url.clone(),
             resync: RESYNC,
@@ -190,6 +190,7 @@ fn run(
             registry,
             client,
             kv,
+            runtime,
         );
         let plugins = daemon
             .sync_plugins()

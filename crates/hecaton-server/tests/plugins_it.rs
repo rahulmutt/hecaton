@@ -383,6 +383,7 @@ async fn a_stored_fleet_under_the_reserved_name_is_ignored() {
         h.registry.clone(),
         h.client.clone(),
         h.kv.clone(),
+        hecaton_server::testing::ready_toolchain(),
     );
     daemon.sync_plugins().await.unwrap();
 
