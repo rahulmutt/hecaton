@@ -955,6 +955,51 @@ mod tests {
         );
     }
 
+    /// A fleet created by a fresh `POST` gets its first pass from its
+    /// `Apply` and never before it: that is what `initial_pass = false`
+    /// buys, and callers rely on it — `Daemon::apply` spawns the actor with
+    /// a record the `Apply` is about to replace.
+    ///
+    /// The readiness channel is the trap. `Shared` is cloned into every
+    /// actor and a `watch::Receiver` clone keeps the *original's* seen
+    /// version, which nothing in the daemon ever advances. An actor spawned
+    /// once the pool is already `Ready` — the normal case after startup,
+    /// and what `start_with_pool` reproduces by sending before it spawns —
+    /// therefore reads that as an unseen change, wakes on it and runs a
+    /// pass nobody asked for.
+    ///
+    /// Nothing is sent to this actor, and its resync is an hour: a
+    /// readiness wake is the only branch of its select that can be ready,
+    /// so the window below cannot fail spuriously. It can only be slow.
+    #[tokio::test]
+    async fn a_new_fleet_runs_no_pass_before_its_first_apply() {
+        let h = Harness::new(Duration::from_secs(3600));
+        let (handle, _shared, _purged, _pool) = start_with_pool(&h, SystemPoolState::Ready);
+        let mut rx = handle.status.clone();
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), rx.changed())
+                .await
+                .is_err(),
+            "the actor published a snapshot before it was asked to do anything"
+        );
+        assert!(
+            h.runner.calls().is_empty(),
+            "no pass may have run yet — every pass observes: {:?}",
+            h.runner.calls()
+        );
+        assert!(
+            h.materializer.calls().is_empty(),
+            "nor may anything have been materialized: {:?}",
+            h.materializer.calls()
+        );
+
+        // And the `Apply` is the first pass, over the spec it carries.
+        apply(&handle, spec(&["a"])).await;
+        wait(&mut rx, |r| r.status.observed_generation == 1).await;
+        assert!(h.runner.calls().contains(&"ensure_agent f/c/a".to_string()));
+    }
+
     /// Spec F §5: the daemon pool is a precondition the fleet cannot
     /// influence, so an unready pool skips the pass rather than failing it.
     #[tokio::test]
