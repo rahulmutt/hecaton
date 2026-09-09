@@ -151,13 +151,16 @@ impl Harness {
         )
     }
 
-    /// The same, starting from stored records — what a daemon restart
-    /// hands `Daemon::start`.
+    /// The same, starting from stored records and over a system toolchain
+    /// the caller controls: the records are what a daemon restart hands
+    /// `Daemon::start`, and the toolchain is what its pool actor drives —
+    /// the only thing that opens the fleets' readiness gate (Spec F §4).
     pub fn daemon_with_existing(
         &self,
         handler: Arc<dyn DaemonHandler>,
         plugin_dir: &Path,
         existing: Vec<(FleetRecord, FleetSecrets)>,
+        toolchain: Arc<dyn SystemToolchain>,
     ) -> Arc<Daemon> {
         self.daemon_full(
             handler,
@@ -165,7 +168,7 @@ impl Harness {
             "admin-tok",
             Metrics::new().unwrap_or_else(|e| panic!("metrics: {e}")),
             existing,
-            ready_toolchain(),
+            toolchain,
         )
     }
 
