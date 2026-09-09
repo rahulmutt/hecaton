@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::process::Command;
 
 use hecaton_core::AgentId;
-use hecaton_runtime::{Toolchain, embedded_system_tools, mise_env};
+use hecaton_runtime::{Toolchain, agent_env, embedded_system_tools, mise_env};
 
 /// Copies the host's `<tool>@<version>` install into `pool/installs`.
 /// Returns false if the host does not have it.
@@ -425,4 +425,146 @@ fn a_crew_pins_its_own_version_without_disturbing_the_fleets() {
         "gitleaks resolved to {resolved}, expected the crew's pin under {}",
         crew_paths.mise_pool().display()
     );
+}
+
+/// Every file under `root`, relative to it and sorted; empty when `root`
+/// does not exist. Used to prove a pool gained nothing.
+fn pool_contents(root: &std::path::Path) -> Vec<String> {
+    fn walk(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, base, out);
+            } else {
+                out.push(path.strip_prefix(base).unwrap().display().to_string());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+// Spec E §10's second acceptance criterion: "`mise install` in the agent's
+// worktree installs a repo-declared tool into `home/.local/share/mise`
+// without touching any pool." Nothing else in the branch exercises this —
+// the ceiling move and the private data dir are otherwise only checked as
+// an env string (env.rs) and the golden snapshot — so this is the only
+// test that would catch a regression in the
+// `MISE_CEILING_PATHS`/`MISE_AUTO_INSTALL`/private-data-dir triple.
+#[test]
+fn mise_install_in_the_worktree_lands_privately_and_leaves_every_pool_alone() {
+    let Some(tools) = support::tools() else {
+        assert!(!support::require_or_skip("mise", false));
+        return;
+    };
+    let root = support::temp_root("pools-worktree");
+    let layout = support::layout(&root);
+    let id: AgentId = "f/c/a".parse().unwrap();
+    let fleet_paths = layout.fleet(&id.fleet);
+    let crew_paths = layout.crew(&id.crew_ref());
+    let paths = layout.agent(&id);
+    std::fs::create_dir_all(&paths.workspace).unwrap();
+
+    // Seeded straight into the agent's own private data dir, never a pool:
+    // this test is about the worktree install path, not the pool chain
+    // (covered above), so nothing here may hit the network. The agent's
+    // generated global table (`tc.write`, below) names nothing, so the
+    // only way `tmux` can resolve is through the worktree's own
+    // `mise.toml`, discovered via `MISE_CEILING_PATHS`.
+    let tmux = repo_pin("tmux");
+    if !support::require_or_skip(
+        "a host tmux install to seed from",
+        seed_into(&tools, &paths.mise_data_dir(), "tmux", &tmux),
+    ) {
+        return;
+    }
+
+    let tc = Toolchain {
+        tools: &tools,
+        layout: &layout,
+    };
+    tc.write(&id, &paths, &BTreeMap::new(), &BTreeMap::new(), false)
+        .unwrap();
+    std::fs::write(
+        paths.workspace.join("mise.toml"),
+        format!("[tools]\ntmux = {tmux:?}\n"),
+    )
+    .unwrap();
+
+    let daemon_pool = layout.mise_data_dir();
+    let before = (
+        pool_contents(&daemon_pool),
+        pool_contents(&fleet_paths.mise_pool()),
+        pool_contents(&crew_paths.mise_pool()),
+    );
+
+    // The same environment the sandbox would carry into the worktree
+    // (Spec E §6): private `MISE_DATA_DIR`, the pool chain as a read-only
+    // fallback, and the ceiling one level above the worktree.
+    let env = agent_env(
+        &id,
+        &paths,
+        &layout,
+        "http://127.0.0.1:0",
+        "s",
+        &BTreeMap::new(),
+    );
+    let run = |args: &[&str]| {
+        Command::new(&tools.mise)
+            .args(args)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &paths.home)
+            .envs(&env)
+            .current_dir(&paths.workspace)
+            .output()
+            .unwrap()
+    };
+
+    // Spec §6: mise honours an untrusted config's `[tools]` for `mise
+    // install`, so no `mise trust` of the worktree file precedes this.
+    let out = run(&["install"]);
+    assert!(
+        out.status.success(),
+        "mise install: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        paths
+            .mise_data_dir()
+            .join("installs")
+            .join("tmux")
+            .join(&tmux)
+            .exists(),
+        "tmux landed under the agent's private data dir"
+    );
+
+    // Resolution, not just presence: the agent's own global table names
+    // nothing, and no pool holds tmux either, so this only succeeds if
+    // `mise which` actually discovered the worktree's own `mise.toml`
+    // through `MISE_CEILING_PATHS`.
+    let out = run(&["which", "tmux"]);
+    assert!(
+        out.status.success(),
+        "mise which tmux: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let resolved = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(
+        resolved.starts_with(&paths.mise_data_dir().display().to_string()),
+        "tmux resolved to {resolved}, expected the private dir"
+    );
+
+    let after = (
+        pool_contents(&daemon_pool),
+        pool_contents(&fleet_paths.mise_pool()),
+        pool_contents(&crew_paths.mise_pool()),
+    );
+    assert_eq!(after, before, "no pool gained anything");
 }
