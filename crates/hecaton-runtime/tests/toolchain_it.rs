@@ -246,8 +246,19 @@ fn each_level_installs_into_its_own_pool_and_the_agent_resolves_them_all() {
         );
     }
 
-    // The markers make a second pass a no-op.
-    let before = std::fs::read_to_string(fleet_paths.installed_marker()).unwrap();
+    // The marker makes a second pass a no-op: rather than compare the
+    // marker's content (its sha256 of the unchanged table is byte-identical
+    // whether the install ran again or was skipped, so that comparison
+    // can never fail), count the `mise install` invocations the pool log
+    // recorded before and after, and assert the count did not rise.
+    let installs = |log: &std::path::Path| {
+        std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .filter(|l| l.starts_with("$ mise install"))
+            .count()
+    };
+    let before = installs(&log);
     tc.install_level(
         &crew_id,
         "fleet f",
@@ -260,8 +271,9 @@ fn each_level_installs_into_its_own_pool_and_the_agent_resolves_them_all() {
     )
     .unwrap();
     assert_eq!(
-        std::fs::read_to_string(fleet_paths.installed_marker()).unwrap(),
-        before
+        installs(&log),
+        before,
+        "the marker matched: no second install"
     );
 }
 
