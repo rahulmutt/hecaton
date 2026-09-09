@@ -346,6 +346,22 @@ impl<M: MatrixPort> Actor<M> {
             if event.name == "SessionStart" {
                 return;
             }
+        } else if let Some(mut thread) =
+            self.maps.thread(&event.agent).filter(|t| t.closed).cloned()
+        {
+            // The session is emitting again after a `SessionEnd` — an
+            // operator resuming it — so its thread is alive whatever the
+            // record says. Left closed, the user would watch the agent
+            // work in a thread where inbound routing refuses every reply
+            // as stale (Spec G-12), and `threads_open` would undercount
+            // from here on. A failed write leaves only the flag stale,
+            // the root being unchanged, so this posts anyway rather than
+            // dropping the event.
+            thread.closed = false;
+            if let Err(e) = self.maps.set_thread(&self.host, &event.agent, thread).await {
+                tracing::warn!("matrix: reopening thread for {}: {e}", event.agent);
+            }
+            self.publish_gauges();
         }
 
         if !config.wants(&event.name) {
@@ -711,6 +727,53 @@ mod tests {
 
         let stored = fake.kv_json("thread/f/c/alice").unwrap();
         assert_eq!(stored["closed"], true);
+    }
+
+    #[tokio::test]
+    async fn a_session_start_after_a_session_end_reopens_the_same_thread() {
+        let (fake, port, mut a) = actor().await;
+        a.handle(Command::Configure(daemon_config())).await;
+        a.handle(Command::Activate {
+            agent: "f/c/alice".into(),
+            config: agent_config(&["Notification"]),
+        })
+        .await;
+        a.handle(Command::Events(vec![
+            started("f/c/alice", "s1", "startup"),
+            during(
+                "f/c/alice",
+                "s1",
+                "SessionEnd",
+                json!({ "reason": "clear" }),
+            ),
+        ]))
+        .await;
+        // Call 0 is the room creation, so the root is call 1.
+        let root = minted_root(&port.take_calls(), 1);
+        assert_eq!(fake.kv_json("thread/f/c/alice").unwrap()["closed"], true);
+
+        // The operator resumes that very session.
+        a.handle(Command::Events(vec![started("f/c/alice", "s1", "resume")]))
+            .await;
+
+        let s = sends(&port.take_calls());
+        assert_eq!(s.len(), 1, "the same session opens no second root");
+        assert_eq!(s[0].0, Some(root), "the restart posts inside that thread");
+        let stored = fake.kv_json("thread/f/c/alice").unwrap();
+        assert_eq!(
+            stored["closed"], false,
+            "and the thread is open again, so a reply in it still routes"
+        );
+
+        // A later event posts in the same thread and leaves it open.
+        a.handle(Command::Events(vec![during(
+            "f/c/alice",
+            "s1",
+            "Notification",
+            json!({ "message": "needs permission" }),
+        )]))
+        .await;
+        assert_eq!(fake.kv_json("thread/f/c/alice").unwrap()["closed"], false);
     }
 
     #[tokio::test]
