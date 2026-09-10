@@ -41,6 +41,11 @@ use crate::session::{self, Plan, Session};
 /// sleeps this before its one retry, so it has to be a number; every
 /// homeserver that implements `M_LIMIT_EXCEEDED` sends its own.
 const DEFAULT_RETRY_MS: u64 = 1_000;
+/// The longest delay the adapter will pass on. The actor sleeps the delay
+/// it is given with its queue standing still, so a homeserver that answers
+/// with a wild `retry_after`, or a timestamp years out, would otherwise
+/// take the plugin down for as long as it liked.
+const MAX_RETRY_MS: u64 = 60_000;
 
 /// The `MatrixPort` the actor drives. `user_id` is the homeserver's own
 /// rendering of this account's id, taken from `whoami`, because the actor
@@ -189,7 +194,7 @@ fn classify(api: Option<&matrix_sdk::ruma::api::error::Error>, message: String) 
 }
 
 /// The homeserver may name a delay or a wall-clock instant; the port speaks
-/// only in milliseconds from now.
+/// only in milliseconds from now, clamped to `MAX_RETRY_MS`.
 fn retry_after_ms(retry_after: Option<RetryAfter>) -> u64 {
     let delay = match retry_after {
         Some(RetryAfter::Delay(delay)) => delay,
@@ -198,7 +203,9 @@ fn retry_after_ms(retry_after: Option<RetryAfter>) -> u64 {
         }
         None => Duration::from_millis(DEFAULT_RETRY_MS),
     };
-    u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)
+    u64::try_from(delay.as_millis())
+        .unwrap_or(u64::MAX)
+        .min(MAX_RETRY_MS)
 }
 
 impl MatrixClient {
