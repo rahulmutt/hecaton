@@ -18,21 +18,12 @@ out_root="${CARGO_TARGET_DIR:-target}"
 
 for name in "${names[@]}"; do
   crate="hecaton-plugin-$name"
+  scripts/plugin.sh build "$name"
+  built="$(scripts/plugin.sh target-dir "$name")/debug/$crate"
   out="$out_root/plugins/$name"
-  if [ -d "plugins/$name" ]; then
-    scripts/plugin.sh build "$name"
-    built="$(scripts/plugin.sh target-dir "$name")/debug/$crate"
-    pkg="plugins/$name/package"
-  else
-    # Still a core workspace member: Spec H moves the plugins one commit at
-    # a time. This branch goes away with the last of them.
-    cargo build -q -p "$crate"
-    built="$out_root/debug/$crate"
-    pkg="crates/$crate/package"
-  fi
   rm -rf "$out"
   mkdir -p "$out/bin"
   cp "$built" "$out/bin/$crate"
-  cp "$pkg/mise.toml" "$pkg/hecaton-plugin.yaml" "$out/"
+  cp "plugins/$name/package/mise.toml" "plugins/$name/package/hecaton-plugin.yaml" "$out/"
   echo "packaged $name -> $out"
 done

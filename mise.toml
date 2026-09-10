@@ -18,10 +18,11 @@ description = "Format all crates"
 run = "cargo fmt --all"
 
 [tasks.lint]
-description = "Static tier: rustfmt check + clippy with warnings denied"
+description = "Static tier: rustfmt check + clippy with warnings denied, then the core dependency-isolation guard"
 run = [
   "cargo fmt --all --check",
   "cargo clippy --workspace --all-targets -- -D warnings",
+  "scripts/check-core-deps.sh",
 ]
 
 [tasks.test]
@@ -58,10 +59,16 @@ run = [
 ]
 
 [tasks.audit]
-description = "Nightly tier: dependency CVEs and policy"
+description = "Nightly tier: dependency CVEs and policy, for the core workspace and each standalone plugin project"
 run = [
   "cargo audit",
   "cargo deny check advisories bans sources licenses",
+  "cargo audit --file plugins/flow/Cargo.lock",
+  "cargo deny --manifest-path plugins/flow/Cargo.toml check advisories bans sources licenses",
+  "cargo audit --file plugins/web/Cargo.lock",
+  "cargo deny --manifest-path plugins/web/Cargo.toml check advisories bans sources licenses",
+  "cargo audit --file plugins/matrix/Cargo.lock",
+  "cargo deny --manifest-path plugins/matrix/Cargo.toml check advisories bans sources licenses",
 ]
 
 [tasks.mutants]
