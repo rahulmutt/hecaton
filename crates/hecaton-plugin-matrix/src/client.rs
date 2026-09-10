@@ -1,0 +1,432 @@
+//! The `matrix-sdk` adapter (Spec G §12.3): the only file that knows Matrix
+//! types. It implements `MatrixPort` for the actor, and `Launcher` for the
+//! plugin, which is where login, the store and the inbound pump are started.
+//!
+//! Nothing here decides anything. Every rule this plugin follows is decided
+//! in a module above — `session::plan`, `routing`, `render`, `actor` — each
+//! of which is tested against the port or against a fake host. This file is
+//! a translation between `matrix-sdk`'s types and the port's, and the one
+//! place in the crate that knows a Matrix error from any other.
+
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use hecaton_plugin_sdk::Host;
+use matrix_sdk::authentication::matrix::MatrixSession;
+use matrix_sdk::config::SyncSettings;
+use matrix_sdk::room::Room;
+use matrix_sdk::ruma::api::client::filter::FilterDefinition;
+use matrix_sdk::ruma::api::client::room::create_room;
+use matrix_sdk::ruma::api::client::sync::sync_events;
+use matrix_sdk::ruma::api::error::{ErrorKind, RetryAfter};
+use matrix_sdk::ruma::events::InitialStateEvent;
+use matrix_sdk::ruma::events::reaction::ReactionEventContent;
+use matrix_sdk::ruma::events::relation::{Annotation, Thread};
+use matrix_sdk::ruma::events::room::encryption::RoomEncryptionEventContent;
+use matrix_sdk::ruma::events::room::message::{
+    MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
+};
+use matrix_sdk::ruma::{EventId, RoomId, UserId, uint};
+use matrix_sdk::store::{RoomLoadSettings, StateStoreDataKey};
+use matrix_sdk::{Client, RoomState, SessionChange, SessionMeta, SessionTokens};
+
+use crate::actor::{Actor, Command, Counters, Health, Queue};
+use crate::config::{DaemonConfig, Secret};
+use crate::matrix::{Inbound, MatrixError, MatrixPort};
+use crate::plugin::Launcher;
+use crate::session::{self, Plan, Session};
+
+/// What a rate limit costs when the homeserver refuses to say. The actor
+/// sleeps this before its one retry, so it has to be a number; every
+/// homeserver that implements `M_LIMIT_EXCEEDED` sends its own.
+const DEFAULT_RETRY_MS: u64 = 1_000;
+
+/// The `MatrixPort` the actor drives. `user_id` is the homeserver's own
+/// rendering of this account's id, taken from `whoami`, because the actor
+/// compares it byte for byte against the `sender` of an inbound event to
+/// keep the plugin from answering itself.
+pub struct MatrixClient {
+    client: Client,
+    user_id: String,
+}
+
+/// A client on the homeserver in `config`, with its state and crypto store
+/// under `store_dir`. Does not authenticate.
+async fn build(config: &DaemonConfig, store_dir: &Path) -> Result<Client, MatrixError> {
+    Client::builder()
+        .homeserver_url(&config.homeserver)
+        .sqlite_store(store_dir, None)
+        .build()
+        .await
+        .map_err(|e| MatrixError::Other(format!("building the client: {e}")))
+}
+
+/// Restores `session` into a fresh client. No network call.
+async fn restore(
+    config: &DaemonConfig,
+    store_dir: &Path,
+    session: &Session,
+) -> Result<Client, String> {
+    let client = build(config, store_dir).await.map_err(|e| e.to_string())?;
+    let user_id = UserId::parse(&session.user_id)
+        .map_err(|e| format!("the cached session's user id is not a Matrix id: {e}"))?;
+    let restored = MatrixSession {
+        meta: SessionMeta {
+            user_id,
+            device_id: session.device_id.as_str().into(),
+        },
+        tokens: SessionTokens {
+            access_token: session.access_token.expose().to_string(),
+            refresh_token: session
+                .refresh_token
+                .as_ref()
+                .map(|t| t.expose().to_string()),
+        },
+    };
+    client
+        .matrix_auth()
+        .restore_session(restored, RoomLoadSettings::default())
+        .await
+        .map_err(|e| format!("restoring the cached session: {e}"))?;
+    Ok(client)
+}
+
+/// Password login with the configured device id and display name, asking
+/// for a refresh token (G-8). Returns the client and the session to seal.
+async fn login(
+    config: &DaemonConfig,
+    store_dir: &Path,
+    password: &Secret,
+) -> Result<(Client, Session), String> {
+    let client = build(config, store_dir).await.map_err(|e| e.to_string())?;
+    let response = client
+        .matrix_auth()
+        .login_username(&config.user_id, password.expose())
+        .device_id(&config.device_id)
+        .initial_device_display_name(&config.device_name)
+        .request_refresh_token()
+        .send()
+        .await
+        .map_err(|e| format!("logging in as {}: {e}", config.user_id))?;
+    let session = Session {
+        homeserver: config.homeserver.clone(),
+        user_id: response.user_id.to_string(),
+        device_id: response.device_id.to_string(),
+        access_token: Secret::new(response.access_token),
+        refresh_token: response.refresh_token.map(Secret::new),
+    };
+    Ok((client, session))
+}
+
+/// `GET /_matrix/client/v3/account/whoami`: the call that proves the
+/// credentials before the daemon is told the plugin is ready.
+async fn whoami(client: &Client) -> Result<String, MatrixError> {
+    match client.whoami().await {
+        Ok(response) => Ok(response.user_id.to_string()),
+        Err(e) => Err(classify(e.as_client_api_error(), format!("whoami: {e}"))),
+    }
+}
+
+/// Every `matrix-sdk` failure becomes a `MatrixError` here, and nowhere else
+/// in the crate. A rate limit keeps the homeserver's own delay, because the
+/// actor sleeps exactly that before its single retry; a rejected token
+/// becomes `Auth`, because that is the variant the launcher clears the
+/// cached session for. `message` is the caller's context plus the error's
+/// own text: a Matrix error carries the server's `errcode` and message and
+/// never a credential, and the access token travels in a header, so no URL
+/// in a transport error carries one either.
+fn classify(api: Option<&matrix_sdk::ruma::api::error::Error>, message: String) -> MatrixError {
+    let Some(api) = api else {
+        return MatrixError::Other(message);
+    };
+    match api.error_kind() {
+        Some(ErrorKind::LimitExceeded(limit)) => MatrixError::RateLimited {
+            retry_after_ms: retry_after_ms(limit.retry_after),
+        },
+        Some(ErrorKind::UnknownToken(_)) => MatrixError::Auth(message),
+        // `M_MISSING_TOKEN` and a bare 401 land here together.
+        _ if api.status_code.as_u16() == 401 => MatrixError::Auth(message),
+        _ => MatrixError::Other(message),
+    }
+}
+
+/// The homeserver may name a delay or a wall-clock instant; the port speaks
+/// only in milliseconds from now.
+fn retry_after_ms(retry_after: Option<RetryAfter>) -> u64 {
+    let delay = match retry_after {
+        Some(RetryAfter::Delay(delay)) => delay,
+        Some(RetryAfter::DateTime(when)) => {
+            when.duration_since(SystemTime::now()).unwrap_or_default()
+        }
+        None => Duration::from_millis(DEFAULT_RETRY_MS),
+    };
+    u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)
+}
+
+impl MatrixClient {
+    /// A room the client is in. The state store holds every joined room, so
+    /// this resolves a room id from the KV map without a network call.
+    fn room(&self, room: &str) -> Result<Room, MatrixError> {
+        let id =
+            RoomId::parse(room).map_err(|e| MatrixError::Other(format!("room id {room}: {e}")))?;
+        self.client
+            .get_room(&id)
+            .ok_or_else(|| MatrixError::Other(format!("not in room {room}")))
+    }
+}
+
+impl MatrixPort for MatrixClient {
+    fn user_id(&self) -> &str {
+        &self.user_id
+    }
+
+    async fn create_room(&self, name: &str, invite: &[String]) -> Result<String, MatrixError> {
+        let mut invited = Vec::with_capacity(invite.len());
+        for user in invite {
+            invited.push(
+                UserId::parse(user)
+                    .map_err(|e| MatrixError::Other(format!("invite {user}: {e}")))?,
+            );
+        }
+        let mut request = create_room::v3::Request::new();
+        request.name = Some(name.to_string());
+        request.invite = invited;
+        request.preset = Some(create_room::v3::RoomPreset::PrivateChat);
+        request.initial_state = vec![
+            InitialStateEvent::with_empty_state_key(
+                RoomEncryptionEventContent::with_recommended_defaults(),
+            )
+            .to_raw_any(),
+        ];
+        let room =
+            self.client.create_room(request).await.map_err(|e| {
+                classify(e.as_client_api_error(), format!("create room {name}: {e}"))
+            })?;
+        Ok(room.room_id().to_string())
+    }
+
+    async fn send(
+        &self,
+        room: &str,
+        thread_root: Option<&str>,
+        markdown: &str,
+    ) -> Result<String, MatrixError> {
+        let target = self.room(room)?;
+        let mut content = RoomMessageEventContent::text_markdown(markdown);
+        if let Some(root) = thread_root {
+            let root = EventId::parse(root)
+                .map_err(|e| MatrixError::Other(format!("thread root {root}: {e}")))?;
+            // `Thread::plain` carries the in-reply-to fallback, pointed at
+            // the root: the plugin does not track the latest event of a
+            // thread, and a client that does not understand `m.thread`
+            // renders the message as a reply to the root either way.
+            content.relates_to = Some(Relation::Thread(Thread::plain(root.clone(), root)));
+        }
+        let sent = target
+            .send(content)
+            .await
+            .map_err(|e| classify(e.as_client_api_error(), format!("send to {room}: {e}")))?;
+        Ok(sent.response.event_id.to_string())
+    }
+
+    async fn react(&self, room: &str, event_id: &str, key: &str) -> Result<(), MatrixError> {
+        let target = self.room(room)?;
+        let event_id = EventId::parse(event_id)
+            .map_err(|e| MatrixError::Other(format!("event id {event_id}: {e}")))?;
+        let content = ReactionEventContent::new(Annotation::new(event_id, key.to_string()));
+        target
+            .send(content)
+            .await
+            .map_err(|e| classify(e.as_client_api_error(), format!("react in {room}: {e}")))?;
+        Ok(())
+    }
+}
+
+/// The sync loop. Runs until the homeserver stops talking to us, pushing
+/// `Command::Inbound` onto `queue` for every text message in a room the
+/// account is in.
+async fn start_inbound_pump(client: Client, queue: Arc<Queue>) {
+    // The returned handle only exists to remove the handler again, which
+    // nothing here ever does: the pump lives as long as the process.
+    client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
+        let queue = queue.clone();
+        async move {
+            // Everything the actor never needs to see is dropped here: a
+            // reaction, a state event, an emote, a room we only watch from
+            // an invite, and an empty body.
+            if room.state() != RoomState::Joined {
+                return;
+            }
+            let MessageType::Text(text) = &event.content.msgtype else {
+                return;
+            };
+            if text.body.trim().is_empty() {
+                return;
+            }
+            let thread_root = match &event.content.relates_to {
+                Some(Relation::Thread(thread)) => Some(thread.event_id.to_string()),
+                _ => None,
+            };
+            queue.push(Command::Inbound(Inbound {
+                room: room.room_id().to_string(),
+                event_id: event.event_id.to_string(),
+                // The same ruma `OwnedUserId` rendering `whoami` gave the
+                // port's `user_id`, so the actor's byte comparison holds.
+                sender: event.sender.to_string(),
+                thread_root,
+                body: text.body.clone(),
+            }));
+        }
+    });
+
+    // §9.3: a first sync must not replay history — every message in it
+    // would be a fresh instruction to an agent. With no batch token in the
+    // store, take one sync with a filter that asks for no timeline events
+    // at all and start the live sync from the token it returns. The store
+    // keeps that token, so a restart resumes instead of replaying.
+    match client
+        .state_store()
+        .get_kv_data(StateStoreDataKey::SyncToken)
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let mut filter = FilterDefinition::empty();
+            filter.room.timeline.limit = Some(uint!(0));
+            let settings =
+                SyncSettings::new().filter(sync_events::v3::Filter::FilterDefinition(filter));
+            if let Err(e) = client.sync_once(settings).await {
+                tracing::error!("matrix: the first sync failed, so no reply will arrive: {e}");
+                return;
+            }
+        }
+        Err(e) => {
+            tracing::error!("matrix: reading the stored sync token: {e}");
+            return;
+        }
+    }
+
+    // `SyncSettings::new()` resumes from the token the store holds, which
+    // is the one the filtered sync above just wrote.
+    if let Err(e) = client.sync(SyncSettings::new()).await {
+        tracing::error!("matrix: the sync loop stopped, so no reply will arrive: {e}");
+    }
+}
+
+/// `matrix-sdk` rotates the access token when it spends the refresh token,
+/// which makes the sealed record stale. Without this, a restart after a
+/// rotation logs in from the password again, or fails when the password has
+/// been taken out of `plugins.yaml`.
+async fn reseal_on_refresh(host: Host, client: Client, session: Session) {
+    let mut changes = client.subscribe_to_session_changes();
+    loop {
+        match changes.recv().await {
+            Ok(SessionChange::TokensRefreshed) => {
+                let Some(tokens) = client.session_tokens() else {
+                    continue;
+                };
+                let rotated = Session {
+                    access_token: Secret::new(tokens.access_token),
+                    refresh_token: tokens.refresh_token.map(Secret::new),
+                    ..session.clone()
+                };
+                if let Err(e) = session::store(&host, &rotated).await {
+                    tracing::warn!("matrix: re-sealing the refreshed session: {e}");
+                }
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+/// Starts the actor and the inbound pump against a real homeserver.
+pub struct MatrixLauncher {
+    pub host: Host,
+    pub counters: Counters,
+    pub health: Health,
+}
+
+impl MatrixLauncher {
+    async fn remember(&self, session: &Session) -> Result<(), String> {
+        session::store(&self.host, session)
+            .await
+            .map_err(|e| format!("kv: {e}"))
+    }
+}
+
+impl Launcher for MatrixLauncher {
+    async fn launch(&self, config: DaemonConfig, queue: Arc<Queue>) -> Result<(), String> {
+        // The state and crypto store live under the plugin's scratch
+        // directory, which survives a restart and is removed only by
+        // `plugin remove --purge` (Spec G §3).
+        let store_dir = self.host.env().scratch.join("store");
+        let cached = session::load(&self.host)
+            .await
+            .map_err(|e| format!("kv: {e}"))?;
+        let plan = session::plan(cached, &config)?;
+
+        // Restore or log in, then prove the credentials with `whoami`
+        // before the daemon is told the plugin is ready (G-14).
+        let (client, session, user_id) = match plan {
+            Plan::Restore(cached) => {
+                let client = restore(&config, &store_dir, &cached).await?;
+                match whoami(&client).await {
+                    Ok(user_id) => (client, *cached, user_id),
+                    Err(MatrixError::Auth(e)) => {
+                        // §5.2 step 4: the cached session was rejected, most
+                        // likely a revoked device. Drop it and log in once
+                        // more if there is a password to log in with.
+                        let Some(password) = config.password.clone() else {
+                            return Err(session::REVOKED.to_string());
+                        };
+                        tracing::warn!(
+                            "matrix: the cached session was rejected ({e}); logging in again"
+                        );
+                        drop(client);
+                        session::clear(&self.host)
+                            .await
+                            .map_err(|e| format!("kv: {e}"))?;
+                        let (client, session) = login(&config, &store_dir, &password).await?;
+                        let user_id = whoami(&client).await.map_err(|e| e.to_string())?;
+                        self.remember(&session).await?;
+                        (client, session, user_id)
+                    }
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+            Plan::Login { password } => {
+                let (client, session) = login(&config, &store_dir, &password).await?;
+                let user_id = whoami(&client).await.map_err(|e| e.to_string())?;
+                self.remember(&session).await?;
+                tracing::warn!(
+                    "matrix: logged in with the configured password and cached the session; \
+                     the password can now be removed from plugins.yaml"
+                );
+                (client, session, user_id)
+            }
+        };
+
+        let port = MatrixClient {
+            client: client.clone(),
+            user_id,
+        };
+        let mut actor = Actor::new(
+            self.host.clone(),
+            port,
+            self.counters.clone(),
+            self.health.clone(),
+        );
+        actor.load().await;
+        tokio::spawn(actor.run(queue.clone()));
+        tokio::spawn(reseal_on_refresh(
+            self.host.clone(),
+            client.clone(),
+            session,
+        ));
+        tokio::spawn(start_inbound_pump(client, queue));
+        Ok(())
+    }
+}
