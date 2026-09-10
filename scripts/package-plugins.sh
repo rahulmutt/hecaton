@@ -1,23 +1,29 @@
 #!/usr/bin/env bash
-# Assembles each in-tree plugin as a directory source under
+# Assembles each named plugin as a directory source under
 # $CARGO_TARGET_DIR/plugins/ (target/plugins/ by default; plugins spec
-# §17.6): the crate's package/ files plus the freshly built binary in bin/.
-# The e2e locates the built binary and this output directory the same way,
-# relative to $CARGO_TARGET_DIR, so both must agree. The e2e names these
-# directories in plugins.yaml; by hand, so can you. One loop: a new in-tree
-# plugin is one more name.
+# §17.6): the project's package/ files plus the freshly built binary in
+# bin/. The e2e locates the built binary and this output directory the
+# same way, relative to $CARGO_TARGET_DIR, so both must agree.
+#
+# Plugins are standalone projects (Spec H), so the binary is built inside
+# plugins/<name>/ and copied here; only the output location is shared.
+# With no arguments, every in-tree plugin.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-target="${CARGO_TARGET_DIR:-target}"
+names=("$@")
+(( ${#names[@]} )) || names=(flow web matrix)
 
-for name in flow web matrix; do
+out_root="${CARGO_TARGET_DIR:-target}"
+
+for name in "${names[@]}"; do
   crate="hecaton-plugin-$name"
-  cargo build -q -p "$crate"
-  out="$target/plugins/$name"
+  scripts/plugin.sh build "$name"
+  built="$(scripts/plugin.sh target-dir "$name")/debug/$crate"
+  out="$out_root/plugins/$name"
   rm -rf "$out"
   mkdir -p "$out/bin"
-  cp "$target/debug/$crate" "$out/bin/$crate"
-  cp "crates/$crate/package/mise.toml" "crates/$crate/package/hecaton-plugin.yaml" "$out/"
+  cp "$built" "$out/bin/$crate"
+  cp "plugins/$name/package/mise.toml" "plugins/$name/package/hecaton-plugin.yaml" "$out/"
   echo "packaged $name -> $out"
 done

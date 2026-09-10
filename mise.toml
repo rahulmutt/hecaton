@@ -14,24 +14,43 @@ nono = "0.76.0"
 claude = "2.1.267"
 
 [tasks.fmt]
-description = "Format all crates"
-run = "cargo fmt --all"
+description = "Format the core workspace and every standalone plugin project"
+run = [
+  "cargo fmt --all",
+  "scripts/plugin.sh fmt flow",
+  "scripts/plugin.sh fmt web",
+  "scripts/plugin.sh fmt matrix",
+]
 
 [tasks.lint]
-description = "Static tier: rustfmt check + clippy with warnings denied"
+description = "Static tier: rustfmt check + clippy with warnings denied, then the core dependency-isolation guard"
 run = [
   "cargo fmt --all --check",
   "cargo clippy --workspace --all-targets -- -D warnings",
+  "scripts/check-core-deps.sh",
 ]
 
 [tasks.test]
-description = "Unit + integration tests"
-depends = ["package-plugins"]
+description = "Unit + integration tests for the core workspace"
+depends = ["package-plugins flow web"]
 run = "cargo nextest run --workspace"
 
 [tasks.package-plugins]
-description = "Build the in-tree plugins and assemble them as directory sources under target/plugins/<name>/ (the e2e and `plugins.yaml` point at these)"
+description = "Build the named in-tree plugins (default: all) and assemble them as directory sources under target/plugins/<name>/"
 run = "scripts/package-plugins.sh"
+
+[tasks.plugin]
+description = "Lint and test one standalone plugin project: `mise run plugin matrix`"
+usage = 'arg "<name>" help="the plugin directory under plugins/"'
+run = 'scripts/plugin.sh check "$usage_name"'
+
+[tasks.plugins]
+description = "Lint and test every standalone plugin project (its own tier; not part of `check`)"
+run = [
+  "scripts/plugin.sh check flow",
+  "scripts/plugin.sh check web",
+  "scripts/plugin.sh check matrix",
+]
 
 [tasks.check]
 description = "Everything the PR tier runs"
@@ -45,10 +64,16 @@ run = [
 ]
 
 [tasks.audit]
-description = "Nightly tier: dependency CVEs and policy"
+description = "Nightly tier: dependency CVEs and policy, for the core workspace and each standalone plugin project"
 run = [
   "cargo audit",
   "cargo deny check advisories bans sources licenses",
+  "cargo audit --file plugins/flow/Cargo.lock",
+  "cargo deny --manifest-path plugins/flow/Cargo.toml check advisories bans sources licenses",
+  "cargo audit --file plugins/web/Cargo.lock",
+  "cargo deny --manifest-path plugins/web/Cargo.toml check advisories bans sources licenses",
+  "cargo audit --file plugins/matrix/Cargo.lock",
+  "cargo deny --manifest-path plugins/matrix/Cargo.toml check advisories bans sources licenses",
 ]
 
 [tasks.mutants]
@@ -62,7 +87,7 @@ run = "cargo nextest run -p hecaton-runtime"
 
 [tasks.e2e]
 description = "End-to-end journey against a real daemon, git, mise, nono and tmux (fails, not skips, without tools)"
-depends = ["package-plugins"]
+depends = ["package-plugins flow web"]
 env = { HECATON_REQUIRE_TOOLS = "1" }
 run = "cargo nextest run -p hecaton --test e2e"
 

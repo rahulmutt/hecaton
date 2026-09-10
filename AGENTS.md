@@ -10,12 +10,17 @@ credentials, hook input, or sandbox rules.
 - `test-it` — the `hecaton-runtime` integration tests against real
   git/mise/nono/tmux, with `HECATON_REQUIRE_TOOLS=1` so a missing tool fails
   instead of skipping.
+- `plugin <name>` — lint and test one standalone plugin project
+  (`mise run plugin matrix`). `plugins` does all three. Neither is part of
+  `check`; CI runs them as their own concurrent jobs.
 - `mutants` — nightly tier: mutation-tests `hecaton-core` (the reconciler).
 - `e2e` — the Phase 3 journey against a real daemon; needs the same tools as `test-it`.
-- `package-plugins` — builds the in-tree plugins and assembles each as a
-  directory source under `target/plugins/<name>/` (under `CARGO_TARGET_DIR`
-  when set); `test` and `e2e` depend on it, and the flow e2e skips (fails
-  under `HECATON_REQUIRE_TOOLS`) without it.
+- `package-plugins [names…]` — builds the named in-tree plugins inside
+  their own projects and assembles each as a directory source under
+  `target/plugins/<name>/` (under `CARGO_TARGET_DIR` when set). No names
+  means all three. `test` and `e2e` ask it for `flow web`, the two the
+  journey needs; the flow e2e skips (fails under `HECATON_REQUIRE_TOOLS`)
+  without it.
 - `serve` — a foreground daemon under `target/tmp/serve` for poking by hand
   (`HOME` is overridden, so it never touches your real state).
 - `verify-claude` — the interactive spec §8.1 check with a real `claude`
@@ -29,7 +34,7 @@ credentials, hook input, or sandbox rules.
 - `lint`, `test`, `fmt`, `precommit`, `audit` — defined in `mise.toml`.
 - `vendor-xterm` is a script, not a task: `scripts/vendor-xterm.sh` re-fetches
   and verifies the web plugin's assets against
-  `crates/hecaton-plugin-web/assets/VENDOR.md` (installing them only when
+  `plugins/web/assets/VENDOR.md` (installing them only when
   every digest matches); `--check` verifies the committed files offline.
 
 ## Conventions
@@ -40,7 +45,11 @@ credentials, hook input, or sandbox rules.
   `hecaton-plugin-sdk` depends on `hecaton-api` only. `hecaton-server`'s
   *dev*-dependencies may include `hecaton-plugin-sdk` (in-process plugin
   tests). Plugin crates (`hecaton-plugin-flow`) depend on `hecaton-plugin-sdk`
-  and `hecaton-api` only.
+  and `hecaton-api` only. Plugins are not workspace members: each is a
+  standalone project under `plugins/<name>/` with its own `Cargo.lock`,
+  dependency table, lints, `clippy.toml` and `deny.toml`, reaching the SDK by
+  relative path. That is what keeps a plugin's dependency tree out of the
+  daemon's feature resolution.
 - Library crates return `thiserror` errors whose messages start with the config
   path (`crews.backend.agents.bob.tools.node: …`); only the binary uses `anyhow`.
 - Every tool version — `mise.toml` and fleet `tools:` — is exact.
@@ -48,11 +57,22 @@ credentials, hook input, or sandbox rules.
   never go in argv, env, or logs; `config resolve` withholds the credential
   bundle but prints the host `settings.json` verbatim unless
   `--no-host-defaults` is given.
-- New Cargo dependencies are a deliberate decision: add to
-  `[workspace.dependencies]` with an exact version and say why in the commit.
+- New Cargo dependencies are a deliberate decision, and they land in the
+  project that uses them: a core dependency in the root
+  `[workspace.dependencies]`, a plugin dependency in that plugin's own
+  manifest. Exact version either way, and say why in the commit.
 
 ## Gotchas
 - Run cargo through mise (`mise x -- cargo …`) or via a `mise run` task.
+- `mise run check` covers the core workspace only. Cargo unifies features
+  across every member one invocation selects, so while the plugins were
+  members, a `--workspace` build handed `hecaton-server` a `reqwest` with
+  rustls, HTTP/2, gzip and stream that it never asked for, and tripled the
+  gate's cold build. `scripts/check-core-deps.sh` fails if that ever comes
+  back: it asserts both the seven-crate member list and that the core
+  `reqwest` carries `json` alone, so a readmitted plugin is caught whether or
+  not its tree pulls a `reqwest` feature. A plugin change is caught by
+  `mise run plugins`, not by `check`.
 - insta snapshots: read the `.snap.new`, compare against the plan's expected
   values, then `mise x -- cargo insta accept`. Never blind-accept.
 - Edition 2024 makes `std::env::set_var` unsafe and the workspace forbids
@@ -293,8 +313,9 @@ credentials, hook input, or sandbox rules.
   so never go back to deriving it.
 - Rotating a file named in `secrets` changes `ResolvedPlugin::hash` and so
   restarts the plugin on the next sync. That is intended.
-- `matrix-sdk` is a large tree and only `hecaton-plugin-matrix` depends on
-  it. Keep it that way, and run `cargo deny` when bumping it.
+- `matrix-sdk` is a large tree, isolated in the standalone `plugins/matrix`
+  project and out of the core workspace's resolution entirely; run
+  `cargo deny` there when bumping it.
 - A plugin that needs daemon-level config implements `Plugin::configure`.
   The daemon may deliver an `activate` before `configure` returns, so such a
   plugin must buffer, as the matrix actor does.
@@ -324,7 +345,7 @@ credentials, hook input, or sandbox rules.
   of truth (mirrored to the daemon's KV) and `.routes` is derived from it
   and rebuilt at startup (`Maps::load`), never persisted itself — don't add
   a second place that writes routes.
-- The actor's inbound `Queue` (`crates/hecaton-plugin-matrix/src/actor.rs`)
+- The actor's inbound `Queue` (`plugins/matrix/src/actor.rs`)
   is bounded and drops its *oldest* entry rather than blocking its
   producer: `observe` is a daemon-to-plugin HTTP call and must return, so a
   slow or wedged homeserver can never stall hook delivery to Claude. It can

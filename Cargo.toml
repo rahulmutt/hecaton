@@ -17,9 +17,6 @@ hecaton-api = { path = "crates/hecaton-api" }
 hecaton-core = { path = "crates/hecaton-core" }
 hecaton-config = { path = "crates/hecaton-config" }
 hecaton-plugin-sdk = { path = "crates/hecaton-plugin-sdk" }
-hecaton-plugin-flow = { path = "crates/hecaton-plugin-flow" }
-hecaton-plugin-matrix = { path = "crates/hecaton-plugin-matrix" }
-hecaton-plugin-web = { path = "crates/hecaton-plugin-web" }
 hecaton-runtime = { path = "crates/hecaton-runtime" }
 hecaton-server = { path = "crates/hecaton-server" }
 
@@ -55,23 +52,6 @@ tokio-tungstenite = "0.30.0"
 # hand-rolled pre_exec would need lives in this crate instead.
 portable-pty = "0.9.0"
 prometheus = "0.14.0"
-# The Matrix client for hecaton-plugin-matrix (Spec G-9), the only crate in
-# the workspace that depends on it. Default features carry `e2e-encryption`
-# (the crew rooms are encrypted), `sqlite` (the state and crypto store the
-# plugin keeps under its scratch dir) and `automatic-room-key-forwarding`;
-# `markdown` gives the `body` plus `formatted_body` pair every message the
-# plugin sends carries, and `bundled-sqlite` compiles SQLite in so no system
-# libsqlite3 is needed. TLS is not a choice here: matrix-sdk exposes no TLS
-# feature and depends on reqwest's `rustls` unconditionally.
-matrix-sdk = { version = "0.18.0", features = ["markdown", "bundled-sqlite"] }
-# The flow plugin's rule matcher (plugins spec §8.1, §17.2): full-match
-# regexes with a 10 KiB size limit. Already in the lock through
-# tracing-subscriber; now a direct, exact dependency.
-regex = "1.13.1"
-# Attaches the config path (`states.working.on[1].foo`) to serde's error so
-# a plugin config error reads like every other hecaton config error
-# (plugins spec §17.2); a hand-written walker would duplicate the schema.
-serde_path_to_error = "0.1.20"
 chacha20poly1305 = "0.11.0"
 rand = "0.10.2"
 tracing = "0.1.44"

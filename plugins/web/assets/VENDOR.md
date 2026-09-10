@@ -1,7 +1,7 @@
 # Vendored assets
 
 Fetched and verified by `scripts/vendor-xterm.sh`; served by
-`crates/hecaton-plugin-web/src/routes.rs` under `/assets/`. Minified builds
+`plugins/web/src/routes.rs` under `/assets/`. Minified builds
 only, kept verbatim (the trailing `sourceMappingURL` comment is harmless:
 no map is served). MIT, `LICENSE.xterm`.
 

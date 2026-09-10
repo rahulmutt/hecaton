@@ -2,3 +2,4 @@
 *.snap.new
 .mise.local.toml
 mutants.out/
+plugins/*/target

@@ -49,12 +49,19 @@ against what was declared.
   state machine over hook events (`config.rs` parses and compiles the
   `plugins.flow` block, `machine.rs` is the pure step, `plugin.rs` owns the
   agents, the KV-mirrored state and the metrics). Plugin crates depend on
-  the SDK and `api` only.
+  the SDK and `api` only, and are not workspace members: each is a
+  standalone project under `plugins/<name>/` with its own lockfile and
+  dependency table (Spec H).
 - `hecaton-plugin-web` — the second in-tree plugin: a per-agent `enabled`
   flag (`config.rs`), a cache fed by `fleets/watch` (`state.rs`), the
   index, terminal page and the bridge to the daemon's attach on a
   vendored xterm.js (`routes.rs`, `assets/`), the review page with the
   diff, line comments and the agent's hook events (`review.rs`, `state.rs`).
+- `hecaton-plugin-matrix` — the third in-tree plugin: a Matrix room per
+  crew and a thread per agent session, with thread replies coming back as
+  `send_text` (Spec G). Its `matrix-sdk` tree is larger than the rest of
+  the repository put together, which is why plugins stopped being
+  workspace members.
 
 ## How it flows
 **Config (Phase 1):** `read` (file.rs) → `resolve` (resolve.rs): for each agent fold

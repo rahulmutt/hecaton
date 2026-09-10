@@ -1,5 +1,5 @@
 ---
-source: crates/hecaton-plugin-matrix/src/render.rs
+source: src/render.rs
 expression: "rendered.join(\"\\n\\n---\\n\\n\")"
 ---
 SessionStart
