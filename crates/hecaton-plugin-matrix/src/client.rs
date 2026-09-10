@@ -29,7 +29,7 @@ use matrix_sdk::ruma::events::room::message::{
 };
 use matrix_sdk::ruma::{EventId, RoomId, UserId, uint};
 use matrix_sdk::store::{RoomLoadSettings, StateStoreDataKey};
-use matrix_sdk::{Client, RoomState, SessionChange, SessionMeta, SessionTokens};
+use matrix_sdk::{Client, HttpError, RoomState, SessionChange, SessionMeta, SessionTokens};
 
 use crate::actor::{Actor, Command, Counters, Health, Queue};
 use crate::config::{DaemonConfig, Secret};
@@ -57,6 +57,12 @@ async fn build(config: &DaemonConfig, store_dir: &Path) -> Result<Client, Matrix
     Client::builder()
         .homeserver_url(&config.homeserver)
         .sqlite_store(store_dir, None)
+        // Without this the client never refreshes: on `M_UNKNOWN_TOKEN` it
+        // broadcasts and gives up, and `SessionChange::TokensRefreshed`,
+        // which `reseal_on_refresh` waits for, is only ever sent by the
+        // refresh this flag gates. `request_refresh_token()` at login only
+        // advertises that we support refreshing (G-8).
+        .handle_refresh_tokens()
         .build()
         .await
         .map_err(|e| MatrixError::Other(format!("building the client: {e}")))
@@ -124,7 +130,27 @@ async fn login(
 async fn whoami(client: &Client) -> Result<String, MatrixError> {
     match client.whoami().await {
         Ok(response) => Ok(response.user_id.to_string()),
-        Err(e) => Err(classify(e.as_client_api_error(), format!("whoami: {e}"))),
+        Err(e) => Err(classify_http(&e, format!("whoami: {e}"))),
+    }
+}
+
+/// A failure from a call that returns `HttpResult`.
+fn classify_http(e: &HttpError, message: String) -> MatrixError {
+    // With `handle_refresh_tokens` on, a refresh the homeserver rejected
+    // comes back as its own variant rather than as a Matrix error, so
+    // `as_client_api_error` sees nothing. The session is dead either way,
+    // and only `Auth` takes the launcher's session-clearing path.
+    if matches!(e, HttpError::RefreshToken(_)) {
+        return MatrixError::Auth(message);
+    }
+    classify(e.as_client_api_error(), message)
+}
+
+/// A failure from a call that returns the SDK's own `Result`.
+fn classify_error(e: &matrix_sdk::Error, message: String) -> MatrixError {
+    match e {
+        matrix_sdk::Error::Http(http) => classify_http(http, message),
+        other => classify(other.as_client_api_error(), message),
     }
 }
 
@@ -199,10 +225,11 @@ impl MatrixPort for MatrixClient {
             )
             .to_raw_any(),
         ];
-        let room =
-            self.client.create_room(request).await.map_err(|e| {
-                classify(e.as_client_api_error(), format!("create room {name}: {e}"))
-            })?;
+        let room = self
+            .client
+            .create_room(request)
+            .await
+            .map_err(|e| classify_error(&e, format!("create room {name}: {e}")))?;
         Ok(room.room_id().to_string())
     }
 
@@ -226,7 +253,7 @@ impl MatrixPort for MatrixClient {
         let sent = target
             .send(content)
             .await
-            .map_err(|e| classify(e.as_client_api_error(), format!("send to {room}: {e}")))?;
+            .map_err(|e| classify_error(&e, format!("send to {room}: {e}")))?;
         Ok(sent.response.event_id.to_string())
     }
 
@@ -238,7 +265,7 @@ impl MatrixPort for MatrixClient {
         target
             .send(content)
             .await
-            .map_err(|e| classify(e.as_client_api_error(), format!("react in {room}: {e}")))?;
+            .map_err(|e| classify_error(&e, format!("react in {room}: {e}")))?;
         Ok(())
     }
 }
@@ -335,7 +362,15 @@ async fn reseal_on_refresh(host: Host, client: Client, session: Session) {
                     tracing::warn!("matrix: re-sealing the refreshed session: {e}");
                 }
             }
-            Ok(_) => {}
+            Ok(SessionChange::UnknownToken(_)) => {
+                // With refreshing on, this means the refresh itself was
+                // refused: the cached record is now worthless and only a
+                // password can replace it (§5.2 step 4, at the next start).
+                tracing::warn!(
+                    "matrix: the homeserver rejected our session and it could not be \
+                     refreshed; configure a password so the next start can log in again"
+                );
+            }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }
