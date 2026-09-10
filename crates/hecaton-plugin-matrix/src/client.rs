@@ -295,8 +295,9 @@ impl MatrixPort for MatrixClient {
 /// The inbound pump: a sync loop that reconnects for as long as the process
 /// lives, pushing `Command::Inbound` onto `queue` for every text message in
 /// a room the account is in. It gives up only when the homeserver rejects
-/// the session, which no amount of reconnecting would mend.
-async fn start_inbound_pump(client: Client, queue: Arc<Queue>) {
+/// the session, which no amount of reconnecting would mend, and it fails
+/// `health` on the way out so `plugin list` says so.
+async fn start_inbound_pump(client: Client, queue: Arc<Queue>, health: Health) {
     // The returned handle only exists to remove the handler again, which
     // nothing here ever does: the pump lives as long as the process.
     client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
@@ -348,10 +349,16 @@ async fn start_inbound_pump(client: Client, queue: Arc<Queue>) {
         // to act on. Breaking out here leaves the launcher's §5.2 step 4
         // path to clear the cached session at the next start.
         if let MatrixError::Auth(message) = classify_error(&e, format!("sync: {e}")) {
-            tracing::error!(
-                "matrix: {message}; no reply can arrive until the plugin is restarted \
-                 with a session the homeserver accepts"
+            let message = format!(
+                "{message}; no reply can arrive until the plugin is restarted with a \
+                 session the homeserver accepts"
             );
+            tracing::error!("matrix: {message}");
+            // Nothing sets the cell back to ok except a newly created or
+            // newly pinned crew room, so this stands until an operator acts:
+            // `Plugin::health` reads it straight through to the daemon's
+            // health poll and `plugin list`.
+            health.fail(message);
             return;
         }
         // A sync that ran longer than the cap was a working connection, so
@@ -519,7 +526,7 @@ impl Launcher for MatrixLauncher {
             client.clone(),
             session,
         ));
-        tokio::spawn(start_inbound_pump(client, queue));
+        tokio::spawn(start_inbound_pump(client, queue, self.health.clone()));
         Ok(())
     }
 }
