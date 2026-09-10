@@ -18,7 +18,6 @@ hecaton-core = { path = "crates/hecaton-core" }
 hecaton-config = { path = "crates/hecaton-config" }
 hecaton-plugin-sdk = { path = "crates/hecaton-plugin-sdk" }
 hecaton-plugin-matrix = { path = "crates/hecaton-plugin-matrix" }
-hecaton-plugin-web = { path = "crates/hecaton-plugin-web" }
 hecaton-runtime = { path = "crates/hecaton-runtime" }
 hecaton-server = { path = "crates/hecaton-server" }
 

@@ -1157,10 +1157,10 @@ fn web_package() -> Option<PathBuf> {
 }
 
 /// `GET` with explicit headers, no redirects followed: status, headers, body.
-/// The sha256 `crates/hecaton-plugin-web/assets/VENDOR.md` records for
+/// The sha256 `plugins/web/assets/VENDOR.md` records for
 /// `file`: the last backticked field of its table row.
 fn vendored_sha256(file: &str) -> String {
-    let vendor = include_str!("../../hecaton-plugin-web/assets/VENDOR.md");
+    let vendor = include_str!("../../../plugins/web/assets/VENDOR.md");
     let row = vendor
         .lines()
         .find(|l| l.starts_with(&format!("| `{file}` |")))

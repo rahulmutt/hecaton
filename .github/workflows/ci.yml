@@ -31,7 +31,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        plugin: [flow]
+        plugin: [flow, web]
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2

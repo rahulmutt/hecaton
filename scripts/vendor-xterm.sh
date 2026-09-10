@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Fetches the pinned xterm.js build and installs it into
-# crates/hecaton-plugin-web/assets/ only after every file has verified
+# plugins/web/assets/ only after every file has verified
 # against its VENDOR.md row (plugins spec §18.5). cargo audit and deny.toml
 # do not cover JavaScript; the recorded digests are the supply-chain
 # control. To bump: change the versions below, run this (it prints the new
@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 
 XTERM=6.0.0
 FIT=0.11.0
-out=crates/hecaton-plugin-web/assets
+out=plugins/web/assets
 files=(xterm.js xterm.css addon-fit.js)
 
 # The digest VENDOR.md records for one file: the last backticked field of
