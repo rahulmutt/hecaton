@@ -272,7 +272,10 @@ Neither blocks the work; both are consequences worth confirming.
 - rust-analyzer sees only the root workspace by default. A linked-projects
   setting listing all four is a small convenience.
 - Renovate's cargo manager detects every `Cargo.toml`, so four lockfiles
-  should need no config change. Confirm after its first scheduled run.
+  should need no config change. `renovate.json` sets `lockFileMaintenance`
+  for Monday mornings; confirm after the first run that all four lockfiles
+  are being maintained, and add `"enabledManagers"` scoping only if one is
+  missed.
 
 ## 13. Done when
 

@@ -825,7 +825,7 @@ no new dependency.
 
 ### 17.6 Crate, package and distribution
 
-`crates/hecaton-plugin-flow` is a library (`config.rs`: types, validation,
+`plugins/flow` is a library (`config.rs`: types, validation,
 compilation; `machine.rs`: the pure step function, where the property tests
 live; `plugin.rs`: the `Plugin` impl owning the agent map, the `Host` for
 KV and the `Metrics`) and a thin binary (`main.rs`: `Env::from_process`,
@@ -863,7 +863,7 @@ Layers, following §11: unit tests in the flow crate asserting every
 validation error's exact text and the step function's rules; `proptest` in
 `machine.rs` (the fired rule equals a naive reference matcher's; a validated
 config never panics on any event; every `goto` lands in a declared state);
-plugin integration through `Harness` in `crates/hecaton-plugin-flow/tests/`
+plugin integration through `Harness` in `plugins/flow/tests/`
 (rejection with path, merged verdict, actions, transitions and metrics,
 restart resumes, deactivate and changed config reset, unknown agent passes
 through); the conformance fixtures replayed unchanged, `metrics.json` now
@@ -1104,7 +1104,7 @@ tab, no subprocess per viewer, no `SIGWINCH` bridge, no idle timer, an
 empty `[tools]` like flow, and the unverified "`ttyd` behind two proxies"
 row of §11.1 is closed as *not used*.
 
-**Crate and package.** `crates/hecaton-plugin-web`, a library plus thin
+**Crate and package.** `plugins/web`, a library plus thin
 binary like flow: `config.rs` (the per-agent block), `state.rs` (the
 watch-fed cache), `routes.rs` (the router and the bridge), `plugin.rs`
 (the `Plugin` impl). `package/mise.toml` has an empty `[tools]` and a
@@ -1137,7 +1137,7 @@ fleets`, so an index that is right at all proves the watch path (§17.1).
   with cache headers.
 
 **Vendored assets.** `@xterm/xterm` 6.0.0 and `@xterm/addon-fit` 0.11.0,
-the minified builds only, under `crates/hecaton-plugin-web/assets/`, with
+the minified builds only, under `plugins/web/assets/`, with
 `VENDOR.md` recording the npm tarball URL and sha256 of each file and
 `scripts/vendor-xterm.sh` re-fetching and verifying them. About 400 KB in
 the repo; `cargo audit` and `deny.toml` do not cover it, so the recorded

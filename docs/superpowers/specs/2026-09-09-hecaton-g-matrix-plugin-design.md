@@ -70,7 +70,7 @@ live agent. §9.3 makes the first-sync rule explicit.
 ## 3. Crate and modules
 
 ```
-crates/hecaton-plugin-matrix/
+plugins/matrix/
   Cargo.toml
   src/
     main.rs      env, tracing, build, serve; failures print `matrix: …`, exit 1
