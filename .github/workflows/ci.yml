@@ -22,6 +22,22 @@ jobs:
         with: { version: 2026.9.2, install: false, cache: true }
       - run: mise install rust cargo:cargo-nextest cargo-insta tmux nono gh gitleaks
       - run: mise run check
+  # Each plugin is a standalone project with its own lockfile (Spec H), so
+  # each gets its own job and its own cache. They run concurrently with
+  # `check`, which no longer lints or tests any of them (it still builds
+  # the ones the e2e packages, from their own projects).
+  plugins:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin: [flow]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with: { version: 2026.9.2, install: false, cache: true }
+      - run: mise install rust cargo:cargo-nextest
+      - run: mise run plugin ${{ matrix.plugin }}
   mutants:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
