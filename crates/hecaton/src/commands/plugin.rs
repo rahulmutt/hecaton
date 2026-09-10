@@ -85,10 +85,17 @@ pub fn load_file(path: &Path) -> Result<PluginsFile> {
 /// Rewrites the file; comments are not preserved. Atomic (sibling temp file
 /// then rename), so a crash or a full disk cannot leave the operator's
 /// source of truth truncated — `serve` fail-fasts on an unreadable one.
-/// 0644: it holds no secrets.
+///
+/// 0600: an entry's `config` may hold a credential inline (spec G §4.1
+/// permits an inline `password`; the `secrets` map is the alternative, not
+/// the only route), and `write_atomic` sets the mode on the temp file it
+/// renames into place, so any weaker mode here would silently widen a file
+/// an operator had locked down on the next `plugin install`/`plugin
+/// remove`. Nothing but the daemon, running as this same user, ever reads
+/// it — the same rule `resolve_secrets` already enforces on a secret file.
 pub fn save_file(path: &Path, file: &PluginsFile) -> Result<()> {
     let text = serde_norway::to_string(file)?;
-    write_atomic(path, text.as_bytes(), 0o644).with_context(|| path.display().to_string())
+    write_atomic(path, text.as_bytes(), 0o600).with_context(|| path.display().to_string())
 }
 
 pub fn install_entry(file: &mut PluginsFile, entry: PluginEntry) -> Result<()> {
@@ -374,6 +381,35 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(left, ["plugins.yaml"], "no temp file left behind");
+    }
+
+    /// An entry's `config` may carry an inline `password` (spec G §4.1), so
+    /// the file every `plugin install`/`plugin remove` rewrites must not be
+    /// readable by group or others — and a rewrite must not widen a file the
+    /// operator already locked down.
+    #[test]
+    fn the_written_file_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hecaton").join("plugins.yaml");
+        let mut file = PluginsFile::default();
+        install_entry(
+            &mut file,
+            PluginEntry {
+                name: "matrix".into(),
+                source: "/pkg/matrix".into(),
+                sha256: None,
+                secrets: Default::default(),
+                config: serde_json::json!({ "password": "hunter2" }),
+            },
+        )
+        .unwrap();
+        for _ in 0..2 {
+            save_file(&path, &file).unwrap();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "plugins.yaml is mode {mode:04o}");
+        }
     }
 
     /// `--purge` on an entry that is already gone still reaches the daemon:
