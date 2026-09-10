@@ -20,8 +20,8 @@ allow = [
   # The Mozilla root certificate bundle, as data: `webpki-roots` (a direct
   # dependency of matrix-sdk) and `webpki-root-certs` (through
   # rustls-platform-verifier, which reqwest's `rustls` feature pulls in).
-  # A permissive data licence with no copyleft and no attribution beyond
-  # the notice we already ship.
+  # A permissive data licence with no copyleft, whose only condition on
+  # redistribution is that its disclaimer travels with the data.
   "CDLA-Permissive-2.0",
   # `xxhash-rust`, through growable-bloom-filter in matrix-sdk-base. The
   # Boost licence: OSI approved, FSF free, permissive, and it does not even
