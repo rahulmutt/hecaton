@@ -1,5 +1,19 @@
 # hecaton
 
+> ## This project is now Balerix
+>
+> Development continues as **[balerix-ai/balerix](https://github.com/balerix-ai/balerix)**.
+> This repository is archived and read-only — nothing here will be updated
+> again. It is kept for the commit history, which the move squashed into a
+> single import commit.
+>
+> The name changed everywhere it appeared: the `balerix` binary and the
+> `balerix-*` crates, the `BALERIX_*` environment variables, the `balerix_*`
+> metric families, the `X-Balerix-Forwarded-Prefix` header, the XDG config and
+> state directories, and `balerix-plugin.yaml`, the plugin package manifest.
+> Nothing was ever published under the old name, so there are no compatibility
+> aliases — point at the new repository and use the new names.
+
 A control plane and orchestrator for fleets of coding agents (Claude Code
 first), driven over a loopback HTTP API from a thin CLI. Agents run isolated — own
 `$HOME`, own tools, own sandbox — as tmux windows grouped into crews that share
