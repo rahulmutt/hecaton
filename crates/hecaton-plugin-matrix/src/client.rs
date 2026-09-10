@@ -50,6 +50,12 @@ const MAX_RETRY_MS: u64 = 60_000;
 /// it will ever wait between two.
 const SYNC_BACKOFF_MIN: Duration = Duration::from_secs(1);
 const SYNC_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// How many syncs in a row must fail authentication before the pump gives
+/// up. Giving up is permanent until the plugin restarts, and a bare 401
+/// from an intermediary — a body that is not even Matrix JSON still carries
+/// its status into `classify` — must not cost that. A token that is really
+/// dead fails every time and still stops the pump, seconds later.
+const AUTH_FAILURES_BEFORE_STOPPING: u32 = 3;
 
 /// The `MatrixPort` the actor drives. `user_id` is the homeserver's own
 /// rendering of this account's id, taken from `whoami`, because the actor
@@ -337,6 +343,7 @@ async fn start_inbound_pump(client: Client, queue: Arc<Queue>, health: Health) {
     // reconnect lives here, and only here.
     let mut backoff = SYNC_BACKOFF_MIN;
     let mut failures: u64 = 0;
+    let mut auth_failures: u32 = 0;
     loop {
         let started = Instant::now();
         let Err(e) = sync(&client).await else {
@@ -345,27 +352,38 @@ async fn start_inbound_pump(client: Client, queue: Arc<Queue>, health: Health) {
             tracing::error!("matrix: the sync loop ended; no reply can arrive");
             return;
         };
-        // The one failure retrying cannot fix, and the one an operator has
-        // to act on. Breaking out here leaves the launcher's §5.2 step 4
-        // path to clear the cached session at the next start.
-        if let MatrixError::Auth(message) = classify_error(&e, format!("sync: {e}")) {
-            let message = format!(
-                "{message}; no reply can arrive until the plugin is restarted with a \
-                 session the homeserver accepts"
-            );
-            tracing::error!("matrix: {message}");
-            // Nothing sets the cell back to ok except a newly created or
-            // newly pinned crew room, so this stands until an operator acts:
-            // `Plugin::health` reads it straight through to the daemon's
-            // health poll and `plugin list`.
-            health.fail(message);
-            return;
-        }
         // A sync that ran longer than the cap was a working connection, so
-        // the next outage starts its backoff from the bottom again.
+        // the next outage starts its backoff from the bottom, and whatever
+        // ends this one is the first failure of a new episode.
         if started.elapsed() > SYNC_BACKOFF_MAX {
             backoff = SYNC_BACKOFF_MIN;
             failures = 0;
+            auth_failures = 0;
+        }
+        // The one failure retrying cannot fix, and the one an operator has
+        // to act on — but only once it has happened often enough in a row to
+        // be the session rather than something in the way. Any other
+        // outcome, and any sync that lasted, starts the count over.
+        // Stopping here leaves the launcher's §5.2 step 4 path to clear the
+        // cached session at the next start.
+        if let MatrixError::Auth(message) = classify_error(&e, format!("sync: {e}")) {
+            auth_failures += 1;
+            if auth_failures >= AUTH_FAILURES_BEFORE_STOPPING {
+                let message = format!(
+                    "{message}; rejected {auth_failures} times in a row, so no reply can \
+                     arrive until the plugin is restarted with a session the homeserver \
+                     accepts"
+                );
+                tracing::error!("matrix: {message}");
+                // Nothing sets the cell back to ok except a newly created or
+                // newly pinned crew room, so this stands until an operator
+                // acts: `Plugin::health` reads it straight through to the
+                // daemon's health poll and `plugin list`.
+                health.fail(message);
+                return;
+            }
+        } else {
+            auth_failures = 0;
         }
         failures += 1;
         // Loud once, then sparse: a homeserver down overnight must not fill
