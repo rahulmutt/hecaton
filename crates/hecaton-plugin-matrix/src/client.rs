@@ -326,12 +326,25 @@ impl MatrixPort for MatrixClient {
     }
 }
 
+/// Counts one failed sync attempt: `errors_total{kind="sync"}` for every
+/// one, and `errors_total{kind="auth"}` as well when the homeserver
+/// rejected the session (Spec G §10 names both labels). These are the two
+/// the operator of a plugin that has gone deaf sees, and a time series
+/// matters more here than the pump's one log line: the failures repeat,
+/// and the log is sparse on purpose.
+fn count_sync_failure(counters: &Counters, error: &MatrixError) {
+    counters.errors.with_label_values(&["sync"]).inc();
+    if matches!(error, MatrixError::Auth(_)) {
+        counters.errors.with_label_values(&["auth"]).inc();
+    }
+}
+
 /// The inbound pump: a sync loop that reconnects for as long as the process
 /// lives, pushing `Command::Inbound` onto `queue` for every text message in
 /// a room the account is in. It gives up only when the homeserver rejects
 /// the session, which no amount of reconnecting would mend, and it fails
 /// `health` on the way out so `plugin list` says so.
-async fn start_inbound_pump(client: Client, queue: Arc<Queue>, health: Health) {
+async fn start_inbound_pump(client: Client, queue: Arc<Queue>, counters: Counters, health: Health) {
     // The returned handle only exists to remove the handler again, which
     // nothing here ever does: the pump lives as long as the process.
     client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
@@ -394,7 +407,9 @@ async fn start_inbound_pump(client: Client, queue: Arc<Queue>, health: Health) {
         // outcome, and any sync that lasted, starts the count over.
         // Stopping here leaves the launcher's §5.2 step 4 path to clear the
         // cached session at the next start.
-        if let MatrixError::Auth(message) = classify_error(&e, format!("sync: {e}")) {
+        let classified = classify_error(&e, format!("sync: {e}"));
+        count_sync_failure(&counters, &classified);
+        if let MatrixError::Auth(message) = classified {
             auth_failures += 1;
             if auth_failures >= AUTH_FAILURES_BEFORE_STOPPING {
                 let message = format!(
@@ -572,7 +587,12 @@ impl Launcher for MatrixLauncher {
             client.clone(),
             session,
         ));
-        tokio::spawn(start_inbound_pump(client, queue, self.health.clone()));
+        tokio::spawn(start_inbound_pump(
+            client,
+            queue,
+            self.counters.clone(),
+            self.health.clone(),
+        ));
         Ok(())
     }
 }
@@ -599,5 +619,31 @@ mod tests {
             assert!(needs_join(Some(state)), "{state:?} should be joined first");
         }
         assert!(needs_join(None), "a room the store has never seen");
+    }
+
+    /// Spec G §10's `errors_total` names `sync` and `auth`, and only the
+    /// pump can emit either: `sync` counts every failed attempt, `auth` the
+    /// subset the homeserver rejected the session for. Between them they
+    /// are what says the plugin has gone deaf.
+    #[test]
+    fn a_failed_sync_counts_sync_and_a_rejected_session_counts_auth_too() {
+        let metrics = hecaton_plugin_sdk::Metrics::new("matrix");
+        let counters = Counters::new(&metrics).unwrap();
+        let sync = || counters.errors.with_label_values(&["sync"]).get();
+        let auth = || counters.errors.with_label_values(&["auth"]).get();
+
+        count_sync_failure(&counters, &MatrixError::Other("connection refused".into()));
+        assert_eq!((sync(), auth()), (1, 0), "a transient failure is not auth");
+
+        count_sync_failure(&counters, &MatrixError::RateLimited { retry_after_ms: 5 });
+        assert_eq!((sync(), auth()), (2, 0));
+
+        count_sync_failure(&counters, &MatrixError::Auth("sync: 401".into()));
+        assert_eq!((sync(), auth()), (3, 1), "a rejected session counts both");
+
+        let text = metrics.render().unwrap();
+        for label in ["kind=\"sync\"", "kind=\"auth\""] {
+            assert!(text.contains(label), "missing {label} in\n{text}");
+        }
     }
 }
