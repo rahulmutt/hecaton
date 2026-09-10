@@ -251,6 +251,30 @@ from the core policy assumes nothing else in the daemon's tree needs them. If
 something does, the entry stays with a reason naming the real dependency
 instead of matrix.
 
+## 10.1 Measured result
+
+| Measure | Before | After |
+|---|---|---|
+| `check` cold build | 143 s | 57 s |
+| core target size | 12 GB | 5.4 GB |
+| core lockfile packages | 524 | 270 |
+| core duplicated crate names | 37 | 16 |
+| matrix project cold build | (inside the 143 s) | 154 s |
+| tests, core / flow / web / matrix | 570 in one tier | 464 / 18 / 22 / 66 (sum 570) |
+
+Core `reqwest` features after the split: `json` only.
+
+Measured on a 24-core, 125 GiB machine, matching the core count of the
+24-core machine described in §1 that produced the "before" column and the
+brief's extrapolated "after" estimates (about 47 s core, about 115 s
+matrix). The core cold build (57 s) and the matrix cold build (154 s) both
+ran somewhat slower here than those estimates — plausibly disk speed or
+background load on this host rather than a difference in what gets
+compiled — but the shape of the result is unchanged: the core gate dropped
+from 143 s to 57 s (a 60% cut), and the matrix build that used to be inside
+that 143 s now runs as its own 154 s job, concurrently with core rather than
+serially inside it.
+
 ## 11. Deliberately deferred
 
 - **Publishing the SDK.** H-3 keeps path dependencies. Publishing
