@@ -77,7 +77,9 @@ packaging loop a straight mapping from directory name to crate name.
 The root workspace keeps seven crates: `hecaton`, `hecaton-api`,
 `hecaton-core`, `hecaton-config`, `hecaton-runtime`, `hecaton-server`,
 `hecaton-plugin-sdk`. Its `members = ["crates/*"]` glob no longer matches any
-plugin, so no `exclude` entry is needed.
+plugin, so no `exclude` entry is needed. `scripts/check-core-deps.sh` asserts
+that member list, so a plugin readmitted through the glob fails the gate even
+if its tree never touches `reqwest`.
 
 Each plugin manifest becomes a standalone project:
 

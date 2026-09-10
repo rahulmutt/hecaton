@@ -1,10 +1,26 @@
 #!/usr/bin/env bash
-# The daemon and client must not inherit a plugin's dependency features.
-# `reqwest` in the core workspace is declared `default-features = false`
-# with only `json`; anything else means a plugin leaked into the core
-# feature resolution (Spec H §1, §4).
+# Two invariants that keep the daemon and client out of a plugin's dependency
+# tree (Spec H §1, §3, §4):
+#
+#   1. The workspace is the seven core crates and nothing else.
+#   2. `reqwest` in that workspace carries `json` and nothing else.
+#
+# The second is the symptom the split was made to cure; the first is the cause,
+# and catches a readmitted plugin whose tree never touches `reqwest` at all.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+# Readmitting a plugin as a workspace member is the tempting fix when its build
+# breaks, and it puts that plugin's whole tree back into the core feature
+# resolution. A genuinely new core crate belongs in this list; a plugin does not.
+expected="hecaton,hecaton-api,hecaton-config,hecaton-core,hecaton-plugin-sdk,hecaton-runtime,hecaton-server"
+members=$(cargo tree --workspace --depth 0 | sed -n 's/^\([a-z][a-z0-9-]*\) v[0-9].*/\1/p' | sort -u | paste -sd, -)
+if [[ $members != "$expected" ]]; then
+  echo "core workspace members are '$members'," >&2
+  echo "expected '$expected' (Spec H §3)." >&2
+  echo "A plugin is a standalone project under plugins/, never a member." >&2
+  exit 1
+fi
 
 # Workspace-wide: cargo unifies features across every package in one
 # build, so the daemon links whatever reqwest the *workspace* resolves to,
@@ -28,4 +44,4 @@ if [[ $have != "json" ]]; then
   echo "core reqwest features are '$have', expected 'json' (a plugin leaked into the core resolution)" >&2
   exit 1
 fi
-echo "core reqwest features are clean (json)"
+echo "core workspace clean: members match Spec H §3, reqwest features are 'json'"
