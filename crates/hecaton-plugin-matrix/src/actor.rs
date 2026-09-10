@@ -5,7 +5,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hecaton_api::{HookEvent, OBSERVER_QUEUE, PluginAction};
 use hecaton_plugin_sdk::metrics::{IntCounter, IntCounterVec, IntGauge};
@@ -20,6 +20,34 @@ use crate::routing::{Maps, Thread, crew_of};
 
 /// Queue depth, the same as the daemon's own observer queues.
 pub const QUEUE: usize = OBSERVER_QUEUE;
+
+/// How long a crew waits after its room creation failed, and the most it
+/// will ever wait. Without this the actor issues one `create_room` per hook
+/// event for a crew whose creation can never succeed — wrong rights, a bad
+/// invite id — which for a busy crew is tens to hundreds of calls a minute
+/// against a homeserver that has already refused: exactly how a rate limit
+/// is earned.
+const CREATE_COOLDOWN_MIN: Duration = Duration::from_secs(5);
+const CREATE_COOLDOWN_MAX: Duration = Duration::from_secs(300);
+
+/// The longest homeserver-requested delay `retry_once` will sit out inline.
+/// It sleeps inside the single actor task, so everything for every crew
+/// waits behind it — and while it waits the drop-oldest queue discards
+/// events for crews that had nothing to do with the rate limit. A longer
+/// delay is not honoured by waiting: the call fails, the caller counts it,
+/// and the next event tries again, spaced by the per-crew cooldown for a
+/// creation and by the event stream itself for a send. Blocking the only
+/// actor for up to a minute is the worse of the two.
+const MAX_INLINE_RETRY: Duration = Duration::from_secs(3);
+
+/// A crew whose room creation failed: when it may be attempted again, and
+/// the wait that produced that instant, which doubles on each further
+/// failure up to `CREATE_COOLDOWN_MAX`.
+#[derive(Debug, Clone)]
+struct Cooldown {
+    until: Instant,
+    wait: Duration,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
@@ -160,6 +188,10 @@ pub struct Actor<M: MatrixPort> {
     pending: Vec<Command>,
     agents: HashMap<String, AgentConfig>,
     maps: Maps,
+    /// Crews whose room creation the homeserver refused, and when each may
+    /// be tried again. Only failures are kept: a crew whose room exists is
+    /// answered from `maps` and never reaches the creation path again.
+    cooldowns: HashMap<String, Cooldown>,
 }
 
 impl<M: MatrixPort> Actor<M> {
@@ -173,7 +205,32 @@ impl<M: MatrixPort> Actor<M> {
             pending: Vec::new(),
             agents: HashMap::new(),
             maps: Maps::new(),
+            cooldowns: HashMap::new(),
         }
+    }
+
+    /// Whether this crew's room creation is still inside the wait its last
+    /// failure earned.
+    fn cooling_down(&self, crew: &str) -> bool {
+        self.cooldowns
+            .get(crew)
+            .is_some_and(|c| Instant::now() < c.until)
+    }
+
+    /// Records a refused creation, doubling the wait the crew has already
+    /// served, up to the cap.
+    fn cool_down(&mut self, crew: &str) {
+        let wait = match self.cooldowns.get(crew) {
+            Some(c) => (c.wait * 2).min(CREATE_COOLDOWN_MAX),
+            None => CREATE_COOLDOWN_MIN,
+        };
+        self.cooldowns.insert(
+            crew.to_string(),
+            Cooldown {
+                until: Instant::now() + wait,
+                wait,
+            },
+        );
     }
 
     /// Replaces the health cell. Only the wiring and its tests use this.
@@ -243,7 +300,8 @@ impl<M: MatrixPort> Actor<M> {
     }
 
     /// The crew's room: known, then pinned, then created. `None` means the
-    /// homeserver refused, which is reported and retried on the next event.
+    /// homeserver refused, which is reported and tried again on a later
+    /// event — not the very next one, if the refusal earned a cooldown.
     async fn room_for(&mut self, agent: &str) -> Option<String> {
         let crew = crew_of(agent)?.to_string();
         if let Some(room) = self.maps.room(&crew) {
@@ -256,12 +314,24 @@ impl<M: MatrixPort> Actor<M> {
         let room = match pinned {
             Some(room) => room,
             None => {
+                if self.cooling_down(&crew) {
+                    // The homeserver refused this crew's room recently.
+                    // Asking again on every hook event is what turns one
+                    // misconfiguration into a flood; the health cell still
+                    // carries the failure, so nothing is hidden by waiting.
+                    tracing::debug!("matrix: room creation for {crew} is cooling down");
+                    return None;
+                }
                 let name = format!("hecaton {crew}");
-                match retry_once(|| self.port.create_room(&name, &invite)).await {
+                // Bound before the match: the closure borrows `self`, and
+                // the arms below need it back to record the outcome.
+                let created = retry_once(|| self.port.create_room(&name, &invite)).await;
+                match created {
                     Ok(room) => {
+                        self.cooldowns.remove(&crew);
                         // The only proven round trip on this path, so the
                         // only place the health cell may go green again.
-                        // The pinned arm below contacts no homeserver at
+                        // The pinned arm above contacts no homeserver at
                         // all: clearing there would let the first event of
                         // a crew with a pre-pinned room wipe the failure
                         // the inbound pump recorded when it gave up on a
@@ -270,6 +340,7 @@ impl<M: MatrixPort> Actor<M> {
                         room
                     }
                     Err(e) => {
+                        self.cool_down(&crew);
                         self.counters
                             .errors
                             .with_label_values(&["create_room"])
@@ -466,8 +537,11 @@ impl<M: MatrixPort> Actor<M> {
 }
 
 /// One port call, retried once on a rate limit after the delay the
-/// homeserver itself asked for. Room creation is rate limited as readily as
-/// a message, so both go through here.
+/// homeserver itself asked for — but only when that delay is short enough
+/// to be worth standing the whole actor still for (`MAX_INLINE_RETRY`).
+/// A longer delay is returned to the caller, which counts it and moves on.
+/// Room creation is rate limited as readily as a message, so both go
+/// through here.
 async fn retry_once<T, F, Fut>(call: F) -> Result<T, MatrixError>
 where
     F: Fn() -> Fut,
@@ -475,7 +549,15 @@ where
 {
     let attempt = call().await;
     if let Err(MatrixError::RateLimited { retry_after_ms }) = attempt {
-        tokio::time::sleep(Duration::from_millis(retry_after_ms)).await;
+        let delay = Duration::from_millis(retry_after_ms);
+        if delay > MAX_INLINE_RETRY {
+            tracing::warn!(
+                "matrix: the homeserver asked for {delay:?}, too long to hold the actor \
+                 for; the next event will try again"
+            );
+            return attempt;
+        }
+        tokio::time::sleep(delay).await;
         return call().await;
     }
     attempt
@@ -639,6 +721,13 @@ mod tests {
             "call {index} is not a thread root: {calls:?}"
         );
         format!("$evt{}:fake", index + 1)
+    }
+
+    fn creations(calls: &[Call]) -> usize {
+        calls
+            .iter()
+            .filter(|c| matches!(c, Call::CreateRoom { .. }))
+            .count()
     }
 
     fn sends(calls: &[Call]) -> Vec<(Option<String>, String)> {
@@ -923,28 +1012,97 @@ mod tests {
         );
     }
 
+    /// A refused room creation earns a cooldown, and the very next event
+    /// must not ask again: a busy crew fires tens to hundreds of events a
+    /// minute, and a room the homeserver will not create refuses every one
+    /// of them, which is how the plugin earns a rate limit. Each further
+    /// refusal doubles the wait; a success clears both the cooldown and the
+    /// health failure.
     #[tokio::test]
-    async fn a_failed_room_creation_is_reported_and_retried_on_the_next_event() {
-        let (_fake, port, mut a) = actor().await;
-        let health = Health::new();
-        a.set_health(health.clone());
+    async fn a_failed_room_creation_cools_down_before_it_is_tried_again() {
+        let (_fake, port, mut a, health) = actor_watching_health().await;
         a.handle(Command::Configure(daemon_config())).await;
         a.handle(Command::Activate {
             agent: "f/c/alice".into(),
             config: agent_config(&["Notification"]),
         })
         .await;
+        async fn start(a: &mut Actor<FakePort>) {
+            a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
+                .await;
+        }
+        // The cooldown runs on the real clock, which the actor has no seam
+        // for, so the test moves the deadline rather than waiting it out.
+        let expire = |a: &mut Actor<FakePort>| {
+            for c in a.cooldowns.values_mut() {
+                c.until = Instant::now();
+            }
+        };
 
+        // `FakePort` records only the calls it lets through, so a recorded
+        // `CreateRoom` is the proof an attempt was made and a cooldown the
+        // proof one was refused.
         port.fail_next(crate::matrix::MatrixError::Other("no rights".into()));
-        a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
-            .await;
+        start(&mut a).await;
         assert!(health.get().is_err(), "the failure is visible");
-        assert!(sends(&port.calls()).is_empty());
+        assert_eq!(
+            a.cooldowns["f/c"].wait, CREATE_COOLDOWN_MIN,
+            "the refusal earned the first wait"
+        );
+        assert!(port.take_calls().is_empty());
 
-        a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
-            .await;
-        assert_eq!(sends(&port.calls()).len(), 1, "the next event retries");
-        assert_eq!(health.get(), Ok(()), "and clears the failure");
+        start(&mut a).await;
+        assert!(
+            port.take_calls().is_empty(),
+            "the next event asked the homeserver again inside the cooldown"
+        );
+
+        expire(&mut a);
+        port.fail_next(crate::matrix::MatrixError::Other("no rights".into()));
+        start(&mut a).await;
+        assert_eq!(
+            a.cooldowns["f/c"].wait,
+            CREATE_COOLDOWN_MIN * 2,
+            "the wait let one attempt through, and its refusal waits twice as long"
+        );
+
+        expire(&mut a);
+        start(&mut a).await;
+        let calls = port.take_calls();
+        assert_eq!(creations(&calls), 1);
+        assert_eq!(sends(&calls).len(), 1, "and the thread root follows");
+        assert_eq!(health.get(), Ok(()), "a created room clears the failure");
+        assert!(
+            a.cooldowns.is_empty(),
+            "and the crew is out of its cooldown"
+        );
+    }
+
+    /// `retry_once` sleeps inside the one actor task, so a long delay would
+    /// stand every crew's events still and let the drop-oldest queue throw
+    /// them away. Past `MAX_INLINE_RETRY` the call returns instead, and the
+    /// caller counts the error and moves on.
+    #[tokio::test]
+    async fn a_long_rate_limit_delay_returns_instead_of_holding_the_actor() {
+        let calls = std::cell::Cell::new(0);
+        let long = MatrixError::RateLimited {
+            retry_after_ms: 60_000,
+        };
+        let started = Instant::now();
+        let result: Result<(), MatrixError> = retry_once(|| {
+            calls.set(calls.get() + 1);
+            let error = long.clone();
+            async move { Err(error) }
+        })
+        .await;
+
+        assert_eq!(result, Err(long));
+        assert_eq!(calls.get(), 1, "it must not have retried");
+        assert!(
+            started.elapsed() < MAX_INLINE_RETRY,
+            "the actor slept the delay out: {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

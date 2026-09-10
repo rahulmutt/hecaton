@@ -41,10 +41,11 @@ use crate::session::{self, Plan, Session};
 /// sleeps this before its one retry, so it has to be a number; every
 /// homeserver that implements `M_LIMIT_EXCEEDED` sends its own.
 const DEFAULT_RETRY_MS: u64 = 1_000;
-/// The longest delay the adapter will pass on. The actor sleeps the delay
-/// it is given with its queue standing still, so a homeserver that answers
-/// with a wild `retry_after`, or a timestamp years out, would otherwise
-/// take the plugin down for as long as it liked.
+/// The longest delay the adapter will pass on. What stands between a wild
+/// `retry_after` and a stalled plugin is the actor, which sits out only a
+/// short delay inline (`actor::MAX_INLINE_RETRY`) and declines a long one
+/// rather than holding every crew's events still; this clamp keeps a
+/// timestamp years out from reaching it as a number at all.
 const MAX_RETRY_MS: u64 = 60_000;
 /// How long the inbound pump waits before its first reconnect, and the most
 /// it will ever wait between two.
