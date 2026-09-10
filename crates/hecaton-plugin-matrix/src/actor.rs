@@ -258,7 +258,17 @@ impl<M: MatrixPort> Actor<M> {
             None => {
                 let name = format!("hecaton {crew}");
                 match retry_once(|| self.port.create_room(&name, &invite)).await {
-                    Ok(room) => room,
+                    Ok(room) => {
+                        // The only proven round trip on this path, so the
+                        // only place the health cell may go green again.
+                        // The pinned arm below contacts no homeserver at
+                        // all: clearing there would let the first event of
+                        // a crew with a pre-pinned room wipe the failure
+                        // the inbound pump recorded when it gave up on a
+                        // dead session, while no reply can still arrive.
+                        self.health.ok();
+                        room
+                    }
                     Err(e) => {
                         self.counters
                             .errors
@@ -274,7 +284,6 @@ impl<M: MatrixPort> Actor<M> {
         if let Err(e) = self.maps.set_room(&self.host, &crew, &room).await {
             tracing::warn!("matrix: storing room for {crew}: {e}");
         }
-        self.health.ok();
         self.publish_gauges();
         Some(room)
     }
@@ -596,11 +605,19 @@ mod tests {
         e
     }
 
-    async fn actor() -> (FakeHost, FakePort, Actor<FakePort>) {
+    /// An actor holding the health cell the test also keeps, for the two
+    /// tests that assert on what does and does not clear a failure.
+    async fn actor_watching_health() -> (FakeHost, FakePort, Actor<FakePort>, Health) {
         let fake = FakeHost::start("tok", json!({}), Vec::new()).await;
         let host = Host::new(fake.env("matrix", std::path::Path::new("scratch"))).unwrap();
         let port = FakePort::new("@hecaton:example.org");
-        let a = Actor::new(host, port.clone(), counters(), Health::new());
+        let health = Health::new();
+        let a = Actor::new(host, port.clone(), counters(), health.clone());
+        (fake, port, a, health)
+    }
+
+    async fn actor() -> (FakeHost, FakePort, Actor<FakePort>) {
+        let (fake, port, a, _health) = actor_watching_health().await;
         (fake, port, a)
     }
 
@@ -874,6 +891,36 @@ mod tests {
             port.calls().first(),
             Some(Call::Send { room, .. }) if room == "!pinned:example.org"
         ));
+    }
+
+    /// `health.ok()` may only ever follow a proven round trip to the
+    /// homeserver. The pinned-room path contacts no server, so the first
+    /// event for a crew with a pre-pinned room must not clear the failure
+    /// the inbound pump recorded when it gave up on a dead session: no
+    /// reply can still arrive, and `plugin list` has to keep saying so.
+    #[tokio::test]
+    async fn a_pinned_room_does_not_clear_a_failure_it_never_disproved() {
+        let (_fake, port, mut a, health) = actor_watching_health().await;
+        let mut cfg = daemon_config();
+        cfg.rooms.insert("f/c".into(), "!pinned:example.org".into());
+        a.handle(Command::Configure(cfg)).await;
+        a.handle(Command::Activate {
+            agent: "f/c/alice".into(),
+            config: agent_config(&["Notification"]),
+        })
+        .await;
+        let deaf = "sync: the homeserver rejected our session".to_string();
+        health.fail(deaf.clone());
+
+        a.handle(Command::Events(vec![started("f/c/alice", "s1", "startup")]))
+            .await;
+
+        assert_eq!(sends(&port.calls()).len(), 1, "the event was still posted");
+        assert_eq!(
+            health.get(),
+            Err(deaf),
+            "a path that reached no homeserver cleared the failure"
+        );
     }
 
     #[tokio::test]
