@@ -10,7 +10,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use hecaton_plugin_sdk::Host;
 use matrix_sdk::authentication::matrix::MatrixSession;
@@ -46,6 +46,10 @@ const DEFAULT_RETRY_MS: u64 = 1_000;
 /// with a wild `retry_after`, or a timestamp years out, would otherwise
 /// take the plugin down for as long as it liked.
 const MAX_RETRY_MS: u64 = 60_000;
+/// How long the inbound pump waits before its first reconnect, and the most
+/// it will ever wait between two.
+const SYNC_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const SYNC_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 /// The `MatrixPort` the actor drives. `user_id` is the homeserver's own
 /// rendering of this account's id, taken from `whoami`, because the actor
@@ -288,9 +292,10 @@ impl MatrixPort for MatrixClient {
     }
 }
 
-/// The sync loop. Runs until the homeserver stops talking to us, pushing
-/// `Command::Inbound` onto `queue` for every text message in a room the
-/// account is in.
+/// The inbound pump: a sync loop that reconnects for as long as the process
+/// lives, pushing `Command::Inbound` onto `queue` for every text message in
+/// a room the account is in. It gives up only when the homeserver rejects
+/// the session, which no amount of reconnecting would mend.
 async fn start_inbound_pump(client: Client, queue: Arc<Queue>) {
     // The returned handle only exists to remove the handler again, which
     // nothing here ever does: the pump lives as long as the process.
@@ -325,38 +330,73 @@ async fn start_inbound_pump(client: Client, queue: Arc<Queue>) {
         }
     });
 
-    // §9.3: a first sync must not replay history — every message in it
-    // would be a fresh instruction to an agent. With no batch token in the
-    // store, take one sync with a filter that asks for no timeline events
-    // at all and start the live sync from the token it returns. The store
-    // keeps that token, so a restart resumes instead of replaying.
-    match client
-        .state_store()
-        .get_kv_data(StateStoreDataKey::SyncToken)
-        .await
-    {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            let mut filter = FilterDefinition::empty();
-            filter.room.timeline.limit = Some(uint!(0));
-            let settings =
-                SyncSettings::new().filter(sync_events::v3::Filter::FilterDefinition(filter));
-            if let Err(e) = client.sync_once(settings).await {
-                tracing::error!("matrix: the first sync failed, so no reply will arrive: {e}");
-                return;
-            }
-        }
-        Err(e) => {
-            tracing::error!("matrix: reading the stored sync token: {e}");
+    // A homeserver can be down for an hour; the plugin should still be
+    // reading replies when it comes back. The SDK's own retry is off (it
+    // would swallow the rate limit the actor is written to handle), so the
+    // reconnect lives here, and only here.
+    let mut backoff = SYNC_BACKOFF_MIN;
+    let mut failures: u64 = 0;
+    loop {
+        let started = Instant::now();
+        let Err(e) = sync(&client).await else {
+            // `Client::sync` returns `Ok` only if a sync callback asked it
+            // to stop, and ours never does.
+            tracing::error!("matrix: the sync loop ended; no reply can arrive");
+            return;
+        };
+        // The one failure retrying cannot fix, and the one an operator has
+        // to act on. Breaking out here leaves the launcher's §5.2 step 4
+        // path to clear the cached session at the next start.
+        if let MatrixError::Auth(message) = classify_error(&e, format!("sync: {e}")) {
+            tracing::error!(
+                "matrix: {message}; no reply can arrive until the plugin is restarted \
+                 with a session the homeserver accepts"
+            );
             return;
         }
+        // A sync that ran longer than the cap was a working connection, so
+        // the next outage starts its backoff from the bottom again.
+        if started.elapsed() > SYNC_BACKOFF_MAX {
+            backoff = SYNC_BACKOFF_MIN;
+            failures = 0;
+        }
+        failures += 1;
+        // Loud once, then sparse: a homeserver down overnight must not fill
+        // the plugin's log.
+        if failures == 1 || failures.is_multiple_of(10) {
+            tracing::warn!(
+                "matrix: sync failed ({failures} in a row), retrying in {backoff:?}: {e}"
+            );
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(SYNC_BACKOFF_MAX);
     }
+}
 
-    // `SyncSettings::new()` resumes from the token the store holds, which
-    // is the one the filtered sync above just wrote.
-    if let Err(e) = client.sync(SyncSettings::new()).await {
-        tracing::error!("matrix: the sync loop stopped, so no reply will arrive: {e}");
+/// One attempt at syncing: the history-free first sync when the store holds
+/// no batch token, then the live sync, which returns only on failure.
+///
+/// §9.3: a first sync must not replay history — every message in it would be
+/// a fresh instruction to an agent. With no batch token in the store, take
+/// one sync with a filter that asks for no timeline events at all and start
+/// the live sync from the token it returns. The store keeps that token, so
+/// both a reconnect and a restart resume instead of replaying.
+async fn sync(client: &Client) -> Result<(), matrix_sdk::Error> {
+    if client
+        .state_store()
+        .get_kv_data(StateStoreDataKey::SyncToken)
+        .await?
+        .is_none()
+    {
+        let mut filter = FilterDefinition::empty();
+        filter.room.timeline.limit = Some(uint!(0));
+        let settings =
+            SyncSettings::new().filter(sync_events::v3::Filter::FilterDefinition(filter));
+        client.sync_once(settings).await?;
     }
+    // `SyncSettings::new()` resumes from the token the store holds, which is
+    // the one the filtered sync above just wrote.
+    client.sync(SyncSettings::new()).await
 }
 
 /// `matrix-sdk` rotates the access token when it spends the refresh token,
