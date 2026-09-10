@@ -20,7 +20,18 @@ pub const REVOKED: &str = "the cached session was rejected, most likely because 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub homeserver: String,
+    /// The homeserver's own rendering of the account id, from the login
+    /// response. This is the one `restore_session` must be given, and the
+    /// one an event's `sender` is compared against.
     pub user_id: String,
+    /// The `userId` in `plugins.yaml` that produced this session. A
+    /// homeserver may canonicalise (Synapse lowercases a localpart), so the
+    /// two can differ, and `plan` has to compare the configured spelling
+    /// against the configured spelling or it would discard a perfectly good
+    /// session. Defaulted, so a record stored before this field existed
+    /// still reads back instead of being thrown away.
+    #[serde(default)]
+    pub configured_user_id: String,
     pub device_id: String,
     pub access_token: Secret,
     pub refresh_token: Option<Secret>,
@@ -31,6 +42,7 @@ impl fmt::Debug for Session {
         f.debug_struct("Session")
             .field("homeserver", &self.homeserver)
             .field("user_id", &self.user_id)
+            .field("configured_user_id", &self.configured_user_id)
             .field("device_id", &self.device_id)
             .field("access_token", &"<redacted>")
             .field("refresh_token", &"<redacted>")
@@ -51,9 +63,17 @@ pub enum Plan {
 /// A cached session is reused only when it belongs to the configured
 /// homeserver and user. Otherwise a password is required, and its absence
 /// is an error that says which of the two situations it is.
+///
+/// "the configured user" is either spelling: the homeserver may answer a
+/// login with a canonicalised id, and a session whose stored id differs
+/// from `config.user_id` only in the way the homeserver rewrote it is the
+/// session for that user. Comparing on the stored id alone would discard
+/// it, which with no password configured means the plugin never starts.
 pub fn plan(cached: Option<Session>, config: &DaemonConfig) -> Result<Plan, String> {
-    let usable =
-        cached.filter(|s| s.homeserver == config.homeserver && s.user_id == config.user_id);
+    let usable = cached.filter(|s| {
+        s.homeserver == config.homeserver
+            && (s.user_id == config.user_id || s.configured_user_id == config.user_id)
+    });
     if let Some(session) = usable {
         return Ok(Plan::Restore(Box::new(session)));
     }
@@ -109,6 +129,7 @@ mod tests {
         Session {
             homeserver: "https://h".into(),
             user_id: "@hecaton:h".into(),
+            configured_user_id: "@hecaton:h".into(),
             device_id: "hecaton".into(),
             access_token: Secret::new("syt_tok"),
             refresh_token: Some(Secret::new("syr_ref")),
@@ -125,6 +146,40 @@ mod tests {
             plan(Some(session()), &config(None)),
             Ok(Plan::Restore(Box::new(session()))),
             "a cached session needs no password at all"
+        );
+    }
+
+    #[test]
+    fn a_session_the_homeserver_canonicalised_is_still_restored_without_a_password() {
+        // The operator wrote `@Hecaton:h`; the homeserver answered the login
+        // with `@hecaton:h`, which is the id `restore_session` needs and the
+        // one an event's `sender` carries. Comparing on the stored id alone
+        // would call the session foreign, and with no password there is
+        // nothing to fall back to — the plugin would refuse to start, for
+        // good, holding a session that works perfectly.
+        let mut cached = session();
+        cached.configured_user_id = "@Hecaton:h".into();
+        let mut c = config(None);
+        c.user_id = "@Hecaton:h".into();
+        assert_eq!(
+            plan(Some(cached.clone()), &c),
+            Ok(Plan::Restore(Box::new(cached)))
+        );
+    }
+
+    #[test]
+    fn a_record_stored_before_the_configured_id_existed_still_reads_back() {
+        let stored = json!({
+            "homeserver": "https://h",
+            "user_id": "@hecaton:h",
+            "device_id": "hecaton",
+            "access_token": "syt_tok",
+        });
+        let session: Session = serde_json::from_value(stored).unwrap();
+        assert_eq!(session.configured_user_id, "");
+        assert!(
+            matches!(plan(Some(session), &config(None)), Ok(Plan::Restore(_))),
+            "an older record still matches on the id it does have"
         );
     }
 

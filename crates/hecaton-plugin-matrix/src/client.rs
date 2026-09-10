@@ -124,7 +124,11 @@ async fn login(
         .map_err(|e| format!("logging in as {}: {e}", config.user_id))?;
     let session = Session {
         homeserver: config.homeserver.clone(),
+        // The homeserver's spelling and the operator's, side by side: the
+        // first is what a restore and the loop guard need, the second is
+        // what `session::plan` has to compare against `config.userId`.
         user_id: response.user_id.to_string(),
+        configured_user_id: config.user_id.clone(),
         device_id: response.device_id.to_string(),
         access_token: Secret::new(response.access_token),
         refresh_token: response.refresh_token.map(Secret::new),
