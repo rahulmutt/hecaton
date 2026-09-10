@@ -21,11 +21,21 @@ jobs:
       - uses: jdx/mise-action@v2
         with: { version: 2026.9.2, install: false, cache: true }
       - run: mise install rust cargo:cargo-nextest cargo-insta tmux nono gh gitleaks
+      # The core workspace, keyed on its own Cargo.lock. A plugin's
+      # dependency bump no longer invalidates this (Spec H §7).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
       - run: mise run check
   # Each plugin is a standalone project with its own lockfile (Spec H), so
   # each gets its own job and its own cache. They run concurrently with
   # `check`, which no longer lints or tests any of them (it still builds
   # the ones the e2e packages, from their own projects).
+  #
+  # GitHub evicts least-recently-used cache entries past 10 GB per
+  # repository, and four Rust caches can approach that. If eviction starts
+  # thrashing, give the plugin jobs `save-if: ${{ github.ref ==
+  # 'refs/heads/main' }}` so pull requests restore but do not write.
   plugins:
     runs-on: ubuntu-latest
     strategy:
@@ -37,6 +47,12 @@ jobs:
       - uses: jdx/mise-action@v2
         with: { version: 2026.9.2, install: false, cache: true }
       - run: mise install rust cargo:cargo-nextest
+      # One cache per plugin project: each has its own lockfile and its own
+      # target directory under plugins/<name>/target (scripts/plugin.sh).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "plugins/${{ matrix.plugin }} -> target"
+          key: ${{ matrix.plugin }}
       - run: mise run plugin ${{ matrix.plugin }}
   mutants:
     if: github.event_name == 'schedule'
