@@ -218,15 +218,43 @@ fn retry_after_ms(retry_after: Option<RetryAfter>) -> u64 {
         .min(MAX_RETRY_MS)
 }
 
+/// Whether a room in this state has to be joined before anything can be
+/// sent to it. `None` is a room the state store has never heard of, which
+/// on a fresh store is every room until the first sync lands; every state
+/// but `Joined` is a room the homeserver would refuse a send in.
+fn needs_join(state: Option<RoomState>) -> bool {
+    state != Some(RoomState::Joined)
+}
+
 impl MatrixClient {
-    /// A room the client is in. The state store holds every joined room, so
-    /// this resolves a room id from the KV map without a network call.
-    fn room(&self, room: &str) -> Result<Room, MatrixError> {
+    /// A room the client can send to. The state store holds every joined
+    /// room, so the common case resolves a room id from the KV map without
+    /// a network call. Anything else is joined first, which is what makes
+    /// G-4's pinned room work: an operator who creates a room and invites
+    /// the bot leaves it in the *invited* state, where every send is
+    /// refused by the homeserver, and on a fresh store the room is not in
+    /// the state store at all until the first sync lands, so the lookup
+    /// fails outright and the first events after an install are dropped.
+    ///
+    /// Joining is the adapter's job, not the port's: `MatrixPort`'s
+    /// contract is "give me a room I can send to". `join_room_by_id` works
+    /// whether or not the store knows the room and is idempotent for a room
+    /// we are already in, so it covers both cases with one call, and a
+    /// refusal (no invite, banned, a rate limit) comes back through
+    /// `classify_error` as the `MatrixError` the caller already handles.
+    async fn room(&self, room: &str) -> Result<Room, MatrixError> {
         let id =
             RoomId::parse(room).map_err(|e| MatrixError::Other(format!("room id {room}: {e}")))?;
+        if let Some(known) = self.client.get_room(&id)
+            && !needs_join(Some(known.state()))
+        {
+            return Ok(known);
+        }
+        tracing::info!("matrix: joining room {room}");
         self.client
-            .get_room(&id)
-            .ok_or_else(|| MatrixError::Other(format!("not in room {room}")))
+            .join_room_by_id(&id)
+            .await
+            .map_err(|e| classify_error(&e, format!("joining room {room}: {e}")))
     }
 }
 
@@ -267,7 +295,7 @@ impl MatrixPort for MatrixClient {
         thread_root: Option<&str>,
         markdown: &str,
     ) -> Result<String, MatrixError> {
-        let target = self.room(room)?;
+        let target = self.room(room).await?;
         let mut content = RoomMessageEventContent::text_markdown(markdown);
         if let Some(root) = thread_root {
             let root = EventId::parse(root)
@@ -286,7 +314,7 @@ impl MatrixPort for MatrixClient {
     }
 
     async fn react(&self, room: &str, event_id: &str, key: &str) -> Result<(), MatrixError> {
-        let target = self.room(room)?;
+        let target = self.room(room).await?;
         let event_id = EventId::parse(event_id)
             .map_err(|e| MatrixError::Other(format!("event id {event_id}: {e}")))?;
         let content = ReactionEventContent::new(Annotation::new(event_id, key.to_string()));
@@ -546,5 +574,30 @@ impl Launcher for MatrixLauncher {
         ));
         tokio::spawn(start_inbound_pump(client, queue, self.health.clone()));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The one decision in `MatrixClient::room` that can be made without a
+    /// homeserver: a pinned room the operator invited the bot to arrives
+    /// `Invited`, and on a fresh store it is not in the store at all — both
+    /// have to be joined, or every send in that room is refused by the
+    /// server (G-4). The join call itself is exercised by
+    /// `scripts/verify-matrix.sh`.
+    #[test]
+    fn every_state_but_joined_has_to_be_joined_first() {
+        assert!(!needs_join(Some(RoomState::Joined)));
+        for state in [
+            RoomState::Invited,
+            RoomState::Left,
+            RoomState::Knocked,
+            RoomState::Banned,
+        ] {
+            assert!(needs_join(Some(state)), "{state:?} should be joined first");
+        }
+        assert!(needs_join(None), "a room the store has never seen");
     }
 }
