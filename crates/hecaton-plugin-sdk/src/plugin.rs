@@ -40,6 +40,16 @@ pub trait Plugin: Send + Sync + 'static {
         let _ = agent;
         async {}
     }
+    /// The daemon-level config from the `hello` reply (plugins spec §2.1).
+    /// `serve` calls this once, after `hello` succeeds. `Err(message)`
+    /// aborts the server and returns `SdkError::Configure`, so the process
+    /// exits 1 and the daemon reports the plugin as not ready. The daemon
+    /// may deliver an `activate` before this returns, so a plugin that
+    /// needs the config must buffer until it arrives.
+    fn configure(&self, config: Value) -> impl Future<Output = Result<(), String>> + Send {
+        let _ = config;
+        async { Ok(()) }
+    }
     fn observe(&self, events: Vec<HookEvent>) -> impl Future<Output = ()> + Send {
         let _ = events;
         async {}
@@ -239,11 +249,22 @@ async fn serve_on<P: Plugin>(
 ) -> Result<(), SdkError> {
     let plugin = Arc::new(plugin);
     let token = host.env().token.clone();
-    let server = tokio::spawn(async move { run(listener, plugin, &token).await });
-    if let Err(e) = host.hello(version, &listen).await {
+    let listener_plugin = plugin.clone();
+    let server = tokio::spawn(async move { run(listener, listener_plugin, &token).await });
+    let stop = |server: tokio::task::JoinHandle<Result<(), SdkError>>| async move {
         server.abort();
         let _ = server.await;
-        return Err(e);
+    };
+    let reply = match host.hello(version, &listen).await {
+        Ok(reply) => reply,
+        Err(e) => {
+            stop(server).await;
+            return Err(e);
+        }
+    };
+    if let Err(message) = plugin.configure(reply.config).await {
+        stop(server).await;
+        return Err(SdkError::Configure(message));
     }
     server.await.map_err(|e| SdkError::Bind(e.to_string()))?
 }
@@ -490,5 +511,56 @@ mod tests {
             freed.is_ok(),
             "port {listen} not freed after the failed hello"
         );
+    }
+
+    /// `serve` hands the hello reply's config to `configure`, and a
+    /// rejection stops the server instead of leaving it listening.
+    #[tokio::test]
+    async fn serve_hands_the_hello_config_to_configure_and_a_rejection_stops_it() {
+        use crate::testing::FakeHost;
+        use std::sync::{Arc, Mutex};
+
+        struct Recorder {
+            seen: Arc<Mutex<Vec<Value>>>,
+            reject: Option<String>,
+        }
+        impl Plugin for Recorder {
+            async fn configure(&self, config: Value) -> Result<(), String> {
+                self.seen
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(config);
+                match &self.reject {
+                    Some(m) => Err(m.clone()),
+                    None => Ok(()),
+                }
+            }
+        }
+
+        let fake = FakeHost::start("tok", json!({ "homeserver": "https://h" }), Vec::new()).await;
+        let env = fake.env("matrix", std::path::Path::new("scratch"));
+        let host = Host::new(env).unwrap();
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let err = serve(
+            &host,
+            "test",
+            Recorder {
+                seen: seen.clone(),
+                reject: Some("bad homeserver".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.to_string(), "configure: bad homeserver");
+        let seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(seen.len(), 1, "configure called once");
+        assert_eq!(seen[0]["homeserver"], "https://h");
+    }
+
+    /// A plugin that implements nothing accepts any config.
+    #[tokio::test]
+    async fn the_default_configure_accepts_anything() {
+        assert_eq!(Silent.configure(json!({ "anything": 1 })).await, Ok(()));
     }
 }

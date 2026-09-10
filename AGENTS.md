@@ -23,6 +23,9 @@ credentials, hook input, or sandbox rules.
   `dev fake-claude`. Its data root (`target/tmp/verify-data`, the daemon
   pool) is kept across runs so claude downloads once per version; config and
   state under `target/tmp/verify-claude` are wiped.
+- `verify-matrix` — Spec G's manual check against a real Matrix homeserver
+  (`scripts/verify-matrix.sh`); needs `MATRIX_HOMESERVER`, `MATRIX_USER_ID`,
+  `MATRIX_PASSWORD` and `MATRIX_INVITE`. Not part of any CI tier.
 - `lint`, `test`, `fmt`, `precommit`, `audit` — defined in `mise.toml`.
 - `vendor-xterm` is a script, not a task: `scripts/vendor-xterm.sh` re-fetches
   and verifies the web plugin's assets against
@@ -278,3 +281,58 @@ credentials, hook input, or sandbox rules.
   but never while a comment box is open.
 - `web`'s event buffer is memory only: after a plugin restart the review
   page's column is empty until new events arrive (no observer catch-up).
+- The matrix plugin's `matrix-sdk` state and crypto store lives in the
+  plugin's `scratch/`, so `plugin remove --purge` discards the device keys:
+  the bot rejoins as a new device and previously encrypted history stops
+  being readable by it. Purge only when you mean that.
+- `plugins.yaml` entries may carry `secrets: { <config key>: <path> }`. The
+  daemon reads each file at load, trims one trailing newline and injects the
+  value into the entry's `config` before `hello`. The file must not be
+  readable by group or others. The resolved config lives only in memory;
+  `ResolvedPlugin` hand-implements `Debug` and prints `config: <redacted>`,
+  so never go back to deriving it.
+- Rotating a file named in `secrets` changes `ResolvedPlugin::hash` and so
+  restarts the plugin on the next sync. That is intended.
+- `matrix-sdk` is a large tree and only `hecaton-plugin-matrix` depends on
+  it. Keep it that way, and run `cargo deny` when bumping it.
+- A plugin that needs daemon-level config implements `Plugin::configure`.
+  The daemon may deliver an `activate` before `configure` returns, so such a
+  plugin must buffer, as the matrix actor does.
+- `matrix-sdk` changed two things for crates that never asked for it,
+  because cargo unifies features across one build: every HTTP client in the
+  workspace now requests compressed responses and decodes them
+  transparently (nothing depends on that, but it is a wire change — see
+  `async-compression` in `Cargo.lock`), and building an HTTP client now
+  reads and parses the system certificate store eagerly, failing outright
+  if that store is empty, even for a client that only ever speaks plaintext
+  to localhost (`reqwest`'s `rustls-platform-verifier`). That hits the
+  daemon's plugin client (`crates/hecaton-server/src/plugins/client.rs`)
+  and the SDK's host client (`crates/hecaton-plugin-sdk/src/host.rs`): on a
+  host with no CA bundle, constructing either now fails where it used to
+  succeed. The sandbox profile's default `/etc` read grant
+  (`SYSTEM_READ` in `crates/hecaton-runtime/src/sandbox.rs`) covers it for
+  agents; a bare container without `/etc/ssl` populated is not covered.
+  Also: the workspace test suite went from roughly 5.9-6.3 s to 8.2-8.7 s
+  on an idle machine after this dependency landed, most plausibly the
+  eager certificate read paid once per client built in-process across the
+  suite. Several tests elsewhere in this workspace already fail under a
+  busy host and pass alone (`hecaton-runtime`'s `processes_with_arg_pair`
+  and `reap_kills` among them); a slower suite makes those flakes more
+  likely, not less — rerun once with `--no-fail-fast` before assuming a
+  real regression.
+- In `hecaton-plugin-matrix`, `routing::Maps.threads` is the single source
+  of truth (mirrored to the daemon's KV) and `.routes` is derived from it
+  and rebuilt at startup (`Maps::load`), never persisted itself — don't add
+  a second place that writes routes.
+- The actor's inbound `Queue` (`crates/hecaton-plugin-matrix/src/actor.rs`)
+  is bounded and drops its *oldest* entry rather than blocking its
+  producer: `observe` is a daemon-to-plugin HTTP call and must return, so a
+  slow or wedged homeserver can never stall hook delivery to Claude. It can
+  silently lose old, stale commands under sustained overload instead —
+  that's the intended trade.
+- `matrix::fake::FakePort` (always compiled, like the SDK's `FakeHost`) is
+  what makes the actor's ordering rules — thread creation before the first
+  event, refusing a room-level reply, refusing a reply after `SessionEnd`
+  — unit-testable without a real homeserver. When changing an ordering
+  rule, extend `FakePort`'s recorded calls rather than reaching for an
+  integration test against a live server.

@@ -267,6 +267,38 @@ async fn plugins_sync_hello_list_and_purge() {
         "{metrics}"
     );
 
+    // a secret colliding with an inline config key fails the sync, changes
+    // nothing, and the error composes one `plugins.yaml:` prefix with the
+    // entry index and the full `secrets.<key>` path — never the file's
+    // contents.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let secret = dir.path().join("secret-pw");
+        fs::write(&secret, "s3cr3t\n").unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(
+            &plugins_yaml,
+            "plugins:\n  - name: hello\n    source: ./hello-pkg\n    config: { greeting: hi }\n    secrets:\n      greeting: ./secret-pw\n",
+        )
+        .unwrap();
+        let (s, body) = api.call("POST", "/v1/plugins/sync", admin, None);
+        assert_eq!(s, 400);
+        assert_eq!(
+            body["error"],
+            "plugins.yaml: plugins[0].secrets.greeting: collides with config.greeting"
+        );
+        assert!(
+            !body["error"].as_str().unwrap().contains("s3cr3t"),
+            "{body}"
+        );
+        // restore the file the "broken manifest" case below builds on.
+        fs::write(
+            &plugins_yaml,
+            "plugins:\n  - name: hello\n    source: ./hello-pkg\n    config: { greeting: hi }\n",
+        )
+        .unwrap();
+    }
+
     // a broken manifest fails the sync and changes nothing
     let bad = dir.path().join("bad-pkg");
     write_package(

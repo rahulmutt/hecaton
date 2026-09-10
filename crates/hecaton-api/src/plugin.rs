@@ -1,7 +1,8 @@
 //! Plugin wire types (plugins spec §2, §3, §4.1): the package manifest, the
 //! daemon's `plugins.yaml`, `hello`, status rows and the sync report.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -75,6 +76,11 @@ pub struct PluginEntry {
     pub source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// Config keys whose values the daemon reads from a host file at load,
+    /// so a secret need not be written into `plugins.yaml` (plugins spec
+    /// G-7). Paths are relative to this file, like `source`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secrets: BTreeMap<String, PathBuf>,
     /// Daemon-level config, passed verbatim in the `hello` reply.
     #[serde(default = "empty_object")]
     pub config: Value,
@@ -240,5 +246,27 @@ mod tests {
         let rep = SyncReport::default();
         assert!(rep.installed.is_empty() && rep.stopped.is_empty() && rep.unchanged.is_empty());
         assert_eq!(PLUGIN_KIND, "Plugin");
+    }
+
+    #[test]
+    fn an_entry_carries_secret_file_paths_and_omits_an_empty_map() {
+        let f: PluginsFile = serde_json::from_value(json!({
+            "plugins": [
+                { "name": "matrix", "source": "./matrix",
+                  "secrets": { "password": "../secrets/matrix-password" } },
+                { "name": "web", "source": "./web" }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            f.plugins[0].secrets.get("password").map(|p| p.as_path()),
+            Some(std::path::Path::new("../secrets/matrix-password"))
+        );
+        assert!(f.plugins[1].secrets.is_empty(), "absent means empty");
+        let back = serde_json::to_value(&f).unwrap();
+        assert!(
+            back["plugins"][1].get("secrets").is_none(),
+            "an empty map is not serialized"
+        );
     }
 }

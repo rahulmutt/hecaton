@@ -11,7 +11,7 @@ cd "$(dirname "$0")/.."
 
 target="${CARGO_TARGET_DIR:-target}"
 
-for name in flow web; do
+for name in flow web matrix; do
   crate="hecaton-plugin-$name"
   cargo build -q -p "$crate"
   out="$target/plugins/$name"

@@ -50,6 +50,8 @@ pub enum SdkError {
     Status { status: u16, message: String },
     #[error("listen: {0}")]
     Bind(String),
+    #[error("configure: {0}")]
+    Configure(String),
     #[error("metrics: {0}")]
     Metrics(String),
 }

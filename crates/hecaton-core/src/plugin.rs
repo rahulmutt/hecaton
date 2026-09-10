@@ -55,7 +55,7 @@ pub fn plugin_id(name: &AgentName) -> AgentId {
 
 /// One plugin after `plugins.yaml` was synced: where its package is, what
 /// its manifest says, and the daemon-level config it gets at `hello`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct ResolvedPlugin {
     pub name: AgentName,
     /// Package root (installed tarball or a directory used in place).
@@ -64,6 +64,20 @@ pub struct ResolvedPlugin {
     pub config: Value,
     /// sha256 hex of the tarball; `None` for a directory source.
     pub digest: Option<String>,
+}
+
+/// `config` may carry a resolved secret (plugins spec G-7), so it is never
+/// printed. Everything else is, because it is what a log line is for.
+impl std::fmt::Debug for ResolvedPlugin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedPlugin")
+            .field("name", &self.name)
+            .field("package", &self.package)
+            .field("manifest", &self.manifest)
+            .field("config", &"<redacted>")
+            .field("digest", &self.digest)
+            .finish()
+    }
 }
 
 #[derive(Serialize)]
@@ -290,6 +304,20 @@ mod tests {
             config,
             digest: Some("abc".into()),
         }
+    }
+
+    fn plugin_fixture() -> ResolvedPlugin {
+        plugin("web", json!({}))
+    }
+
+    #[test]
+    fn debug_never_prints_the_resolved_config() {
+        let mut p = plugin_fixture();
+        p.config = serde_json::json!({ "password": "hunter2" });
+        let text = format!("{p:?}");
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
+        assert!(text.contains("name"), "the rest is still readable: {text}");
     }
 
     #[test]
