@@ -294,3 +294,21 @@ package directory as the working directory. Two shapes:
   one `sha256`. Cross-compiling the per-platform assets is the plugin
   repository's release pipeline (Linux x86_64 and aarch64 while the
   sandbox is Landlock; static builds avoid libc mismatches).
+
+A `plugins.yaml` entry may also carry `secrets`: a map from a config key
+to a file path, resolved against the directory holding `plugins.yaml`
+exactly as `source` is (for example `secrets: { password:
+/run/hecaton-secrets/matrix-bot-password }`). The daemon reads each file
+when it loads the entry, trims one trailing newline, and splices the
+contents into the entry's `config` under that key before the plugin's
+first `hello` — it hands the plugin the resolved value, not the path.
+That is deliberate rather than the plugin reading the file itself: a
+plugin's own `scratch/` does not exist until the daemon materializes the
+plugin, which is exactly the moment it first needs the credential, so the
+daemon is the one positioned to read it. Each file must not be readable
+by group or other; a looser mode is rejected at load, alongside a missing
+file or a `secrets` key that collides with one already in `config`. The
+resolved value lives only in memory from there — it is never written back
+to `plugins.yaml` or logged. Rotating a file named in `secrets` changes
+the resolved plugin's hash, so the daemon restarts the plugin on its next
+sync to pick up the new value.
