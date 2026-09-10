@@ -62,7 +62,7 @@ Then check, in your Matrix client:
   - after SessionEnd, a reply in that thread is refused with a reaction;
   - restarting the daemon replays nothing into the room.
 
-Three more, exercised only by a real server — argued so far from
+Five more, exercised only by a real server — argued so far from
 matrix-sdk's source, with no test behind them:
 
   - Token refresh. Leave the daemon running past your homeserver's access
@@ -91,6 +91,30 @@ matrix-sdk's source, with no test behind them:
     the homeserver accepts. The plugin must not go quietly deaf: a reply
     posted after the revocation should visibly get no response, matching
     what plugin list already said.
+  - A pinned room (G-4). Make a room yourself in your Matrix client,
+    invite the bot to it, and add its internal id — not its alias — to the
+    plugin's config as `rooms: { "<fleet>/<crew>": "!id:example.org" }`.
+    Then `hecaton down` that crew, `plugin remove --purge matrix` so the
+    plugin starts on a store that has never seen the room, restart, and
+    `up` again. Expect: no second room appears, and the crew's threads are
+    rooted in the room you made, with the bot's membership going from
+    invited to joined at the first event. Nothing else in the plugin ever
+    joins a room, so a pinned room left merely invited would fail every
+    send at the homeserver and show only as an `errors_total{kind="send"}`
+    tick; this is the only check that proves otherwise.
+  - Restart after revocation, with a password still configured. Revoke the
+    plugin's device as above, but leave the `secrets` block in place, and
+    restart the daemon. Expect: it logs in again on its own and `plugin
+    list` returns to ready. Then watch the room, because the login pins
+    the same `deviceId` against a crypto store that still holds the
+    revoked device's keys, and no reading of the library settles what that
+    costs: check that messages the bot posts after the restart are
+    readable in your client, that a reply in a thread still reaches the
+    agent, and that your client does not show the bot's new messages as
+    coming from an unknown or unverified device. If any of that is broken,
+    `plugin remove --purge matrix` discards the store so the bot starts
+    over as a new device — at the price of the old device's history
+    staying unreadable to it.
 
 Finally, confirm the password can be removed: delete the `secrets` block,
 restart, and check the plugin still logs in from its cached session.
