@@ -53,7 +53,7 @@ fn run() -> anyhow::Result<()> {
             counters: counters.clone(),
             health: health.clone(),
         };
-        let plugin = MatrixPlugin::new(metrics, counters, health, queue, launcher);
+        let plugin = MatrixPlugin::new(metrics, health, queue, launcher);
         let phase_watch = tokio::spawn(watch_phases(host.clone(), plugin.queue()));
         eprintln!("matrix: starting");
         let result = serve(&host, env!("CARGO_PKG_VERSION"), plugin).await;

@@ -81,7 +81,6 @@ async fn a_session_gets_a_thread_and_a_reply_in_it_reaches_the_agent() {
     let port = FakePort::new("@hecaton:h");
     let plugin = MatrixPlugin::new(
         metrics,
-        counters.clone(),
         health,
         queue.clone(),
         TestLauncher {

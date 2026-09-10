@@ -10,7 +10,7 @@ use hecaton_api::{AgentStatus, FleetRecord, HookEvent};
 use hecaton_plugin_sdk::{Metrics, Plugin};
 use serde_json::Value;
 
-use crate::actor::{Command, Counters, Health, Queue};
+use crate::actor::{Command, Health, Queue};
 use crate::config::{DaemonConfig, parse_agent, parse_daemon};
 use crate::render::PhaseChange;
 
@@ -82,8 +82,6 @@ pub trait Launcher: Send + Sync + 'static {
 
 pub struct MatrixPlugin<L: Launcher> {
     metrics: Metrics,
-    #[allow(dead_code, reason = "held so the families outlive the registry")]
-    counters: Counters,
     health: Health,
     queue: Arc<Queue>,
     launcher: L,
@@ -98,16 +96,13 @@ impl<L: Launcher> std::fmt::Debug for MatrixPlugin<L> {
 }
 
 impl<L: Launcher> MatrixPlugin<L> {
-    pub fn new(
-        metrics: Metrics,
-        counters: Counters,
-        health: Health,
-        queue: Arc<Queue>,
-        launcher: L,
-    ) -> Self {
+    /// The counters are deliberately not held here: `Metrics` is the
+    /// prometheus registry, and a registered collector is kept alive by the
+    /// registry's own handle to it, so the actor and the pump can own the
+    /// only clones and this still renders every family.
+    pub fn new(metrics: Metrics, health: Health, queue: Arc<Queue>, launcher: L) -> Self {
         Self {
             metrics,
-            counters,
             health,
             queue,
             launcher,
@@ -166,6 +161,7 @@ impl<L: Launcher> Plugin for MatrixPlugin<L> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actor::Counters;
     use hecaton_plugin_sdk::testing::{FakeHost, Harness, event};
     use serde_json::json;
     use std::sync::Mutex;
@@ -202,7 +198,7 @@ mod tests {
         let counters = Counters::new(&metrics).unwrap();
         let health = Health::new();
         let queue = Queue::new(counters.events_dropped.clone());
-        let p = MatrixPlugin::new(metrics, counters, health.clone(), queue.clone(), launcher);
+        let p = MatrixPlugin::new(metrics, health.clone(), queue.clone(), launcher);
         (p, queue, health)
     }
 

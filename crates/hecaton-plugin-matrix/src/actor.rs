@@ -233,11 +233,6 @@ impl<M: MatrixPort> Actor<M> {
         );
     }
 
-    /// Replaces the health cell. Only the wiring and its tests use this.
-    pub fn set_health(&mut self, health: Health) {
-        self.health = health;
-    }
-
     /// Restores the room and thread maps from KV, so a restart resumes.
     pub async fn load(&mut self) {
         match Maps::load(&self.host).await {
@@ -591,13 +586,11 @@ mod tests {
         };
         // Hand control to the scheduler so the popper actually runs, finds
         // the queue empty, and parks on `notified()` before the push below
-        // exercises the wake path.
+        // exercises the wake path. Nothing here can assert that it parked —
+        // the queue is empty either way — so the yield is what makes the
+        // test reach that path at all, and the pop returning below is what
+        // proves the wake happened.
         tokio::task::yield_now().await;
-        assert_eq!(
-            q.len(),
-            0,
-            "the popper should have found nothing and parked"
-        );
         q.push(deactivate("f/c/a"));
         assert_eq!(popper.await.unwrap(), deactivate("f/c/a"));
 
@@ -781,13 +774,23 @@ mod tests {
             )]))
             .await;
         }
-        let rooms = port
-            .calls()
+        let calls = port.calls();
+        assert_eq!(creations(&calls), 1, "one room per crew");
+        // Not just two roots and one creation: both roots have to have gone
+        // to that one room. `sends` drops the room, so read it here.
+        let rooms: Vec<&String> = calls
             .iter()
-            .filter(|c| matches!(c, Call::CreateRoom { .. }))
-            .count();
-        assert_eq!(rooms, 1, "one room per crew");
-        assert_eq!(sends(&port.calls()).len(), 2, "one root per agent");
+            .filter_map(|c| match c {
+                Call::Send {
+                    room,
+                    thread_root: None,
+                    ..
+                } => Some(room),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rooms.len(), 2, "one root per agent: {calls:?}");
+        assert_eq!(rooms[0], rooms[1], "and both in the same room");
     }
 
     #[tokio::test]
