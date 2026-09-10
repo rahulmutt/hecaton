@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 
 use hecaton_plugin_sdk::Host;
 use matrix_sdk::authentication::matrix::MatrixSession;
-use matrix_sdk::config::SyncSettings;
+use matrix_sdk::config::{RequestConfig, SyncSettings};
 use matrix_sdk::room::Room;
 use matrix_sdk::ruma::api::client::filter::FilterDefinition;
 use matrix_sdk::ruma::api::client::room::create_room;
@@ -63,6 +63,13 @@ async fn build(config: &DaemonConfig, store_dir: &Path) -> Result<Client, Matrix
         // refresh this flag gates. `request_refresh_token()` at login only
         // advertises that we support refreshing (G-8).
         .handle_refresh_tokens()
+        // The plan puts the retry in the actor: one retry, after the delay
+        // the homeserver itself named (rule 1), with the queue moving in
+        // between. Left at its default the SDK swallows a rate limit or a
+        // 5xx into an exponential backoff of up to fifteen minutes inside a
+        // single call, so the actor's retry — and the tests written for it —
+        // would never run.
+        .request_config(RequestConfig::new().disable_retry())
         .build()
         .await
         .map_err(|e| MatrixError::Other(format!("building the client: {e}")))
