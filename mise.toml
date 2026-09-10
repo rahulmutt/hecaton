@@ -14,8 +14,13 @@ nono = "0.76.0"
 claude = "2.1.267"
 
 [tasks.fmt]
-description = "Format all crates"
-run = "cargo fmt --all"
+description = "Format the core workspace and every standalone plugin project"
+run = [
+  "cargo fmt --all",
+  "scripts/plugin.sh fmt flow",
+  "scripts/plugin.sh fmt web",
+  "scripts/plugin.sh fmt matrix",
+]
 
 [tasks.lint]
 description = "Static tier: rustfmt check + clippy with warnings denied, then the core dependency-isolation guard"

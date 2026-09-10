@@ -93,7 +93,11 @@ Each plugin manifest becomes a standalone project:
 - its own `clippy.toml` (`allow-unwrap-in-tests`, `allow-expect-in-tests`),
   because clippy resolves that file from the workspace root;
 - its own `deny.toml` (§6);
-- its own `target/`, added to `.gitignore` as `plugins/*/target`.
+- its own `target/`, added to `.gitignore` as `plugins/*/target`;
+- the root `.config/nextest.toml` profile, which nextest also resolves from
+  the workspace root: the plugin tiers pass `--config-file` so a hung plugin
+  test still dies on the root profile's slow-timeout rather than running to
+  the CI job limit.
 
 Two path references move with the crates: the three vendored xterm entries in
 `.gitleaks.toml`, and `out=` in `scripts/vendor-xterm.sh`.
